@@ -1,0 +1,38 @@
+name: Code Review Reusable
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        required: false
+        type: string
+        default: English
+    secrets:
+      GITHUB_TOKEN:
+        required: true
+      OPENAI_API_KEY:
+        required: true
+
+jobs:
+  code-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: anc95/ChatGPT-CodeReview@v1.0.20
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LANGUAGE: ${{ inputs.language }}
+          OPENAI_API_ENDPOINT: https://api.openai.com/v1
+          MODEL: o3-mini-2025-01-31
+          PROMPT: |
+            As a code reviewer, please provide a BRIEF review (max 2-3 sentences per issue) focusing only on:
+            1. Critical bugs or security vulnerabilities
+            2. Significant performance concerns
+            3. Major maintainability issues
+            4. Important business logic errors
+
+            Keep responses concise. If no significant issues found, just reply "Review completed, no major issues found."
+            Avoid lengthy explanations or minor suggestions.
+          top_p: 1
+          temperature: 1
+          MAX_PATCH_LENGTH: 10000
