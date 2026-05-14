@@ -7,7 +7,16 @@ inputs:
     required: false
     default: ${{ github.ref_name }}
   previous-tag:
-    description: 'Previous tag to bound the commit range. If empty, auto-derived from local git history via `git describe --tags --abbrev=0 $CUR^`.'
+    description: 'Previous tag to bound the commit range. If empty, auto-derived from local git history via `git describe --tags --match=<pattern> --abbrev=0 $CUR^`.'
+    required: false
+    default: ''
+  tag-pattern:
+    description: |
+      Pattern passed to `git describe --tags --match` when auto-deriving the
+      previous tag. Defaults to a pattern inferred from `current-tag`:
+      `<prefix>/v*` for path-prefixed tags (e.g. `release-notes/v1.0.1` →
+      `release-notes/v*`), otherwise `v*`. Set explicitly for repos with
+      non-standard tag naming. Ignored when `previous-tag` is set.
     required: false
     default: ''
   openai-api-key:
@@ -44,15 +53,25 @@ runs:
       env:
         CUR: ${{ inputs.current-tag }}
         PREV_INPUT: ${{ inputs.previous-tag }}
+        TAG_PATTERN: ${{ inputs.tag-pattern }}
       run: |
         set -euo pipefail
-        if [ -n "$PREV_INPUT" ]; then
+        if [[ -n "$PREV_INPUT" ]]; then
           PREV="$PREV_INPUT"
+          echo "Previous tag (explicit): $PREV"
         else
-          PREV=$(git describe --tags --abbrev=0 "$CUR^" 2>/dev/null || true)
+          if [[ -n "$TAG_PATTERN" ]]; then
+            PATTERN="$TAG_PATTERN"
+          elif [[ "$CUR" =~ ^(.+)/v[0-9] ]]; then
+            PATTERN="${BASH_REMATCH[1]}/v*"
+          else
+            PATTERN="v*"
+          fi
+          PREV=$(git describe --tags --match="$PATTERN" --abbrev=0 "$CUR^" 2>/dev/null || true)
+          echo "Tag pattern: $PATTERN"
+          echo "Previous tag (auto): ${PREV:-<none>}"
         fi
         echo "tag=$PREV" >> "$GITHUB_OUTPUT"
-        echo "Previous tag: ${PREV:-<none>}"
 
     - name: Install uv
       uses: astral-sh/setup-uv@v6
