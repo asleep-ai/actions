@@ -133,7 +133,7 @@ def main() -> int:
 
     prev = os.environ.get("PREV") or None
     api_key = os.environ.get("OPENAI_API_KEY")
-    model = os.environ.get("OPENAI_MODEL", "gpt-5.5")
+    model = os.environ.get("OPENAI_MODEL") or "gpt-5.5"
     system_prompt = os.environ.get("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT
 
     commits = git_commit_list(prev, cur)
