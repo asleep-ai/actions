@@ -1,0 +1,76 @@
+name: 'AI Release Notes'
+description: 'Generate sectioned markdown release notes from a git tag range via OpenAI, with a deterministic commit-list fallback.'
+
+inputs:
+  current-tag:
+    description: 'Current tag (e.g. v0.5.0). Defaults to github.ref_name when running on a tag push.'
+    required: false
+    default: ${{ github.ref_name }}
+  previous-tag:
+    description: 'Previous tag to bound the commit range. If empty, auto-derived from local git history via `git describe --tags --abbrev=0 $CUR^`.'
+    required: false
+    default: ''
+  openai-api-key:
+    description: 'OpenAI API key. If unset, the action falls back to a plain commit-list summary so a missing secret never blocks the release.'
+    required: false
+    default: ''
+  openai-model:
+    description: 'OpenAI model name.'
+    required: false
+    default: 'gpt-5.4'
+  system-prompt:
+    description: 'Override the default system prompt. Pass a string (heredoc-friendly). Leave blank to use the built-in generic library/service prompt.'
+    required: false
+    default: ''
+  output-file:
+    description: 'Path where the generated markdown is written. The caller typically passes this to `gh release create --notes-file`.'
+    required: false
+    default: 'release-notes.md'
+
+outputs:
+  path:
+    description: 'Path to the generated markdown file.'
+    value: ${{ inputs.output-file }}
+  previous-tag:
+    description: 'The previous tag the commit range was bounded against. Useful when auto-derived.'
+    value: ${{ steps.prev.outputs.tag }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve previous tag
+      id: prev
+      shell: bash
+      env:
+        CUR: ${{ inputs.current-tag }}
+        PREV_INPUT: ${{ inputs.previous-tag }}
+      run: |
+        set -euo pipefail
+        if [ -n "$PREV_INPUT" ]; then
+          PREV="$PREV_INPUT"
+        else
+          PREV=$(git describe --tags --abbrev=0 "$CUR^" 2>/dev/null || true)
+        fi
+        echo "tag=$PREV" >> "$GITHUB_OUTPUT"
+        echo "Previous tag: ${PREV:-<none>}"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
+
+    - name: Generate release notes
+      shell: bash
+      env:
+        CUR: ${{ inputs.current-tag }}
+        PREV: ${{ steps.prev.outputs.tag }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        OPENAI_MODEL: ${{ inputs.openai-model }}
+        SYSTEM_PROMPT: ${{ inputs.system-prompt }}
+        OUTPUT_FILE: ${{ inputs.output-file }}
+      run: |
+        set -euo pipefail
+        uv run "${{ github.action_path }}/generate.py" > "$OUTPUT_FILE"
+        echo "::group::Generated release notes ($OUTPUT_FILE)"
+        cat "$OUTPUT_FILE"
+        echo "::endgroup::"
