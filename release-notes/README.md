@@ -56,8 +56,15 @@ search filtered to the same track. Resolution precedence:
    `<prefix>/v*`. Otherwise `v*`.
 
 Most callers need nothing: tags following the `<action>/vMAJOR.MINOR.PATCH`
-convention auto-derive the right pattern. Set `tag-pattern` explicitly only when
-your tag scheme doesn't fit either default.
+convention auto-derive the right pattern. Nested path prefixes (e.g.
+`foo/bar/v1.0.0`) also auto-derive correctly to `foo/bar/v*`. Set
+`tag-pattern` explicitly only when your tag scheme doesn't fit either default.
+
+If no tag matches the resolved pattern (e.g. the first release on a new
+track), `git describe` returns nothing and the action falls back to
+summarising the full reachable history for `current-tag` — appropriate for
+initial releases, but worth knowing if you ever see unexpectedly long
+release notes.
 
 ```yaml
 # Non-default scheme: filter to "rel-*" tags

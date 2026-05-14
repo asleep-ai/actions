@@ -56,13 +56,13 @@ runs:
         TAG_PATTERN: ${{ inputs.tag-pattern }}
       run: |
         set -euo pipefail
-        if [ -n "$PREV_INPUT" ]; then
+        if [[ -n "$PREV_INPUT" ]]; then
           PREV="$PREV_INPUT"
           echo "Previous tag (explicit): $PREV"
         else
-          if [ -n "$TAG_PATTERN" ]; then
+          if [[ -n "$TAG_PATTERN" ]]; then
             PATTERN="$TAG_PATTERN"
-          elif [[ "$CUR" =~ ^([^/]+)/v[0-9] ]]; then
+          elif [[ "$CUR" =~ ^(.+)/v[0-9] ]]; then
             PATTERN="${BASH_REMATCH[1]}/v*"
           else
             PATTERN="v*"
