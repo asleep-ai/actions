@@ -11,7 +11,7 @@ Env:
   CUR              required -- current tag (e.g., v0.5.0)
   PREV             optional -- previous tag; if empty, full history is used
   OPENAI_API_KEY   required for AI summary; without it the commit list is returned
-  OPENAI_MODEL     optional -- default: gpt-5.4
+  OPENAI_MODEL     optional -- default: gpt-5.5
   SYSTEM_PROMPT    optional -- override default prompt
 
 Stdout: markdown. Never exits non-zero for AI failure -- always emits a usable
@@ -133,7 +133,7 @@ def main() -> int:
 
     prev = os.environ.get("PREV") or None
     api_key = os.environ.get("OPENAI_API_KEY")
-    model = os.environ.get("OPENAI_MODEL", "gpt-5.4")
+    model = os.environ.get("OPENAI_MODEL", "gpt-5.5")
     system_prompt = os.environ.get("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT
 
     commits = git_commit_list(prev, cur)

@@ -33,7 +33,7 @@ The action **only writes the markdown file**. Release creation, asset attachment
 | `previous-tag` | no | _auto_ | Previous tag bounding the commit range. Auto-derived via `git describe --tags --match=<pattern> --abbrev=0 $CUR^` when empty. |
 | `tag-pattern` | no | _auto_ | Pattern passed to `git describe --match` when auto-deriving the previous tag. Defaults to `<prefix>/v*.*` for path-prefixed tags, otherwise `v*`. See [Multi-track repos](#multi-track-repos). |
 | `openai-api-key` | no | _empty_ | OpenAI API key. **If unset, fallback emits a plain commit-list summary.** |
-| `openai-model` | no | `gpt-5.4` | OpenAI model name. |
+| `openai-model` | no | `gpt-5.5` | OpenAI model name. |
 | `system-prompt` | no | _built-in_ | Override the default prompt. Useful when the caller wants Korean output, different sections, or a domain-specific tone. |
 | `output-file` | no | `release-notes.md` | Path where the markdown is written. |
 

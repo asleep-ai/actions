@@ -28,7 +28,7 @@ inputs:
   openai-model:
     description: 'OpenAI model name.'
     required: false
-    default: 'gpt-5.4'
+    default: 'gpt-5.5'
   system-prompt:
     description: 'Override the default system prompt. Pass a string (heredoc-friendly). Leave blank to use the built-in generic library/service prompt.'
     required: false
