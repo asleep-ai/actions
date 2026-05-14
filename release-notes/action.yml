@@ -14,9 +14,11 @@ inputs:
     description: |
       Pattern passed to `git describe --tags --match` when auto-deriving the
       previous tag. Defaults to a pattern inferred from `current-tag`:
-      `<prefix>/v*` for path-prefixed tags (e.g. `release-notes/v1.0.1` →
-      `release-notes/v*`), otherwise `v*`. Set explicitly for repos with
-      non-standard tag naming. Ignored when `previous-tag` is set.
+      `<prefix>/v*.*` for path-prefixed tags (e.g. `release-notes/v1.0.1` →
+      `release-notes/v*.*`), otherwise `v*`. The `*.*` excludes bare-major
+      floating tags (`release-notes/v1`) so semver tags win the
+      `git describe` tie-break. Set explicitly for repos with non-standard
+      tag naming. Ignored when `previous-tag` is set.
     required: false
     default: ''
   openai-api-key:
@@ -63,7 +65,7 @@ runs:
           if [[ -n "$TAG_PATTERN" ]]; then
             PATTERN="$TAG_PATTERN"
           elif [[ "$CUR" =~ ^(.+)/v[0-9] ]]; then
-            PATTERN="${BASH_REMATCH[1]}/v*"
+            PATTERN="${BASH_REMATCH[1]}/v*.*"
           else
             PATTERN="v*"
           fi
