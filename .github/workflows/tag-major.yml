@@ -1,0 +1,44 @@
+name: Update major tag
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  update-major:
+    # Skip prereleases -- floating major tag should only track stable patches.
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve major tag
+        id: major
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          # Expect tags shaped like <action>/vMAJOR.MINOR.PATCH, e.g.
+          # release-notes/v1.0.1 -> release-notes/v1
+          if [[ "$TAG" =~ ^([^/]+)/v([0-9]+)\.[0-9]+\.[0-9]+$ ]]; then
+            MAJOR_TAG="${BASH_REMATCH[1]}/v${BASH_REMATCH[2]}"
+            echo "tag=$MAJOR_TAG" >> "$GITHUB_OUTPUT"
+            echo "Will fast-forward $MAJOR_TAG to $GITHUB_SHA (was $TAG)"
+          else
+            echo "::warning::Tag '$TAG' is not <action>/vMAJOR.MINOR.PATCH; skipping floating-tag update"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Force-update major tag
+        if: steps.major.outputs.tag != ''
+        env:
+          MAJOR: ${{ steps.major.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git tag -f "$MAJOR" "$GITHUB_SHA"
+          git push origin "$MAJOR" --force
