@@ -28,6 +28,6 @@ Consumers pin to the major (`@release-notes/v1`) for floating bug-fix updates, o
 4. Tag the release: `<name>/v1.0.0`.
 5. Create a GitHub Release scoped to that tag.
 
-## Visibility policy
+## Visibility
 
-This repo is **private**. The actions inside have no proprietary content, but keeping the surface private avoids accidental external-user support burden. Spin out an action to its own public repo only when external adoption is the actual goal.
+This repo is **public**. The actions have no proprietary content and the OPENAI_API_KEY (or equivalent) is always caller-injected, so making them inspectable carries no real cost. External adoption is not a goal -- issues filed by non-org users may not get prompt triage.
