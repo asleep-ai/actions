@@ -17,8 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
 
       - name: Resolve major tag
         id: major
@@ -29,22 +27,9 @@ jobs:
           # Expect tags shaped like <action>/vMAJOR.MINOR.PATCH, e.g.
           # release-notes/v1.0.1 -> release-notes/v1
           if [[ "$TAG" =~ ^([^/]+)/v([0-9]+)\.[0-9]+\.[0-9]+$ ]]; then
-            PREFIX="${BASH_REMATCH[1]}"
-            MAJOR="${BASH_REMATCH[2]}"
-            MAJOR_TAG="$PREFIX/v$MAJOR"
-            # Only advance the floating major when this tag is the highest stable
-            # patch on that line -- guards against out-of-order or re-run pushes
-            # racing to move the same major tag. Relies on fetch-depth: 0 above to
-            # see every tag, and -v:refname for numeric (not lexical) version sort.
-            LATEST=$(git tag --list "$PREFIX/v$MAJOR.*" --sort=-v:refname \
-              | grep -E "^$PREFIX/v$MAJOR\.[0-9]+\.[0-9]+$" | head -n1 || true)
-            if [[ "$LATEST" == "$TAG" ]]; then
-              echo "tag=$MAJOR_TAG" >> "$GITHUB_OUTPUT"
-              echo "Will fast-forward $MAJOR_TAG to $GITHUB_SHA (was $TAG)"
-            else
-              echo "::notice::$TAG is not the latest stable patch on $MAJOR_TAG (latest: ${LATEST:-none}); skipping floating-tag update"
-              echo "tag=" >> "$GITHUB_OUTPUT"
-            fi
+            MAJOR_TAG="${BASH_REMATCH[1]}/v${BASH_REMATCH[2]}"
+            echo "tag=$MAJOR_TAG" >> "$GITHUB_OUTPUT"
+            echo "Will fast-forward $MAJOR_TAG to $GITHUB_SHA (was $TAG)"
           else
             echo "::notice::Tag '$TAG' is not <action>/vMAJOR.MINOR.PATCH (prerelease or non-standard); skipping floating-tag update"
             echo "tag=" >> "$GITHUB_OUTPUT"
