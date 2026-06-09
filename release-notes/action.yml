@@ -63,24 +63,17 @@ runs:
           PREV="$PREV_INPUT"
           echo "Previous tag (explicit): $PREV"
         else
-          EXCLUDE=""
           if [[ -n "$TAG_PATTERN" ]]; then
             PATTERN="$TAG_PATTERN"
           elif [[ "$CUR" =~ ^(.+)/v[0-9] ]]; then
             PATTERN="${BASH_REMATCH[1]}/v*.*"
           elif [[ "$CUR" =~ ^([^.]+)-[0-9]{8,}$ ]]; then
             PATTERN="${BASH_REMATCH[1]}-[0-9]*"
-            # The glob only anchors the first digit; also exclude same-prefix
-            # siblings with any non-digit in the suffix (e.g. release-2026-canary)
-            # so only fully-numeric date/sequence tags match.
-            EXCLUDE="${BASH_REMATCH[1]}-*[!0-9]*"
           else
             PATTERN="v*"
           fi
-          ARGS=(--tags --match="$PATTERN" --abbrev=0)
-          if [[ -n "$EXCLUDE" ]]; then ARGS+=(--exclude="$EXCLUDE"); fi
-          PREV=$(git describe "${ARGS[@]}" "$CUR^" 2>/dev/null || true)
-          echo "Tag pattern: $PATTERN${EXCLUDE:+ (exclude: $EXCLUDE)}"
+          PREV=$(git describe --tags --match="$PATTERN" --abbrev=0 "$CUR^" 2>/dev/null || true)
+          echo "Tag pattern: $PATTERN"
           echo "Previous tag (auto): ${PREV:-<none>}"
         fi
         echo "tag=$PREV" >> "$GITHUB_OUTPUT"

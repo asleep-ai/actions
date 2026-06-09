@@ -59,12 +59,11 @@ search filtered to the same track. Resolution precedence:
    - `<prefix>-<8+ digits>` (date- or sequence-stamped) → `<prefix>-[0-9]*`, e.g.
      `release-202606091330` → `release-[0-9]*` or `build-12345678` → `build-[0-9]*`.
      The 8-digit floor matches a `YYYYMMDD` date and avoids catching short suffixes
-     like `foo-3`. Only same-prefix tags whose suffix is entirely digits are
-     considered (via `git describe --match`/`--exclude`), so sibling tracks like
-     `release-notes/...` or `release-2026-canary` are ignored. The prefix must
-     contain no dot and the digits must run to the end, so `release-202606091330`
-     matches but a dotted `v1.2.3-20240115` (semver with a numeric pre-release) or a
-     dash-split `release-20260609-1330` falls through to `v*` (use `tag-pattern`).
+     like `foo-3`; the digit after the hyphen keeps `release-[0-9]*` from also
+     matching a sibling track like `release-notes/...`. The prefix must contain no
+     dot and the digits must run to the end, so `release-202606091330` matches but
+     a dotted `v1.2.3-20240115` (semver with a numeric pre-release) or a dash-split
+     `release-20260609-1330` falls through to `v*` (use `tag-pattern` if you need those).
    - otherwise → `v*`.
 
 Most callers need nothing: tags following the `<action>/vMAJOR.MINOR.PATCH`
