@@ -9,6 +9,9 @@ permissions:
 
 jobs:
   release:
+    # A tag push also fires on deletion; skip those so a deleted release tag is
+    # never recreated by `gh release create`.
+    if: ${{ !github.event.deleted }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -41,6 +44,7 @@ jobs:
           flags=()
           [[ "$GITHUB_REF_NAME" =~ ^[^/]+/v[0-9]+\.[0-9]+\.[0-9]+$ ]] || flags+=(--prerelease)
           gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
             --title "$GITHUB_REF_NAME" \
             --notes-file "$NOTES_FILE" \
             "${flags[@]}"

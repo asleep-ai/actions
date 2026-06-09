@@ -9,6 +9,8 @@ permissions:
 
 jobs:
   update-major:
+    # Skip tag deletions (a push fires on those too); only act on live tags.
+    if: ${{ !github.event.deleted }}
     # No event-level prerelease check: prereleases (`-rc.1`) and non-standard
     # tags fail the `vMAJOR.MINOR.PATCH` regex below, so the floating major tag
     # tracks only stable patches.
