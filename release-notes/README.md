@@ -58,12 +58,14 @@ search filtered to the same track. Resolution precedence:
      `release-notes/v1`).
    - `<prefix>-<8+ digits>` (date- or sequence-stamped) → `<prefix>-[0-9]*`, e.g.
      `release-202606091330` → `release-[0-9]*` or `build-12345678` → `build-[0-9]*`.
-     The 8-digit floor matches a `YYYYMMDD` date and avoids catching short suffixes
-     like `foo-3`; the digit after the hyphen keeps `release-[0-9]*` from also
-     matching a sibling track like `release-notes/...`. The prefix must contain no
-     dot and the digits must run to the end, so `release-202606091330` matches but
-     a dotted `v1.2.3-20240115` (semver with a numeric pre-release) or a dash-split
-     `release-20260609-1330` falls through to `v*` (use `tag-pattern` if you need those).
+     The 8-digit floor applies to the *current* tag (so `foo-3` as a current tag
+     falls through to `v*`); the previous-tag glob `<prefix>-[0-9]*` then matches
+     any same-prefix numeric sibling. The digit after the hyphen keeps it off an
+     alphabetical track like `release-notes/...`, but a repo mixing date tags with
+     short numeric ones (`release-3`) should set `tag-pattern` to stay on one
+     scheme. Likewise the prefix must contain no dot and the digits must run to the
+     end, so a dotted `v1.2.3-20240115` (semver with a numeric pre-release) or a
+     dash-split `release-20260609-1330` falls through to `v*`.
    - otherwise → `v*`.
 
 Most callers need nothing: tags following the `<action>/vMAJOR.MINOR.PATCH`
