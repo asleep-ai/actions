@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    tags: ['**/v*.*.*']
+    tags: ['*/v*.*.*']  # single-segment prefixes only (this repo's actions are root-level)
 
 permissions:
   contents: write

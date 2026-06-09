@@ -2,7 +2,7 @@ name: Update major tag
 
 on:
   push:
-    tags: ['**/v*.*.*']
+    tags: ['*/v*.*.*']  # single-segment prefixes only; matches the one-level regex below
 
 permissions:
   contents: write
