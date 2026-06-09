@@ -31,7 +31,7 @@ The action **only writes the markdown file**. Release creation, asset attachment
 |------|----------|---------|-------------|
 | `current-tag` | no | `github.ref_name` | Current tag, e.g. `v0.5.0`. Defaults to the tag that triggered the run. |
 | `previous-tag` | no | _auto_ | Previous tag bounding the commit range. Auto-derived via `git describe --tags --match=<pattern> --abbrev=0 $CUR^` when empty. |
-| `tag-pattern` | no | _auto_ | Pattern passed to `git describe --match` when auto-deriving the previous tag. Defaults to `<prefix>/v*.*` for path-prefixed tags, otherwise `v*`. See [Multi-track repos](#multi-track-repos). |
+| `tag-pattern` | no | _auto_ | Pattern passed to `git describe --match` when auto-deriving the previous tag. Defaults to a pattern inferred from `current-tag` (path-prefixed semver, date-stamped, or `v*`). See [Multi-track repos](#multi-track-repos). |
 | `openai-api-key` | no | _empty_ | OpenAI API key. **If unset, fallback emits a plain commit-list summary.** |
 | `openai-model` | no | `gpt-5.5` | OpenAI model name. |
 | `system-prompt` | no | _built-in_ | Override the default prompt. Useful when the caller wants Korean output, different sections, or a domain-specific tone. |
@@ -52,16 +52,25 @@ search filtered to the same track. Resolution precedence:
 
 1. **`previous-tag` set** — used verbatim, no `git describe` call.
 2. **`tag-pattern` set** — passed as-is to `git describe --match`.
-3. **Auto-derived** — if `current-tag` matches `<prefix>/vN...`, pattern is
-   `<prefix>/v*.*` (the `*.*` requires at least one dot, which excludes
-   bare-major floating tags like `release-notes/v1`). Otherwise `v*`.
+3. **Auto-derived** — inferred from `current-tag`:
+   - `<prefix>/vN...` (path-prefixed semver) → `<prefix>/v*.*` (the `*.*`
+     requires at least one dot, which excludes bare-major floating tags like
+     `release-notes/v1`).
+   - `<prefix>-<8+ digits>` (date- or sequence-stamped) → `<prefix>-*`, e.g.
+     `release-202606091330` → `release-*` or `build-12345678` → `build-*`. The
+     8-digit floor matches a `YYYYMMDD` date and avoids catching short suffixes
+     like `foo-3`. The prefix must contain no dot and the digits must run to the
+     end, so `release-202606091330` matches but a dotted `v1.2.3-20240115` (semver
+     with a numeric pre-release) or a dash-split `release-20260609-1330` falls
+     through to `v*` (use `tag-pattern` if you need those).
+   - otherwise → `v*`.
 
 Most callers need nothing: tags following the `<action>/vMAJOR.MINOR.PATCH`
-convention auto-derive the right pattern. Nested path prefixes (e.g.
-`foo/bar/v1.0.0`) also auto-derive correctly to `foo/bar/v*.*`. Set
-`tag-pattern` explicitly only when your tag scheme doesn't fit either default
-(e.g. you use bare-major tags like `foo/v1` as actual releases rather than
-floating pointers).
+convention or a `<prefix>-<timestamp>` deploy scheme both auto-derive the right
+pattern. Nested path prefixes (e.g. `foo/bar/v1.0.0`) also auto-derive correctly
+to `foo/bar/v*.*`. Set `tag-pattern` explicitly only when your tag scheme fits no
+default (e.g. you use bare-major tags like `foo/v1` as actual releases rather
+than floating pointers, or date tags with fewer than 8 digits).
 
 If no tag matches the resolved pattern (e.g. the first release on a new
 track), `git describe` returns nothing and the action falls back to
