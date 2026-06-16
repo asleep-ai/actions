@@ -105,17 +105,20 @@ def pr_body(number: int) -> str:
     request. `gh` is preinstalled on GitHub runners and already used by the
     release workflow; it handles auth (GH_TOKEN/GITHUB_TOKEN), host, and JSON.
     Any failure -- no token, the number is an issue not a PR, an API error,
-    or `gh` not on PATH -- yields an empty string, so the caller falls back
-    to the commit message. Cached so a PR referenced by several commits is
-    fetched at most once.
+    `gh` not on PATH, or a hang past the timeout -- yields an empty string,
+    so the caller falls back to the commit message. Cached so a PR referenced
+    by several commits is fetched at most once.
     """
     try:
         result = subprocess.run(
             ["gh", "pr", "view", str(number), "--json", "body", "--jq", ".body"],
             capture_output=True,
             text=True,
+            timeout=10,
         )
-    except OSError:  # gh not installed / not on PATH
+    except (OSError, subprocess.SubprocessError):
+        # gh absent (OSError) or hung past the timeout (TimeoutExpired, a
+        # SubprocessError). Enrichment is best-effort -- never block a release.
         return ""
     return result.stdout.strip() if result.returncode == 0 else ""
 

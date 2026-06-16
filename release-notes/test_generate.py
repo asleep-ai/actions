@@ -5,6 +5,7 @@ Run: uv run --with pytest --with 'openai>=1.55,<2' python -m pytest test_generat
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 from pathlib import Path
 
 _spec = importlib.util.spec_from_file_location("generate", Path(__file__).with_name("generate.py"))
@@ -34,14 +35,19 @@ def test_format_without_pr_ref_makes_no_lookup(monkeypatch) -> None:
     assert calls == []  # no (#NNN) -> gh is never invoked
 
 
-def test_pr_body_returns_empty_when_gh_missing(monkeypatch) -> None:
-    def boom(*_args: object, **_kwargs: object) -> object:
-        raise FileNotFoundError("gh")
+def test_pr_body_returns_empty_on_subprocess_failure(monkeypatch) -> None:
+    failures = [
+        FileNotFoundError("gh"),                          # gh not on PATH (OSError)
+        subprocess.TimeoutExpired(cmd="gh", timeout=10),  # hang (SubprocessError)
+    ]
+    for exc in failures:
+        def boom(*_args: object, _exc: BaseException = exc, **_kwargs: object) -> object:
+            raise _exc
 
-    monkeypatch.setattr(generate.subprocess, "run", boom)
-    generate.pr_body.cache_clear()
+        monkeypatch.setattr(generate.subprocess, "run", boom)
+        generate.pr_body.cache_clear()
 
-    assert generate.pr_body(99999) == ""  # gh absent -> fallback, no crash
+        assert generate.pr_body(99999) == ""  # best-effort -> fallback, no crash
 
 
 def test_format_dedupes_repeated_ref_within_commit(monkeypatch) -> None:
