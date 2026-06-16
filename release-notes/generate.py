@@ -142,20 +142,37 @@ def pr_body(number: int) -> str:
 # ~80 minutes. Once spent, remaining commits fall back to the message alone.
 ENRICH_BUDGET_S = 120
 
+# Bounds on PR-body text appended to the prompt so a few huge descriptions, or
+# one very long range, cannot push the request past the model's input limit and
+# force a fallback to bare commit subjects for the whole release.
+PR_BODY_CHAR_LIMIT = 4000  # per PR
+PR_BODY_TOTAL_LIMIT = 40000  # across the run
+
+
+def truncate(text: str, limit: int) -> str:
+    """Trim text to `limit` chars, appending a marker when it was cut."""
+    if len(text) <= limit:
+        return text
+    marker = "\n[... truncated]"
+    return text[: max(0, limit - len(marker))].rstrip() + marker
+
 
 def format_commits_for_prompt(commits: list[str]) -> str:
     """Render commits as a numbered list, enriched with referenced PR bodies.
 
     PR-body lookups share a total wall-clock budget (`ENRICH_BUDGET_S`) so a
-    hanging `gh`/API never holds the release for long.
+    hanging `gh`/API never holds the release for long, and appended text is
+    bounded per PR (`PR_BODY_CHAR_LIMIT`) and overall (`PR_BODY_TOTAL_LIMIT`)
+    so a verbose range can't push the request past the model's input limit.
     """
     deadline = time.monotonic() + ENRICH_BUDGET_S
     warned = False
+    chars_used = 0
     blocks: list[str] = []
     for i, entry in enumerate(commits, start=1):
         block = f"### Commit {i}\n{entry.strip()}"
         number = pr_ref(entry)
-        if number is not None:
+        if number is not None and chars_used < PR_BODY_TOTAL_LIMIT:
             if time.monotonic() >= deadline:
                 if not warned:
                     log(f"::warning::PR-body enrichment budget ({ENRICH_BUDGET_S}s) exceeded; remaining commits use commit message only")
@@ -163,7 +180,9 @@ def format_commits_for_prompt(commits: list[str]) -> str:
             else:
                 body = pr_body(number)
                 if body:
-                    block += f"\n\nPR #{number} description:\n{body}"
+                    snippet = truncate(body, PR_BODY_CHAR_LIMIT)
+                    chars_used += len(snippet)
+                    block += f"\n\nPR #{number} description:\n{snippet}"
         blocks.append(block)
     return "\n\n".join(blocks)
 

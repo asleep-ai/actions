@@ -82,3 +82,24 @@ def test_enrichment_respects_total_budget(monkeypatch) -> None:
     generate.format_commits_for_prompt(["First (#1)", "Second (#2)"])
 
     assert fetched == [1]  # budget spent before the second commit's lookup
+
+
+def test_pr_body_is_truncated_to_char_limit(monkeypatch) -> None:
+    long_body = "x" * (generate.PR_BODY_CHAR_LIMIT + 500)
+    monkeypatch.setattr(generate, "pr_body", lambda _n: long_body)
+
+    out = generate.format_commits_for_prompt(["Big PR (#7)"])
+
+    assert "[... truncated]" in out
+    assert out.count("x") <= generate.PR_BODY_CHAR_LIMIT  # capped, not verbatim
+
+
+def test_total_pr_body_budget_caps_appended_text(monkeypatch) -> None:
+    body = "y" * generate.PR_BODY_CHAR_LIMIT
+    monkeypatch.setattr(generate, "pr_body", lambda _n: body)
+    count = generate.PR_BODY_TOTAL_LIMIT // generate.PR_BODY_CHAR_LIMIT + 3
+    commits = [f"Change {i} (#{i})" for i in range(1, count + 1)]
+
+    out = generate.format_commits_for_prompt(commits)
+
+    assert out.count("description:") < count  # stops once the total budget is spent
