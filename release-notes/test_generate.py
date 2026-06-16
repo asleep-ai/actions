@@ -50,18 +50,26 @@ def test_pr_body_returns_empty_on_subprocess_failure(monkeypatch) -> None:
         assert generate.pr_body(99999) == ""  # best-effort -> fallback, no crash
 
 
-def test_format_dedupes_repeated_ref_within_commit(monkeypatch) -> None:
-    calls: list[int] = []
+def test_enrichment_uses_trailing_subject_ref_only(monkeypatch) -> None:
+    fetched: list[int] = []
+    monkeypatch.setattr(generate, "pr_body", lambda n: fetched.append(n) or f"body {n}")
 
-    def fake(n: int) -> str:
-        calls.append(n)
-        return "body"
+    out = generate.format_commits_for_prompt(['Revert "Feature (#42)" (#43)'])
 
-    monkeypatch.setattr(generate, "pr_body", fake)
+    assert fetched == [43]  # the merge PR, not the reverted original #42
+    assert "PR #43 description:\nbody 43" in out
+    assert "PR #42 description:" not in out
 
-    generate.format_commits_for_prompt(["Revert revert of thing (#42) (#42)"])
 
-    assert calls == [42]  # looked up once despite two refs
+def test_enrichment_ignores_refs_outside_subject(monkeypatch) -> None:
+    fetched: list[int] = []
+    monkeypatch.setattr(generate, "pr_body", lambda n: fetched.append(n) or "body")
+
+    entry = "Tidy helper\n\nFollow-up to (#41); see also (#40)."
+    out = generate.format_commits_for_prompt([entry])
+
+    assert fetched == []  # refs only in the body are not enriched
+    assert "PR #" not in out  # nothing appended
 
 
 def test_enrichment_respects_total_budget(monkeypatch) -> None:

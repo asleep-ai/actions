@@ -94,7 +94,19 @@ def fallback(commits: list[str]) -> str:
     return f"## Changes\n\n{commit_subjects_only(commits)}\n"
 
 
-PR_REF_RE = re.compile(r"\(#(\d+)\)")
+# The squash-merge PR ref is the trailing `(#N)` on the subject line. Anchoring
+# to the line end avoids refs embedded in the title/body -- e.g. a revert subject
+# `Revert "Feature (#42)" (#43)` must enrich with #43, not the reverted #42.
+PR_REF_RE = re.compile(r"\(#(\d+)\)\s*$")
+
+
+def pr_ref(entry: str) -> int | None:
+    """Return the squash-merge PR number from a commit's subject line, if any."""
+    for line in entry.splitlines():
+        if line.strip():  # first non-blank line is the subject
+            match = PR_REF_RE.search(line)
+            return int(match.group(1)) if match else None
+    return None
 
 
 @functools.cache
@@ -142,15 +154,16 @@ def format_commits_for_prompt(commits: list[str]) -> str:
     blocks: list[str] = []
     for i, entry in enumerate(commits, start=1):
         block = f"### Commit {i}\n{entry.strip()}"
-        for number in dict.fromkeys(PR_REF_RE.findall(entry)):  # dedupe, keep order
+        number = pr_ref(entry)
+        if number is not None:
             if time.monotonic() >= deadline:
                 if not warned:
                     log(f"::warning::PR-body enrichment budget ({ENRICH_BUDGET_S}s) exceeded; remaining commits use commit message only")
                     warned = True
-                break
-            body = pr_body(int(number))
-            if body:
-                block += f"\n\nPR #{number} description:\n{body}"
+            else:
+                body = pr_body(number)
+                if body:
+                    block += f"\n\nPR #{number} description:\n{body}"
         blocks.append(block)
     return "\n\n".join(blocks)
 
