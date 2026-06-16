@@ -23,9 +23,12 @@ are available locally.
 """
 from __future__ import annotations
 
+import functools
 import os
+import re
 import subprocess
 import sys
+import time
 
 from openai import OpenAI, OpenAIError
 
@@ -91,11 +94,97 @@ def fallback(commits: list[str]) -> str:
     return f"## Changes\n\n{commit_subjects_only(commits)}\n"
 
 
+# The squash-merge PR ref is the trailing `(#N)` on the subject line. Anchoring
+# to the line end avoids refs embedded in the title/body -- e.g. a revert subject
+# `Revert "Feature (#42)" (#43)` must enrich with #43, not the reverted #42.
+PR_REF_RE = re.compile(r"\(#(\d+)\)\s*$")
+
+
+def pr_ref(entry: str) -> int | None:
+    """Return the squash-merge PR number from a commit's subject line, if any."""
+    for line in entry.splitlines():
+        if line.strip():  # first non-blank line is the subject
+            match = PR_REF_RE.search(line)
+            return int(match.group(1)) if match else None
+    return None
+
+
+@functools.cache
+def pr_body(number: int) -> str:
+    """Fetch a pull request's description via the `gh` CLI.
+
+    Squash merges frequently land with an empty commit body, so the PR
+    rationale, compatibility notes, and verification live only on the pull
+    request. `gh` is preinstalled on GitHub runners and already used by the
+    release workflow; it handles auth (GH_TOKEN/GITHUB_TOKEN), host, and JSON.
+    Any failure -- no token, the number is an issue not a PR, an API error,
+    `gh` not on PATH, or a hang past the timeout -- yields an empty string,
+    so the caller falls back to the commit message. Cached so a PR referenced
+    by several commits is fetched at most once.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", str(number), "--json", "body", "--jq", ".body"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # gh absent (OSError) or hung past the timeout (TimeoutExpired, a
+        # SubprocessError). Enrichment is best-effort -- never block a release.
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+# Wall-clock cap on PR-body enrichment across the whole run. gh calls are
+# normally sub-second; this only bites during a sustained gh/API hang, where
+# 500 commits * the 10s per-PR timeout could otherwise stall a release for
+# ~80 minutes. Once spent, remaining commits fall back to the message alone.
+ENRICH_BUDGET_S = 120
+
+# Bounds on PR-body text appended to the prompt so a few huge descriptions, or
+# one very long range, cannot push the request past the model's input limit and
+# force a fallback to bare commit subjects for the whole release.
+PR_BODY_CHAR_LIMIT = 4000  # per PR
+PR_BODY_TOTAL_LIMIT = 40000  # across the run
+
+
+def truncate(text: str, limit: int) -> str:
+    """Trim text to `limit` chars, appending a marker when it was cut."""
+    if len(text) <= limit:
+        return text
+    marker = "\n[... truncated]"
+    return text[: max(0, limit - len(marker))].rstrip() + marker
+
+
 def format_commits_for_prompt(commits: list[str]) -> str:
-    """Render commits as a numbered list for the AI prompt."""
-    return "\n\n".join(
-        f"### Commit {i}\n{entry.strip()}" for i, entry in enumerate(commits, start=1)
-    )
+    """Render commits as a numbered list, enriched with referenced PR bodies.
+
+    PR-body lookups share a total wall-clock budget (`ENRICH_BUDGET_S`) so a
+    hanging `gh`/API never holds the release for long, and appended text is
+    bounded per PR (`PR_BODY_CHAR_LIMIT`) and overall (`PR_BODY_TOTAL_LIMIT`)
+    so a verbose range can't push the request past the model's input limit.
+    """
+    deadline = time.monotonic() + ENRICH_BUDGET_S
+    warned = False
+    chars_used = 0
+    blocks: list[str] = []
+    for i, entry in enumerate(commits, start=1):
+        block = f"### Commit {i}\n{entry.strip()}"
+        number = pr_ref(entry)
+        if number is not None and chars_used < PR_BODY_TOTAL_LIMIT:
+            if time.monotonic() >= deadline:
+                if not warned:
+                    log(f"::warning::PR-body enrichment budget ({ENRICH_BUDGET_S}s) exceeded; remaining commits use commit message only")
+                    warned = True
+            else:
+                body = pr_body(number)
+                if body:
+                    snippet = truncate(body, PR_BODY_CHAR_LIMIT)
+                    chars_used += len(snippet)
+                    block += f"\n\nPR #{number} description:\n{snippet}"
+        blocks.append(block)
+    return "\n\n".join(blocks)
 
 
 def generate_ai_notes(

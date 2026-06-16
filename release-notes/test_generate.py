@@ -1,0 +1,105 @@
+"""Unit tests for generate.py.
+
+Run: uv run --with pytest --with 'openai>=1.55,<2' python -m pytest test_generate.py
+"""
+from __future__ import annotations
+
+import importlib.util
+import subprocess
+from pathlib import Path
+
+_spec = importlib.util.spec_from_file_location("generate", Path(__file__).with_name("generate.py"))
+assert _spec is not None and _spec.loader is not None
+generate = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(generate)
+
+
+def test_format_enriches_with_pr_body(monkeypatch) -> None:
+    monkeypatch.setattr(
+        generate, "pr_body", lambda n: "Fixes a release-only R8/JNI crash." if n == 476 else ""
+    )
+
+    out = generate.format_commits_for_prompt(["Update wakeword service to 0.1.1 (#476)"])
+
+    assert "Update wakeword service to 0.1.1 (#476)" in out  # subject + ref preserved
+    assert "PR #476 description:\nFixes a release-only R8/JNI crash." in out  # body injected
+
+
+def test_format_without_pr_ref_makes_no_lookup(monkeypatch) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr(generate, "pr_body", lambda n: calls.append(n) or "should-not-appear")
+
+    out = generate.format_commits_for_prompt(["Tidy internal helper"])
+
+    assert out == "### Commit 1\nTidy internal helper"  # unchanged
+    assert calls == []  # no (#NNN) -> gh is never invoked
+
+
+def test_pr_body_returns_empty_on_subprocess_failure(monkeypatch) -> None:
+    failures = [
+        FileNotFoundError("gh"),                          # gh not on PATH (OSError)
+        subprocess.TimeoutExpired(cmd="gh", timeout=10),  # hang (SubprocessError)
+    ]
+    for exc in failures:
+        def boom(*_args: object, _exc: BaseException = exc, **_kwargs: object) -> object:
+            raise _exc
+
+        monkeypatch.setattr(generate.subprocess, "run", boom)
+        generate.pr_body.cache_clear()
+
+        assert generate.pr_body(99999) == ""  # best-effort -> fallback, no crash
+
+
+def test_enrichment_uses_trailing_subject_ref_only(monkeypatch) -> None:
+    fetched: list[int] = []
+    monkeypatch.setattr(generate, "pr_body", lambda n: fetched.append(n) or f"body {n}")
+
+    out = generate.format_commits_for_prompt(['Revert "Feature (#42)" (#43)'])
+
+    assert fetched == [43]  # the merge PR, not the reverted original #42
+    assert "PR #43 description:\nbody 43" in out
+    assert "PR #42 description:" not in out
+
+
+def test_enrichment_ignores_refs_outside_subject(monkeypatch) -> None:
+    fetched: list[int] = []
+    monkeypatch.setattr(generate, "pr_body", lambda n: fetched.append(n) or "body")
+
+    entry = "Tidy helper\n\nFollow-up to (#41); see also (#40)."
+    out = generate.format_commits_for_prompt([entry])
+
+    assert fetched == []  # refs only in the body are not enriched
+    assert "PR #" not in out  # nothing appended
+
+
+def test_enrichment_respects_total_budget(monkeypatch) -> None:
+    fetched: list[int] = []
+    monkeypatch.setattr(generate, "pr_body", lambda n: fetched.append(n) or "body")
+    # monotonic(): set deadline, commit 1 under budget, then over for the rest.
+    ticks = iter([0.0, 0.0] + [10_000.0] * 10)
+    monkeypatch.setattr(generate.time, "monotonic", lambda: next(ticks))
+
+    generate.format_commits_for_prompt(["First (#1)", "Second (#2)"])
+
+    assert fetched == [1]  # budget spent before the second commit's lookup
+
+
+def test_pr_body_is_truncated_to_char_limit(monkeypatch) -> None:
+    long_body = "x" * (generate.PR_BODY_CHAR_LIMIT + 500)
+    monkeypatch.setattr(generate, "pr_body", lambda _n: long_body)
+
+    out = generate.format_commits_for_prompt(["Big PR (#7)"])
+
+    assert "[... truncated]" in out
+    assert out.count("x") <= generate.PR_BODY_CHAR_LIMIT  # capped, not verbatim
+
+
+def test_total_pr_body_budget_caps_appended_text(monkeypatch) -> None:
+    body = "y" * generate.PR_BODY_CHAR_LIMIT
+    monkeypatch.setattr(generate, "pr_body", lambda _n: body)
+    count = generate.PR_BODY_TOTAL_LIMIT // generate.PR_BODY_CHAR_LIMIT + 3
+    commits = [f"Change {i} (#{i})" for i in range(1, count + 1)]
+
+    out = generate.format_commits_for_prompt(commits)
+
+    assert out.count("description:") < count  # stops once the total budget is spent

@@ -33,6 +33,7 @@ The action **only writes the markdown file**. Release creation, asset attachment
 | `previous-tag` | no | _auto_ | Previous tag bounding the commit range. Auto-derived via `git describe --tags --match=<pattern> --abbrev=0 $CUR^` when empty. |
 | `tag-pattern` | no | _auto_ | Pattern passed to `git describe --match` when auto-deriving the previous tag. Defaults to a pattern inferred from `current-tag` (path-prefixed semver, date-stamped, or `v*`). See [Multi-track repos](#multi-track-repos). |
 | `openai-api-key` | no | _empty_ | OpenAI API key. **If unset, fallback emits a plain commit-list summary.** |
+| `github-token` | no | `github.token` | Token `gh` uses to fetch PR descriptions for squash-merge commits referencing `(#NNN)`. Needs `pull-requests: read`. Falls back to commit messages if unset/insufficient. |
 | `openai-model` | no | `gpt-5.5` | OpenAI model name. |
 | `system-prompt` | no | _built-in_ | Override the default prompt. Useful when the caller wants Korean output, different sections, or a domain-specific tone. |
 | `output-file` | no | `release-notes.md` | Path where the markdown is written. |
@@ -93,6 +94,7 @@ release notes.
 
 - **Checkout must use `fetch-depth: 0`.** The action runs `git log` and `git describe` locally; a shallow checkout will miss tags and historical commits.
 - **Caller owns release creation.** The action is intentionally split from `gh release create` so the caller can decide on assets, drafts, prerelease, idempotency, and title.
+- **PR descriptions are best-effort.** When a commit subject references a PR like `(#476)`, the action fetches that PR's body with `gh` and feeds it to the model, so squash merges with empty commit bodies still produce informed notes. Restrictive workflows must grant `pull-requests: read`; a missing token or API failure falls back to the commit message with no error.
 - **AI failure is non-fatal.** If `openai-api-key` is empty or the API call fails, the action emits a `## Changes` heading followed by a bullet list of commit subjects. Tagging proceeds normally.
 
 ## Fallback output shape

@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: read  # release-notes fetches PR bodies via gh for squash merges
 
 jobs:
   release:
