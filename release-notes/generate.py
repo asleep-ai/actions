@@ -23,7 +23,9 @@ are available locally.
 """
 from __future__ import annotations
 
+import functools
 import os
+import re
 import subprocess
 import sys
 
@@ -91,11 +93,44 @@ def fallback(commits: list[str]) -> str:
     return f"## Changes\n\n{commit_subjects_only(commits)}\n"
 
 
+PR_REF_RE = re.compile(r"\(#(\d+)\)")
+
+
+@functools.cache
+def pr_body(number: int) -> str:
+    """Fetch a pull request's description via the `gh` CLI.
+
+    Squash merges frequently land with an empty commit body, so the PR
+    rationale, compatibility notes, and verification live only on the pull
+    request. `gh` is preinstalled on GitHub runners and already used by the
+    release workflow; it handles auth (GH_TOKEN/GITHUB_TOKEN), host, and JSON.
+    Any failure -- no token, the number is an issue not a PR, an API error,
+    or `gh` not on PATH -- yields an empty string, so the caller falls back
+    to the commit message. Cached so a PR referenced by several commits is
+    fetched at most once.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", str(number), "--json", "body", "--jq", ".body"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:  # gh not installed / not on PATH
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
 def format_commits_for_prompt(commits: list[str]) -> str:
-    """Render commits as a numbered list for the AI prompt."""
-    return "\n\n".join(
-        f"### Commit {i}\n{entry.strip()}" for i, entry in enumerate(commits, start=1)
-    )
+    """Render commits as a numbered list, enriched with referenced PR bodies."""
+    blocks: list[str] = []
+    for i, entry in enumerate(commits, start=1):
+        block = f"### Commit {i}\n{entry.strip()}"
+        for number in dict.fromkeys(PR_REF_RE.findall(entry)):  # dedupe, keep order
+            body = pr_body(int(number))
+            if body:
+                block += f"\n\nPR #{number} description:\n{body}"
+        blocks.append(block)
+    return "\n\n".join(blocks)
 
 
 def generate_ai_notes(

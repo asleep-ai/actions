@@ -26,6 +26,10 @@ inputs:
     description: 'OpenAI API key. If unset, the action falls back to a plain commit-list summary so a missing secret never blocks the release.'
     required: false
     default: ''
+  github-token:
+    description: 'Token `gh` uses to fetch PR descriptions for squash-merge commits referencing `(#NNN)`. Needs `pull-requests: read`. If unset or insufficient, the action falls back to commit messages only.'
+    required: false
+    default: ${{ github.token }}
   openai-model:
     description: 'OpenAI model name.'
     required: false
@@ -89,6 +93,7 @@ runs:
         CUR: ${{ inputs.current-tag }}
         PREV: ${{ steps.prev.outputs.tag }}
         OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        GH_TOKEN: ${{ inputs.github-token }}
         OPENAI_MODEL: ${{ inputs.openai-model }}
         SYSTEM_PROMPT: ${{ inputs.system-prompt }}
         OUTPUT_FILE: ${{ inputs.output-file }}
