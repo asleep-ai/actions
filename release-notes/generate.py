@@ -28,6 +28,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 from openai import OpenAI, OpenAIError
 
@@ -123,12 +124,30 @@ def pr_body(number: int) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+# Wall-clock cap on PR-body enrichment across the whole run. gh calls are
+# normally sub-second; this only bites during a sustained gh/API hang, where
+# 500 commits * the 10s per-PR timeout could otherwise stall a release for
+# ~80 minutes. Once spent, remaining commits fall back to the message alone.
+ENRICH_BUDGET_S = 120
+
+
 def format_commits_for_prompt(commits: list[str]) -> str:
-    """Render commits as a numbered list, enriched with referenced PR bodies."""
+    """Render commits as a numbered list, enriched with referenced PR bodies.
+
+    PR-body lookups share a total wall-clock budget (`ENRICH_BUDGET_S`) so a
+    hanging `gh`/API never holds the release for long.
+    """
+    deadline = time.monotonic() + ENRICH_BUDGET_S
+    warned = False
     blocks: list[str] = []
     for i, entry in enumerate(commits, start=1):
         block = f"### Commit {i}\n{entry.strip()}"
         for number in dict.fromkeys(PR_REF_RE.findall(entry)):  # dedupe, keep order
+            if time.monotonic() >= deadline:
+                if not warned:
+                    log(f"::warning::PR-body enrichment budget ({ENRICH_BUDGET_S}s) exceeded; remaining commits use commit message only")
+                    warned = True
+                break
             body = pr_body(int(number))
             if body:
                 block += f"\n\nPR #{number} description:\n{body}"

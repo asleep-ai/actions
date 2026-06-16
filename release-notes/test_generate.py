@@ -62,3 +62,15 @@ def test_format_dedupes_repeated_ref_within_commit(monkeypatch) -> None:
     generate.format_commits_for_prompt(["Revert revert of thing (#42) (#42)"])
 
     assert calls == [42]  # looked up once despite two refs
+
+
+def test_enrichment_respects_total_budget(monkeypatch) -> None:
+    fetched: list[int] = []
+    monkeypatch.setattr(generate, "pr_body", lambda n: fetched.append(n) or "body")
+    # monotonic(): set deadline, commit 1 under budget, then over for the rest.
+    ticks = iter([0.0, 0.0] + [10_000.0] * 10)
+    monkeypatch.setattr(generate.time, "monotonic", lambda: next(ticks))
+
+    generate.format_commits_for_prompt(["First (#1)", "Second (#2)"])
+
+    assert fetched == [1]  # budget spent before the second commit's lookup
