@@ -1,0 +1,29 @@
+name: pytest
+
+on:
+  pull_request:
+    paths:
+      - 'release-notes/**'
+  push:
+    branches: [main]
+    paths:
+      - 'release-notes/**'
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # `--with openai` because generate.py imports it at module load; the unit
+      # tests stub the network and never call OpenAI, so the version is unpinned.
+      - name: Run tests
+        run: uv run --with pytest --with openai python -m pytest release-notes -q
