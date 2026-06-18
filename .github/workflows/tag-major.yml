@@ -16,7 +16,7 @@ jobs:
     # tracks only stable patches.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Resolve major tag
         id: major
