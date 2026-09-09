@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "openai>=1.55,<2",
+#     "openai>=1.58,<2",
 # ]
 # ///
 """Generate markdown release notes from a git tag range via OpenAI.
@@ -11,11 +11,17 @@ Env:
   CUR              required -- current tag (e.g., v0.5.0)
   PREV             optional -- previous tag; if empty, full history is used
   OPENAI_API_KEY   required for AI summary; without it the commit list is returned
-  OPENAI_MODEL     optional -- default: gpt-5.5
+  OPENAI_MODEL     optional -- default: gpt-6-astra
+  REASONING_EFFORT optional -- default: low; empty omits the parameter
   SYSTEM_PROMPT    optional -- override default prompt
 
 Stdout: markdown. Never exits non-zero for AI failure -- always emits a usable
 fallback so release creation isn't blocked by an OpenAI outage.
+
+Run report: every run publishes what happened (status, model, tokens, estimated
+cost) to the job -- a table in $GITHUB_STEP_SUMMARY, key=value pairs in
+$GITHUB_OUTPUT, and one `::notice::` annotation carrying the record as JSON so
+it stays queryable after the run via the check-run annotations API.
 
 Caller contract: the workflow that invokes this script must have checked out
 the repository with `fetch-depth: 0` so all tags and the full commit graph
@@ -24,11 +30,13 @@ are available locally.
 from __future__ import annotations
 
 import functools
+import json
 import os
 import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 
 from openai import OpenAI, OpenAIError
 
@@ -187,6 +195,150 @@ def format_commits_for_prompt(commits: list[str]) -> str:
     return "\n\n".join(blocks)
 
 
+# USD per 1M tokens (input, cached input, output) for the run report's cost
+# estimate, keyed by exact model name; a dated snapshot suffix
+# (`gpt-5.5-2026-04-23`) is stripped before lookup. Anything else -- including
+# unlisted variants that merely share a prefix -- reports tokens but no cost
+# rather than a guessed price.
+# Source: https://developers.openai.com/api/docs/pricing (2026-09-04)
+MODEL_PRICES_USD_PER_1M: dict[str, tuple[float, float, float]] = {
+    "gpt-6-astra": (10.00, 1.00, 50.00),
+    "gpt-5.6-sol": (4.00, 0.40, 20.00),
+    "gpt-5.6-terra": (2.00, 0.20, 12.00),
+    "gpt-5.6-luna": (0.20, 0.02, 1.20),
+    "gpt-5.6": (4.00, 0.40, 20.00),  # alias of gpt-5.6-sol
+    "gpt-5.5": (5.00, 0.50, 30.00),
+    "gpt-5.4-mini": (0.75, 0.075, 4.50),
+    "gpt-5.4-nano": (0.20, 0.02, 1.25),
+    "gpt-5.4": (2.50, 0.25, 15.00),
+    "gpt-5-mini": (0.25, 0.025, 2.00),
+    "gpt-5-nano": (0.05, 0.005, 0.40),
+}
+
+
+@dataclass(frozen=True)
+class Usage:
+    """Token counts from a Chat Completions response; zeros when no call was made."""
+
+    prompt_tokens: int = 0
+    cached_tokens: int = 0  # the part of prompt_tokens billed at the cached rate
+    completion_tokens: int = 0
+
+    @classmethod
+    def from_response(cls, resp: object) -> Usage:
+        usage = getattr(resp, "usage", None)
+        details = getattr(usage, "prompt_tokens_details", None)
+        return cls(
+            prompt_tokens=getattr(usage, "prompt_tokens", None) or 0,
+            cached_tokens=getattr(details, "cached_tokens", None) or 0,
+            completion_tokens=getattr(usage, "completion_tokens", None) or 0,
+        )
+
+
+SNAPSHOT_SUFFIX_RE = re.compile(r"-\d{4}-\d{2}-\d{2}$")
+
+
+def estimate_cost_usd(model: str, usage: Usage) -> float | None:
+    """Estimate spend from the price table; None when the model is not listed."""
+    prices = MODEL_PRICES_USD_PER_1M.get(SNAPSHOT_SUFFIX_RE.sub("", model))
+    if prices is None:
+        return None
+    in_price, cached_price, out_price = prices
+    uncached = max(usage.prompt_tokens - usage.cached_tokens, 0)
+    total = uncached * in_price + usage.cached_tokens * cached_price + usage.completion_tokens * out_price
+    return total / 1_000_000
+
+
+@dataclass
+class RunReport:
+    """What this run did, published for humans and for later aggregation."""
+
+    tag: str
+    model: str
+    status: str = "fallback"  # "ai" once model output was used
+    reason: str = ""  # why the fallback was used: no-commits | no-api-key | openai-error | empty-response
+    commits: int = 0
+    usage: Usage = field(default_factory=Usage)
+    duration_s: float = 0.0  # wall-clock of the model call only
+
+    def as_record(self) -> dict[str, object]:
+        cost = estimate_cost_usd(self.model, self.usage)
+        return {
+            "tag": self.tag,
+            "action_ref": os.environ.get("GITHUB_ACTION_REF", ""),
+            "status": self.status,
+            "reason": self.reason,
+            "model": self.model,
+            "commits": self.commits,
+            "prompt_tokens": self.usage.prompt_tokens,
+            "cached_tokens": self.usage.cached_tokens,
+            "completion_tokens": self.usage.completion_tokens,
+            "estimated_cost_usd": None if cost is None else round(cost, 6),
+            "duration_s": round(self.duration_s, 2),
+        }
+
+
+def annotation_escape(text: str) -> str:
+    """Escape a workflow-command value (`::notice::...`) per the runner's rules."""
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def summary_markdown(record: dict[str, object]) -> str:
+    cost = record["estimated_cost_usd"]
+    cost_text = "n/a" if cost is None else f"${cost:.4f}"
+    status = f"{record['status']} ({record['reason']})" if record["reason"] else str(record["status"])
+    return (
+        "### Release notes report\n\n"
+        "| Tag | Status | Model | Commits | Prompt tokens (cached) | Completion tokens | Est. cost | Model call |\n"
+        "|---|---|---|---|---|---|---|---|\n"
+        f"| `{record['tag']}` | {status} | `{record['model']}` | {record['commits']} "
+        f"| {record['prompt_tokens']:,} ({record['cached_tokens']:,}) | {record['completion_tokens']:,} "
+        f"| {cost_text} | {record['duration_s']}s |\n"
+    )
+
+
+def append_to(path_env: str, text: str) -> None:
+    """Append to the file a runner-provided env var names; no-op outside Actions."""
+    path = os.environ.get(path_env)
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(text)
+
+
+def publish_report(report: RunReport) -> None:
+    """Publish the run record to the job.
+
+    Three sinks: `$GITHUB_STEP_SUMMARY` (a table for humans), `$GITHUB_OUTPUT`
+    (values for workflow logic, mapped to action outputs), and a `::notice::`
+    annotation holding the JSON record. Summaries and outputs cannot be read
+    back through the API once the run ends, but annotations can (check-run
+    annotations endpoint), so the notice is what cross-repo reporting consumes.
+    The runner parses workflow commands from stderr as well as stdout, so the
+    notice goes through `log()` and never touches the markdown on stdout.
+    Best-effort: a reporting failure must never fail a release.
+    """
+    record = report.as_record()
+    cost = record["estimated_cost_usd"]
+    outputs = {
+        "status": record["status"],
+        "reason": record["reason"],
+        "model": record["model"],
+        "prompt-tokens": record["prompt_tokens"],
+        "cached-tokens": record["cached_tokens"],
+        "completion-tokens": record["completion_tokens"],
+        "estimated-cost-usd": "" if cost is None else cost,
+    }
+    try:
+        log(f"::notice title=release-notes report::{annotation_escape(json.dumps(record))}")
+        # One `key=value` per line. A value with a line break (say, a stray
+        # newline in the model input) would make the runner reject the whole
+        # file and fail the step, so values are flattened to a single line.
+        append_to("GITHUB_OUTPUT", "".join(f"{k}={' '.join(str(v).split())}\n" for k, v in outputs.items()))
+        append_to("GITHUB_STEP_SUMMARY", summary_markdown(record))
+    except OSError as e:
+        log(f"::warning::Could not publish run report: {e}")
+
+
 def generate_ai_notes(
     *,
     api_key: str,
@@ -194,7 +346,17 @@ def generate_ai_notes(
     system_prompt: str,
     version: str,
     commits: list[str],
+    report: RunReport,
+    reasoning_effort: str = "",
 ) -> str | None:
+    """Ask the model for notes; record tokens, timing, and any failure on `report`.
+
+    `reasoning_effort` is only sent when non-empty: reasoning tokens bill at
+    the output rate, and summarising commits does not need deep reasoning, so
+    the action defaults to `low`. Empty keeps the request valid for models
+    that reject the parameter.
+    """
+    started = time.monotonic()
     try:
         client = OpenAI(api_key=api_key, timeout=60.0, max_retries=2)
         resp = client.chat.completions.create(
@@ -206,12 +368,56 @@ def generate_ai_notes(
                     "content": f"Version: {version}\n\nCommits:\n{format_commits_for_prompt(commits)}",
                 },
             ],
+            **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
         )
+        report.usage = Usage.from_response(resp)
         content = (resp.choices[0].message.content or "").strip()
+        if not content:
+            report.reason = "empty-response"
         return content or None
     except OpenAIError as e:
         log(f"::warning::OpenAI request failed: {e}")
+        report.reason = "openai-error"
         return None
+    finally:
+        report.duration_s = time.monotonic() - started
+
+
+def render_notes(cur: str, model: str, report: RunReport) -> str:
+    """Return the markdown for stdout, recording on `report` how it was produced."""
+    prev = os.environ.get("PREV") or None
+    api_key = os.environ.get("OPENAI_API_KEY")
+    system_prompt = os.environ.get("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT
+    reasoning_effort = os.environ.get("REASONING_EFFORT", "low")
+
+    commits = git_commit_list(prev, cur)
+    report.commits = len(commits)
+
+    if not commits:
+        log("::warning::No commits found in range, skipping AI call")
+        report.reason = "no-commits"
+        return fallback(commits)
+
+    if not api_key:
+        log("::warning::OPENAI_API_KEY not set, using commit list fallback")
+        report.reason = "no-api-key"
+        return fallback(commits)
+
+    notes = generate_ai_notes(
+        api_key=api_key,
+        model=model,
+        system_prompt=system_prompt,
+        version=cur,
+        commits=commits,
+        report=report,
+        reasoning_effort=reasoning_effort,
+    )
+    if notes is None:
+        log("::warning::AI notes generation failed, using commit list fallback")
+        return fallback(commits)
+
+    report.status = "ai"
+    return f"{notes}\n"
 
 
 def main() -> int:
@@ -220,36 +426,12 @@ def main() -> int:
         log("::error::CUR (current tag) env var is required")
         return 2
 
-    prev = os.environ.get("PREV") or None
-    api_key = os.environ.get("OPENAI_API_KEY")
-    model = os.environ.get("OPENAI_MODEL") or "gpt-5.5"
-    system_prompt = os.environ.get("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT
-
-    commits = git_commit_list(prev, cur)
-
-    if not commits:
-        log("::warning::No commits found in range, skipping AI call")
-        sys.stdout.write(fallback(commits))
-        return 0
-
-    if not api_key:
-        log("::warning::OPENAI_API_KEY not set, using commit list fallback")
-        sys.stdout.write(fallback(commits))
-        return 0
-
-    notes = generate_ai_notes(
-        api_key=api_key,
-        model=model,
-        system_prompt=system_prompt,
-        version=cur,
-        commits=commits,
-    )
-    if notes is None:
-        log("::warning::AI notes generation failed, using commit list fallback")
-        sys.stdout.write(fallback(commits))
-        return 0
-
-    print(notes)
+    model = os.environ.get("OPENAI_MODEL") or "gpt-6-astra"
+    report = RunReport(tag=cur, model=model)
+    try:
+        sys.stdout.write(render_notes(cur, model, report))
+    finally:
+        publish_report(report)
     return 0
 
 

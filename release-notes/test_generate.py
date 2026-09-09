@@ -5,12 +5,19 @@ Run: uv run --with pytest --with 'openai>=1.55,<2' python -m pytest test_generat
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import ClassVar
+
+import pytest
 
 _spec = importlib.util.spec_from_file_location("generate", Path(__file__).with_name("generate.py"))
 assert _spec is not None and _spec.loader is not None
 generate = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = generate  # dataclasses resolve annotations via sys.modules[cls.__module__]
 _spec.loader.exec_module(generate)
 
 
@@ -103,3 +110,153 @@ def test_total_pr_body_budget_caps_appended_text(monkeypatch) -> None:
     out = generate.format_commits_for_prompt(commits)
 
     assert out.count("description:") < count  # stops once the total budget is spent
+
+
+def test_estimate_cost_bills_cached_prompt_tokens_at_cached_rate() -> None:
+    usage = generate.Usage(prompt_tokens=1_000, cached_tokens=200, completion_tokens=100)
+
+    cost = generate.estimate_cost_usd("gpt-5.5", usage)
+
+    assert cost == pytest.approx((800 * 5.00 + 200 * 0.50 + 100 * 30.00) / 1_000_000)
+
+
+def test_estimate_cost_accepts_dated_snapshots_but_not_prefix_lookalikes() -> None:
+    usage = generate.Usage(prompt_tokens=1_000_000)
+
+    assert generate.estimate_cost_usd("gpt-5.4-mini-2026-01-01", usage) == pytest.approx(0.75)
+    assert generate.estimate_cost_usd("gpt-5.5-2026-04-23", usage) == pytest.approx(5.00)
+    assert generate.estimate_cost_usd("gpt-5.4-unlisted-variant", usage) is None  # shares a prefix, not priced
+    assert generate.estimate_cost_usd("some-future-model", usage) is None
+
+
+class _FakeOpenAI:
+    """Stands in for `openai.OpenAI`: one canned completion with usage; records request kwargs."""
+
+    last_request: ClassVar[dict[str, object]] = {}
+
+    def __init__(self, **_kwargs: object) -> None:
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    @classmethod
+    def _create(cls, **kwargs: object) -> SimpleNamespace:
+        cls.last_request = kwargs
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="## Highlights\n- x\n"))],
+            usage=SimpleNamespace(
+                prompt_tokens=1_200,
+                completion_tokens=300,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=400),
+            ),
+        )
+
+
+def test_generate_ai_notes_records_usage_on_report(monkeypatch) -> None:
+    monkeypatch.setattr(generate, "OpenAI", _FakeOpenAI)
+    report = generate.RunReport(tag="v1.0.0", model="gpt-5.5")
+
+    notes = generate.generate_ai_notes(
+        api_key="k", model="gpt-5.5", system_prompt="p", version="v1.0.0", commits=["Add x"], report=report
+    )
+
+    assert notes == "## Highlights\n- x"
+    assert report.usage == generate.Usage(prompt_tokens=1_200, cached_tokens=400, completion_tokens=300)
+    assert report.reason == ""
+    assert "reasoning_effort" not in _FakeOpenAI.last_request  # omitted unless requested
+
+
+def test_generate_ai_notes_sends_reasoning_effort_when_set(monkeypatch) -> None:
+    monkeypatch.setattr(generate, "OpenAI", _FakeOpenAI)
+    report = generate.RunReport(tag="v1.0.0", model="gpt-6-astra")
+
+    generate.generate_ai_notes(
+        api_key="k",
+        model="gpt-6-astra",
+        system_prompt="p",
+        version="v1.0.0",
+        commits=["Add x"],
+        report=report,
+        reasoning_effort="low",
+    )
+
+    assert _FakeOpenAI.last_request["reasoning_effort"] == "low"
+
+
+def test_generate_ai_notes_marks_openai_error(monkeypatch) -> None:
+    def boom(**_kwargs: object) -> object:
+        raise generate.OpenAIError("down")
+
+    monkeypatch.setattr(generate, "OpenAI", boom)
+    report = generate.RunReport(tag="v1.0.0", model="gpt-5.5")
+
+    notes = generate.generate_ai_notes(
+        api_key="k", model="gpt-5.5", system_prompt="p", version="v1.0.0", commits=["Add x"], report=report
+    )
+
+    assert notes is None
+    assert report.reason == "openai-error"
+    assert report.usage == generate.Usage()  # nothing billed
+
+
+def test_publish_report_writes_outputs_summary_and_notice(monkeypatch, tmp_path, capsys) -> None:
+    out, summary = tmp_path / "output", tmp_path / "summary"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setenv("GITHUB_ACTION_REF", "release-notes/v1")
+    report = generate.RunReport(
+        tag="v1.2.1",
+        model="gpt-5.5",
+        status="ai",
+        commits=3,
+        usage=generate.Usage(prompt_tokens=1_000, cached_tokens=0, completion_tokens=100),
+        duration_s=4.25,
+    )
+
+    generate.publish_report(report)
+
+    outputs = dict(line.split("=", 1) for line in out.read_text().splitlines())
+    assert outputs["status"] == "ai"
+    assert outputs["reason"] == ""
+    assert outputs["estimated-cost-usd"] == "0.008"  # (1000 * 5 + 100 * 30) / 1e6
+    assert "| `v1.2.1` | ai | `gpt-5.5` | 3 | 1,000 (0) | 100 | $0.0080 | 4.25s |" in summary.read_text()
+    notices = [line for line in capsys.readouterr().err.splitlines() if line.startswith("::notice ")]
+    assert len(notices) == 1
+    record = json.loads(notices[0].split("::", 2)[2])
+    assert record["action_ref"] == "release-notes/v1"
+    assert record["estimated_cost_usd"] == 0.008
+
+
+def test_publish_report_handles_unknown_model_and_missing_sinks(monkeypatch, tmp_path, capsys) -> None:
+    out = tmp_path / "output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)  # e.g. run outside Actions
+    report = generate.RunReport(tag="v1.0.0", model="mystery-model", reason="no-api-key")
+
+    generate.publish_report(report)
+
+    outputs = dict(line.split("=", 1) for line in out.read_text().splitlines())
+    assert outputs["status"] == "fallback"
+    assert outputs["estimated-cost-usd"] == ""  # unlisted model: tokens only, no cost
+    assert "::notice title=release-notes report::" in capsys.readouterr().err  # still annotated
+
+
+def test_publish_report_keeps_outputs_one_per_line(monkeypatch, tmp_path, capsys) -> None:
+    out = tmp_path / "output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    report = generate.RunReport(tag="v1.0.0", model="gpt-6-astra\nextra", reason="no-api-key")
+
+    generate.publish_report(report)
+
+    lines = out.read_text().splitlines()
+    assert all("=" in line for line in lines)  # a bare line would make the runner fail the step
+    assert dict(line.split("=", 1) for line in lines)["model"] == "gpt-6-astra extra"
+
+
+def test_render_notes_reports_no_api_key_fallback(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(generate, "git_commit_list", lambda _prev, _cur: ["Add thing (#1)", "Fix other"])
+    report = generate.RunReport(tag="v1.0.0", model="gpt-5.5")
+
+    out = generate.render_notes("v1.0.0", "gpt-5.5", report)
+
+    assert out == "## Changes\n\n- Add thing (#1)\n- Fix other\n"
+    assert (report.status, report.reason, report.commits) == ("fallback", "no-api-key", 2)

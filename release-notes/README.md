@@ -34,7 +34,8 @@ The action **only writes the markdown file**. Release creation, asset attachment
 | `tag-pattern` | no | _auto_ | Pattern passed to `git describe --match` when auto-deriving the previous tag. Defaults to a pattern inferred from `current-tag` (path-prefixed semver, date-stamped, or `v*`). See [Multi-track repos](#multi-track-repos). |
 | `openai-api-key` | no | _empty_ | OpenAI API key. **If unset, fallback emits a plain commit-list summary.** |
 | `github-token` | no | `github.token` | Token `gh` uses to fetch PR descriptions for squash-merge commits referencing `(#NNN)`. Needs `pull-requests: read`. Falls back to commit messages if unset/insufficient. |
-| `openai-model` | no | `gpt-5.5` | OpenAI model name. |
+| `openai-model` | no | `gpt-6-astra` | OpenAI model name. |
+| `reasoning-effort` | no | `low` | Reasoning effort sent with the request. `low` suits summarisation and keeps reasoning-token spend down; set empty to omit the parameter for models that do not accept it. |
 | `system-prompt` | no | _built-in_ | Override the default prompt. Useful when the caller wants Korean output, different sections, or a domain-specific tone. |
 | `output-file` | no | `release-notes.md` | Path where the markdown is written. |
 
@@ -44,6 +45,21 @@ The action **only writes the markdown file**. Release creation, asset attachment
 |------|-------------|
 | `path` | Path to the generated markdown file. |
 | `previous-tag` | The resolved previous tag (useful when auto-derived). |
+| `status` | `ai` when the model wrote the notes, `fallback` when the commit-list fallback was used. |
+| `reason` | Why the fallback was used: `no-commits`, `no-api-key`, `openai-error`, `empty-response`. Empty on success. |
+| `model` | The OpenAI model the run used. |
+| `prompt-tokens`, `cached-tokens`, `completion-tokens` | Token usage of the OpenAI call (`cached-tokens` is the part of the prompt served at the cached rate). `0` when no call was made; an `empty-response` fallback still reports what the call billed. |
+| `estimated-cost-usd` | Estimated spend from the built-in price table. Empty when the model is not listed. |
+
+## Run report
+
+Every run publishes what it did, whether the model or the fallback produced the notes:
+
+- **Job summary** -- a one-row table (tag, status, model, tokens, estimated cost, model-call time) under the step.
+- **Outputs** -- the `status`/`reason`/token/cost outputs above, e.g. to fail or warn when a release shipped with fallback notes.
+- **Annotation** -- a `::notice::` titled `release-notes report` carrying the same record as JSON. Summaries and outputs are gone once the run ends, but annotations stay readable through the job's check run (`GET /repos/{owner}/{repo}/check-runs/{check_run_id}/annotations`, with the id taken from the jobs API's `check_run_url`), so per-repo history and spend can be aggregated across every consumer without extra storage.
+
+Cost is an estimate from a price table in `generate.py` (OpenAI list prices in USD per 1M tokens; cached prompt tokens billed at the cached rate). Update the table when prices or models change. Reporting is best-effort and never fails the release.
 
 ## Multi-track repos
 

@@ -33,7 +33,11 @@ inputs:
   openai-model:
     description: 'OpenAI model name.'
     required: false
-    default: 'gpt-5.5'
+    default: 'gpt-6-astra'
+  reasoning-effort:
+    description: 'Reasoning effort sent with the request (`low`, `medium`, `high`, ...). Release notes are a summarisation task, so `low` keeps latency and reasoning-token spend down. Set empty to omit the parameter for models that do not accept it.'
+    required: false
+    default: 'low'
   system-prompt:
     description: 'Override the default system prompt. Pass a string (heredoc-friendly). Leave blank to use the built-in generic library/service prompt.'
     required: false
@@ -50,6 +54,27 @@ outputs:
   previous-tag:
     description: 'The previous tag the commit range was bounded against. Useful when auto-derived.'
     value: ${{ steps.prev.outputs.tag }}
+  status:
+    description: '`ai` when the model wrote the notes, `fallback` when the commit-list fallback was used.'
+    value: ${{ steps.generate.outputs.status }}
+  reason:
+    description: 'Why the fallback was used (`no-commits`, `no-api-key`, `openai-error`, `empty-response`); empty on success.'
+    value: ${{ steps.generate.outputs.reason }}
+  model:
+    description: 'The OpenAI model the run used.'
+    value: ${{ steps.generate.outputs.model }}
+  prompt-tokens:
+    description: 'Prompt tokens billed for the OpenAI call; `0` when no call was made.'
+    value: ${{ steps.generate.outputs.prompt-tokens }}
+  cached-tokens:
+    description: 'Part of `prompt-tokens` served from the prompt cache at the cached rate.'
+    value: ${{ steps.generate.outputs.cached-tokens }}
+  completion-tokens:
+    description: 'Completion tokens billed for the OpenAI call; `0` when no call was made.'
+    value: ${{ steps.generate.outputs.completion-tokens }}
+  estimated-cost-usd:
+    description: 'Estimated spend in USD from the built-in price table; empty when the model is not listed.'
+    value: ${{ steps.generate.outputs.estimated-cost-usd }}
 
 runs:
   using: 'composite'
@@ -88,6 +113,7 @@ runs:
         enable-cache: true
 
     - name: Generate release notes
+      id: generate
       shell: bash
       env:
         CUR: ${{ inputs.current-tag }}
@@ -95,6 +121,7 @@ runs:
         OPENAI_API_KEY: ${{ inputs.openai-api-key }}
         GH_TOKEN: ${{ inputs.github-token }}
         OPENAI_MODEL: ${{ inputs.openai-model }}
+        REASONING_EFFORT: ${{ inputs.reasoning-effort }}
         SYSTEM_PROMPT: ${{ inputs.system-prompt }}
         OUTPUT_FILE: ${{ inputs.output-file }}
       run: |
