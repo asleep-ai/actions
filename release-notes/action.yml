@@ -33,7 +33,11 @@ inputs:
   openai-model:
     description: 'OpenAI model name.'
     required: false
-    default: 'gpt-5.5'
+    default: 'gpt-6-astra'
+  reasoning-effort:
+    description: 'Reasoning effort sent with the request (`low`, `medium`, `high`, ...). Release notes are a summarisation task, so `low` keeps latency and reasoning-token spend down. Set empty to omit the parameter for models that do not accept it.'
+    required: false
+    default: 'low'
   system-prompt:
     description: 'Override the default system prompt. Pass a string (heredoc-friendly). Leave blank to use the built-in generic library/service prompt.'
     required: false
@@ -117,6 +121,7 @@ runs:
         OPENAI_API_KEY: ${{ inputs.openai-api-key }}
         GH_TOKEN: ${{ inputs.github-token }}
         OPENAI_MODEL: ${{ inputs.openai-model }}
+        REASONING_EFFORT: ${{ inputs.reasoning-effort }}
         SYSTEM_PROMPT: ${{ inputs.system-prompt }}
         OUTPUT_FILE: ${{ inputs.output-file }}
       run: |

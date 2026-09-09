@@ -10,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -129,13 +130,16 @@ def test_estimate_cost_accepts_dated_snapshots_but_not_prefix_lookalikes() -> No
 
 
 class _FakeOpenAI:
-    """Stands in for `openai.OpenAI`: one canned completion with usage."""
+    """Stands in for `openai.OpenAI`: one canned completion with usage; records request kwargs."""
+
+    last_request: ClassVar[dict[str, object]] = {}
 
     def __init__(self, **_kwargs: object) -> None:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
-    @staticmethod
-    def _create(**_kwargs: object) -> SimpleNamespace:
+    @classmethod
+    def _create(cls, **kwargs: object) -> SimpleNamespace:
+        cls.last_request = kwargs
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="## Highlights\n- x\n"))],
             usage=SimpleNamespace(
@@ -157,6 +161,24 @@ def test_generate_ai_notes_records_usage_on_report(monkeypatch) -> None:
     assert notes == "## Highlights\n- x"
     assert report.usage == generate.Usage(prompt_tokens=1_200, cached_tokens=400, completion_tokens=300)
     assert report.reason == ""
+    assert "reasoning_effort" not in _FakeOpenAI.last_request  # omitted unless requested
+
+
+def test_generate_ai_notes_sends_reasoning_effort_when_set(monkeypatch) -> None:
+    monkeypatch.setattr(generate, "OpenAI", _FakeOpenAI)
+    report = generate.RunReport(tag="v1.0.0", model="gpt-6-astra")
+
+    generate.generate_ai_notes(
+        api_key="k",
+        model="gpt-6-astra",
+        system_prompt="p",
+        version="v1.0.0",
+        commits=["Add x"],
+        report=report,
+        reasoning_effort="low",
+    )
+
+    assert _FakeOpenAI.last_request["reasoning_effort"] == "low"
 
 
 def test_generate_ai_notes_marks_openai_error(monkeypatch) -> None:

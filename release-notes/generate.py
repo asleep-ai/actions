@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "openai>=1.55,<2",
+#     "openai>=1.58,<2",
 # ]
 # ///
 """Generate markdown release notes from a git tag range via OpenAI.
@@ -11,7 +11,8 @@ Env:
   CUR              required -- current tag (e.g., v0.5.0)
   PREV             optional -- previous tag; if empty, full history is used
   OPENAI_API_KEY   required for AI summary; without it the commit list is returned
-  OPENAI_MODEL     optional -- default: gpt-5.5
+  OPENAI_MODEL     optional -- default: gpt-6-astra
+  REASONING_EFFORT optional -- default: low; empty omits the parameter
   SYSTEM_PROMPT    optional -- override default prompt
 
 Stdout: markdown. Never exits non-zero for AI failure -- always emits a usable
@@ -346,8 +347,15 @@ def generate_ai_notes(
     version: str,
     commits: list[str],
     report: RunReport,
+    reasoning_effort: str = "",
 ) -> str | None:
-    """Ask the model for notes; record tokens, timing, and any failure on `report`."""
+    """Ask the model for notes; record tokens, timing, and any failure on `report`.
+
+    `reasoning_effort` is only sent when non-empty: reasoning tokens bill at
+    the output rate, and summarising commits does not need deep reasoning, so
+    the action defaults to `low`. Empty keeps the request valid for models
+    that reject the parameter.
+    """
     started = time.monotonic()
     try:
         client = OpenAI(api_key=api_key, timeout=60.0, max_retries=2)
@@ -360,6 +368,7 @@ def generate_ai_notes(
                     "content": f"Version: {version}\n\nCommits:\n{format_commits_for_prompt(commits)}",
                 },
             ],
+            **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
         )
         report.usage = Usage.from_response(resp)
         content = (resp.choices[0].message.content or "").strip()
@@ -379,6 +388,7 @@ def render_notes(cur: str, model: str, report: RunReport) -> str:
     prev = os.environ.get("PREV") or None
     api_key = os.environ.get("OPENAI_API_KEY")
     system_prompt = os.environ.get("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT
+    reasoning_effort = os.environ.get("REASONING_EFFORT", "low")
 
     commits = git_commit_list(prev, cur)
     report.commits = len(commits)
@@ -400,6 +410,7 @@ def render_notes(cur: str, model: str, report: RunReport) -> str:
         version=cur,
         commits=commits,
         report=report,
+        reasoning_effort=reasoning_effort,
     )
     if notes is None:
         log("::warning::AI notes generation failed, using commit list fallback")
@@ -415,7 +426,7 @@ def main() -> int:
         log("::error::CUR (current tag) env var is required")
         return 2
 
-    model = os.environ.get("OPENAI_MODEL") or "gpt-5.5"
+    model = os.environ.get("OPENAI_MODEL") or "gpt-6-astra"
     report = RunReport(tag=cur, model=model)
     try:
         sys.stdout.write(render_notes(cur, model, report))

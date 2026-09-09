@@ -34,7 +34,8 @@ The action **only writes the markdown file**. Release creation, asset attachment
 | `tag-pattern` | no | _auto_ | Pattern passed to `git describe --match` when auto-deriving the previous tag. Defaults to a pattern inferred from `current-tag` (path-prefixed semver, date-stamped, or `v*`). See [Multi-track repos](#multi-track-repos). |
 | `openai-api-key` | no | _empty_ | OpenAI API key. **If unset, fallback emits a plain commit-list summary.** |
 | `github-token` | no | `github.token` | Token `gh` uses to fetch PR descriptions for squash-merge commits referencing `(#NNN)`. Needs `pull-requests: read`. Falls back to commit messages if unset/insufficient. |
-| `openai-model` | no | `gpt-5.5` | OpenAI model name. |
+| `openai-model` | no | `gpt-6-astra` | OpenAI model name. |
+| `reasoning-effort` | no | `low` | Reasoning effort sent with the request. `low` suits summarisation and keeps reasoning-token spend down; set empty to omit the parameter for models that do not accept it. |
 | `system-prompt` | no | _built-in_ | Override the default prompt. Useful when the caller wants Korean output, different sections, or a domain-specific tone. |
 | `output-file` | no | `release-notes.md` | Path where the markdown is written. |
 
