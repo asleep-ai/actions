@@ -1,0 +1,47 @@
+# pre-commit hooks published by this repository. `rev` pins these hook
+# scripts; the tool versions they run come from the caller's mise.toml.
+# unsupported_script runs `entry` from the hook repository checkout with the
+# working directory at the caller's repository root; it needs pre-commit 4.4.0.
+
+- id: ktfmt
+  name: ktfmt
+  description: Check Kotlin formatting with ktfmt --kotlinlang-style --enable-editorconfig, exempting unchanged files listed in a hash baseline.
+  entry: ktfmt/ktfmt.sh
+  language: unsupported_script
+  minimum_pre_commit_version: '4.4.0'
+  files: '\.kts?$'
+  types: [file]
+  require_serial: true
+
+- id: ktfmt-write
+  name: ktfmt (format in place)
+  description: Format the selected Kotlin files with ktfmt. Manual stage only.
+  entry: ktfmt/ktfmt.sh --write
+  language: unsupported_script
+  minimum_pre_commit_version: '4.4.0'
+  files: '\.kts?$'
+  types: [file]
+  require_serial: true
+  stages: [manual]
+
+- id: ktfmt-baseline-refresh
+  name: ktfmt baseline refresh (shrink only)
+  description: Drop baseline entries for edited, formatted, or removed files; never adds one. Manual stage only.
+  entry: ktfmt/ktfmt.sh --update-baseline
+  language: unsupported_script
+  minimum_pre_commit_version: '4.4.0'
+  pass_filenames: false
+  always_run: true
+  require_serial: true
+  stages: [manual]
+
+- id: ktfmt-baseline-bootstrap
+  name: ktfmt baseline bootstrap (one-time)
+  description: Create the baseline from every tracked Kotlin file ktfmt would change; refuses to overwrite an existing baseline. Manual stage only.
+  entry: ktfmt/ktfmt.sh --bootstrap-baseline
+  language: unsupported_script
+  minimum_pre_commit_version: '4.4.0'
+  pass_filenames: false
+  always_run: true
+  require_serial: true
+  stages: [manual]
