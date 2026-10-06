@@ -1,0 +1,59 @@
+name: pre-commit changed files
+description: >-
+  Run the caller's pre-commit hooks on the files a pull request or push
+  changed, or on every file when shared lint configuration changed.
+
+inputs:
+  event-name:
+    description: The triggering event, normally `github.event_name`.
+    required: true
+  base-sha:
+    description: >-
+      Full commit SHA to compare against: the pull request base
+      (`github.event.pull_request.base.sha`) or the push's previous tip
+      (`github.event.before`). A push tip missing from the local history, such
+      as the old tip of a force push, checks all files with a warning. Optional
+      for manual runs, which otherwise compare the head commit with its first
+      parent.
+    required: false
+    default: ''
+  head-sha:
+    description: >-
+      Full SHA of the checked-out commit. For pull requests pass
+      `github.event.pull_request.head.sha` when the PR head is checked out.
+      An empty value means the checked-out HEAD.
+    required: false
+    default: ${{ github.sha }}
+  full-scan-paths:
+    description: >-
+      Newline-separated, root-relative glob patterns (`*`, `?`, `**`). A change
+      of any status to a matching path, including a deletion, runs pre-commit
+      on all files instead of only the changed ones.
+    required: false
+    default: |
+      .pre-commit-config.yaml
+      .pre-commit-hooks.yaml
+      **/mise.toml
+      **/.mise.toml
+      **/mise.lock
+      **/.tool-versions
+      **/.editorconfig
+      **/pyproject.toml
+      **/uv.lock
+      **/ruff.toml
+      **/.ruff.toml
+      config/**
+      scripts/**
+      .github/workflows/**
+
+runs:
+  using: composite
+  steps:
+    - name: Run pre-commit on changed files
+      shell: bash
+      env:
+        EVENT_NAME: ${{ inputs.event-name }}
+        BASE_SHA: ${{ inputs.base-sha }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        FULL_SCAN_PATHS: ${{ inputs.full-scan-paths }}
+      run: python3 "$GITHUB_ACTION_PATH/run.py"

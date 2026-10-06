@@ -1,0 +1,46 @@
+# Caller template: copy to .github/workflows/ruff.yml in the consuming repository.
+# The .yml.example suffix keeps this repository's Actions from running it.
+#
+# Requires Ruff in a uv dependency group, recorded in uv.lock:
+#   uv add --group lint 'ruff==0.16.10'
+# Developers run the same two `uv run` commands locally. See ruff/README.md.
+name: Ruff
+
+on:
+  pull_request:
+  push:
+    branches: [main] # your default branch
+
+# No `paths:` filter: a change to only pyproject.toml, ruff.toml, or uv.lock
+# must still trigger the full scan.
+
+permissions:
+  contents: read
+
+jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Installs uv only; the Ruff version comes from uv.lock.
+      - uses: astral-sh/setup-uv@v10.2.0
+
+      # No paths or rule flags: the caller's Ruff configuration decides what is
+      # checked and how. --no-fix keeps CI read-only even if the configuration
+      # sets `fix = true`. Both commands always run; the step fails if either
+      # fails (`|| var=$?` is exempt from the runner's `set -e`).
+      - name: Ruff check and format check
+        run: |
+          lint=0
+          uv run --locked --only-group lint ruff check --no-fix || lint=$?
+          format=0
+          uv run --locked --only-group lint ruff format --check || format=$?
+          echo "ruff check exit status: $lint"
+          echo "ruff format --check exit status: $format"
+          if [ "$lint" -ne 0 ] || [ "$format" -ne 0 ]; then
+            exit 1
+          fi
