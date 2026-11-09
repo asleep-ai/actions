@@ -10,6 +10,7 @@
 Env:
   CUR              required -- current tag (e.g., v0.5.0)
   PREV             optional -- previous tag; if empty, full history is used
+  PATHS_INPUT      optional -- newline-delimited git pathspecs; blank means all paths
   OPENAI_API_KEY   required for AI summary; without it the commit list is returned
   OPENAI_MODEL     optional -- default: gpt-6-astra
   REASONING_EFFORT optional -- default: low; empty omits the parameter
@@ -59,7 +60,7 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def git_commit_list(prev: str | None, cur: str, limit: int = 500) -> list[str]:
+def git_commit_list(prev: str | None, cur: str, limit: int = 500, paths: list[str] | None = None) -> list[str]:
     """Return commits in [prev..cur] as full messages.
 
     Squash-merged PRs put the PR description in the commit body, where the
@@ -69,9 +70,12 @@ def git_commit_list(prev: str | None, cur: str, limit: int = 500) -> list[str]:
     might contain.
     """
     ref = f"{prev}..{cur}" if prev else cur
+    args = ["git", "log", "-z", f"--max-count={limit}", "--pretty=format:%B", ref]
+    if paths:
+        args.extend(["--", *paths])
     try:
         result = subprocess.run(
-            ["git", "log", "-z", f"--max-count={limit}", "--pretty=format:%B", ref],
+            args,
             capture_output=True,
             text=True,
             check=True,
@@ -390,7 +394,8 @@ def render_notes(cur: str, model: str, report: RunReport) -> str:
     system_prompt = os.environ.get("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT
     reasoning_effort = os.environ.get("REASONING_EFFORT", "low")
 
-    commits = git_commit_list(prev, cur)
+    paths = [line.strip() for line in os.environ.get("PATHS_INPUT", "").splitlines() if line.strip()]
+    commits = git_commit_list(prev, cur, paths=paths) if paths else git_commit_list(prev, cur)
     report.commits = len(commits)
 
     if not commits:

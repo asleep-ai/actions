@@ -32,6 +32,7 @@ The action **only writes the markdown file**. Release creation, asset attachment
 | `current-tag` | no | `github.ref_name` | Current tag, e.g. `v0.5.0`. Defaults to the tag that triggered the run. |
 | `previous-tag` | no | _auto_ | Previous tag bounding the commit range. Auto-derived via `git describe --tags --match=<pattern> --abbrev=0 $CUR^` when empty. |
 | `tag-pattern` | no | _auto_ | Pattern passed to `git describe --match` when auto-deriving the previous tag. Defaults to a pattern inferred from `current-tag` (path-prefixed semver, date-stamped, or `v*`). See [Multi-track repos](#multi-track-repos). |
+| `paths` | no | _empty_ | Newline-delimited git pathspecs restricting commit collection. Omitted or blank preserves the full-range behavior. See [Path filtering](#path-filtering). |
 | `openai-api-key` | no | _empty_ | OpenAI API key. **If unset, fallback emits a plain commit-list summary.** |
 | `github-token` | no | `github.token` | Token `gh` uses to fetch PR descriptions for squash-merge commits referencing `(#NNN)`. Needs `pull-requests: read`. Falls back to commit messages if unset/insufficient. |
 | `openai-model` | no | `gpt-6-astra` | OpenAI model name. |
@@ -105,6 +106,39 @@ release notes.
     tag-pattern: 'rel-*'
     openai-api-key: ${{ secrets.OPENAI_API_KEY }}
 ```
+
+## Path filtering
+
+Use `paths` to select commits touching a module within the resolved tag range:
+
+```yaml
+- uses: asleep-ai/actions/release-notes@release-notes/v1
+  with:
+    paths: |
+      libs/sleepmetrics
+      libs/postprocess
+    openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+```
+
+Each nonblank line is trimmed and passed as one native git pathspec after
+`git log ... <range> --`, without shell interpretation. Spaces within a path
+are preserved; do not add shell quotes. Git glob and pathspec magic are
+supported (for example `:(top)libs/sleepmetrics` or `:(exclude)docs`). Paths
+are relative to the checkout root. Filenames containing newlines or leading
+or trailing whitespace cannot be represented by this input.
+
+Filtering happens before the existing 500-commit limit and PR enrichment;
+only selected commits feed both AI and fallback notes. Tag resolution is
+unchanged. Omitted, empty, or whitespace-only input preserves the existing
+command and output. An empty match uses the existing `no-commits` fallback.
+
+This uses Git's default path-limited history simplification and merge
+handling; it adds no first-parent, merge-diff, or rename-following options.
+Renamed files are not followed across old names automatically: include old
+and new paths when needed. Shared-file changes outside the selected paths
+are excluded unless callers include those paths too. A selected commit's
+whole message and PR description remain available to the model, so a PR
+touching multiple modules can still mention changes outside the selection.
 
 ## Caller contract
 
