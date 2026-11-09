@@ -260,3 +260,128 @@ def test_render_notes_reports_no_api_key_fallback(monkeypatch) -> None:
 
     assert out == "## Changes\n\n- Add thing (#1)\n- Fix other\n"
     assert (report.status, report.reason, report.commits) == ("fallback", "no-api-key", 2)
+
+
+@pytest.fixture
+def path_history(tmp_path, monkeypatch):
+    """Real tagged history with module, shared, and space-containing paths."""
+    monkeypatch.chdir(tmp_path)
+
+    def git(*args):
+        return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+
+    git("init", "-b", "main")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "commit.gpgsign", "false")
+    git("config", "tag.gpgsign", "false")
+
+    def commit(path, subject):
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(subject)
+        git("add", "--", path)
+        git("commit", "-m", subject)
+
+    commit("libs/sleepmetrics/base.py", "Old metrics (#1)")
+    git("tag", "v1")
+    commit("libs/postprocess/core.py", "Postprocess (#2)")
+    commit("libs/sleepmetrics/core.py", "Metrics (#3)")
+    commit("shared/config", "Shared (#4)")
+    commit("libs/space module/core.py", "Space module (#5)")
+    git("tag", "v2")
+    commit("libs/sleepmetrics/later.py", "After release (#6)")
+    return git, commit
+
+
+def test_git_paths_preserve_unfiltered_command_and_limit(path_history):
+    git, _ = path_history
+    expected = git("log", "-z", "--max-count=500", "--pretty=format:%B", "v1..v2")
+    expected = [entry for entry in expected.split("\x00") if entry.strip()]
+    assert generate.git_commit_list("v1", "v2") == expected
+    assert generate.git_commit_list("v1", "v2", paths=[]) == generate.git_commit_list("v1", "v2")
+    assert [entry.strip() for entry in generate.git_commit_list("v1", "v2", 1)] == ["Space module (#5)"]
+
+
+def test_git_paths_filter_range_and_multiple_space_paths(path_history):
+    selected = generate.git_commit_list(
+        "v1", "v2", paths=["libs/sleepmetrics", "libs/space module"]
+    )
+    assert [entry.strip() for entry in selected] == ["Space module (#5)", "Metrics (#3)"]
+    assert [entry.strip() for entry in generate.git_commit_list(None, "v1", paths=["libs/sleepmetrics"])] == [
+        "Old metrics (#1)"
+    ]
+    assert [entry.strip() for entry in generate.git_commit_list("v1", "v2", 1, ["libs/sleepmetrics"])] == [
+        "Metrics (#3)"
+    ]
+
+
+@pytest.mark.parametrize("paths", [None, "", " \n\t\n"])
+def test_render_blank_paths_matches_existing_output(path_history, monkeypatch, paths):
+    monkeypatch.setenv("PREV", "v1")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    if paths is None:
+        monkeypatch.delenv("PATHS_INPUT", raising=False)
+    else:
+        monkeypatch.setenv("PATHS_INPUT", paths)
+    report = generate.RunReport(tag="v2", model="test")
+    assert generate.render_notes("v2", "test", report) == generate.fallback(generate.git_commit_list("v1", "v2"))
+    assert (report.reason, report.commits) == ("no-api-key", 4)
+
+
+@pytest.mark.parametrize("ai", [False, True])
+def test_render_paths_filters_before_enrichment_and_output(path_history, monkeypatch, ai):
+    monkeypatch.setenv("PREV", "v1")
+    monkeypatch.setenv("PATHS_INPUT", " libs/sleepmetrics \n\nlibs/space module\n")
+    monkeypatch.setenv("OPENAI_API_KEY", "test" if ai else "")
+    monkeypatch.setattr(generate, "OpenAI", _FakeOpenAI)
+    fetched = []
+    monkeypatch.setattr(generate, "pr_body", lambda n: fetched.append(n) or f"Description {n}")
+    report = generate.RunReport(tag="v2", model="test")
+    out = generate.render_notes("v2", "test", report)
+    assert report.commits == 2
+    if ai:
+        assert fetched == [5, 3]
+        prompt = str(_FakeOpenAI.last_request["messages"])
+        assert "Space module (#5)" in prompt and "Metrics (#3)" in prompt
+        assert all(subject not in prompt for subject in ["Postprocess", "Shared", "Old metrics", "After release"])
+        assert report.status == "ai"
+    else:
+        assert fetched == []
+        assert out == "## Changes\n\n- Space module (#5)\n- Metrics (#3)\n"
+
+
+def test_paths_empty_match_skips_ai_and_enrichment(path_history, monkeypatch):
+    monkeypatch.setenv("PREV", "v1")
+    monkeypatch.setenv("PATHS_INPUT", "missing")
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Empty path selection must not call external services")
+
+    monkeypatch.setattr(generate, "OpenAI", unexpected)
+    monkeypatch.setattr(generate, "pr_body", unexpected)
+    report = generate.RunReport(tag="v2", model="test")
+    assert generate.render_notes("v2", "test", report) == "## Changes\n\n\n"
+    assert (report.reason, report.commits) == ("no-commits", 0)
+
+
+def test_paths_use_native_magic_and_merge_history(path_history):
+    git, commit = path_history
+    git("checkout", "-b", "feature", "v1")
+    commit("libs/sleepmetrics/branch.py", "Branch metrics (#7)")
+    git("checkout", "main")
+    git("merge", "--no-ff", "feature", "-m", "Merge feature")
+    paths = [":(top)libs/*", ":(exclude)libs/postprocess"]
+    expected = git("log", "-z", "--max-count=500", "--pretty=format:%B", "v1..HEAD", "--", *paths)
+    assert [entry.strip() for entry in generate.git_commit_list("v1", "HEAD", paths=paths)] == [
+        entry.strip() for entry in expected.split("\x00") if entry.strip()
+    ]
+
+
+def test_pathspec_is_one_literal_argv_not_shell(path_history):
+    _, commit = path_history
+    path = "libs/$(touch injected); module/file.py"
+    commit(path, "Literal path (#8)")
+    assert [entry.strip() for entry in generate.git_commit_list("v2", "HEAD", paths=[path])] == ["Literal path (#8)"]
+    assert not Path("injected").exists()
