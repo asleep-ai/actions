@@ -7,6 +7,10 @@ name: Android release
 # otherwise, and a self-hosted build that fails for an infrastructure reason
 # runs again on a GitHub-hosted runner.
 #
+# A tag vX.Y.0-preview.N is built the same way, as a preview of the new minor
+# or major version X.Y.0: the same key and checks, a versionCode below the
+# release's, and a GitHub pre-release that is never the latest release.
+#
 # The caller's contract, every input and the secrets are in
 # android-ci/README.md.
 on:
@@ -14,9 +18,9 @@ on:
     inputs:
       tag:
         description: >-
-          The release tag to build, vX.Y.Z. Empty means the ref the workflow
-          run started for, which is the tag on a tag push and on a manual run
-          started for a tag.
+          The tag to build: vX.Y.Z, or vX.Y.0-preview.N for a preview. Empty
+          means the ref the workflow run started for, which is the tag on a
+          tag push and on a manual run started for a tag.
         required: false
         type: string
         default: ''
@@ -82,6 +86,8 @@ on:
       gradle-args:
         description: >-
           Extra Gradle arguments for ./gradlew ciRelease, split on whitespace.
+          The build already gets -PciVersionName, -PciVersionCode and
+          -PciBuildKind (release, or preview for a preview tag).
         required: false
         type: string
         default: ''
@@ -122,10 +128,15 @@ on:
         description: >-
           Names of the checks that must have succeeded on the tagged commit,
           one per line, as the commit's checks list shows them. They are
-          checked for every tag, whoever pushed it. Empty requires none.
+          checked for every tag, whoever pushed it. Empty requires none. The
+          default is the pull request check and the QA build of the push
+          (android-qa.yml, called by a job named qa): android-pr-check.yml
+          leaves the release variant of a pushed commit to that build.
         required: false
         type: string
-        default: pr-check / result
+        default: |
+          pr-check / result
+          qa / built
       release-notes-prompt:
         description: >-
           System prompt for release-notes, replacing its built-in one.
@@ -232,10 +243,14 @@ jobs:
     permissions:
       contents: read
       checks: read
+    # Whether the tag is a preview is passed as true or false, not as the
+    # name of the kind: the runner drops a job output that contains the value
+    # of a secret, and "release" is a likely key alias.
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       sha: ${{ steps.tag.outputs.sha }}
       latest: ${{ steps.tag.outputs.latest }}
+      preview: ${{ steps.tag.outputs.kind == 'preview' }}
       version: ${{ steps.code.outputs.version }}
       version-code: ${{ steps.code.outputs.version-code }}
       runs-on: ${{ steps.pick.outputs.runs-on }}
@@ -249,17 +264,31 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          # Only vX.Y.Z is a release. A tag with a suffix, a branch, or a
-          # number with a leading zero is not.
+          # vX.Y.Z is a release, and vX.Y.0-preview.N a preview of the new
+          # minor or major version X.Y.0. A tag with any other suffix, a
+          # branch, or a number with a leading zero is neither. A patch
+          # release has no preview: its codes would be below the release that
+          # is out.
           pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-          if [[ ! "$TAG" =~ $pattern ]]; then
-            echo "::error::'$TAG' is not a release tag. Start the release for a tag of the form vX.Y.Z."
+          preview_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0-preview\.[1-9][0-9]*$'
+          patch_preview_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.[1-9][0-9]*-preview\.[1-9][0-9]*$'
+          if [[ "$TAG" =~ $pattern ]]; then
+            kind=release
+            base="$TAG"
+          elif [[ "$TAG" =~ $preview_pattern ]]; then
+            kind=preview
+            base="${TAG%-preview.*}"
+          elif [[ "$TAG" =~ $patch_preview_pattern ]]; then
+            echo "::error::'$TAG' is a preview of a patch release, and only a new minor or major version has previews (vX.Y.0-preview.N): within a minor version every preview is numbered below every release. Nothing is built."
+            exit 1
+          else
+            echo "::error::'$TAG' is not a release tag. Start the release for a tag of the form vX.Y.Z, or vX.Y.0-preview.N for a preview."
             exit 1
           fi
 
           names=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/v" --jq '.[].ref | ltrimstr("refs/tags/")')
           tags=$(grep -E "$pattern" <<< "$names" | sort -V || true)
-          if ! grep -qxF "$TAG" <<< "$tags"; then
+          if ! grep -qxF "$TAG" <<< "$names"; then
             echo "::error::Tag $TAG does not exist in $GH_REPO."
             exit 1
           fi
@@ -267,10 +296,10 @@ jobs:
 
           # A major version is a release line: 1.x may still be released from
           # its maintenance branch after 2.0.0 exists.
-          major="${TAG#v}"
+          major="${base#v}"
           major="${major%%.*}"
           highest=$(tail -1 <<< "$tags")
-          line_highest=$(grep -E "^v${major}\." <<< "$tags" | tail -1)
+          line_highest=$(grep -E "^v${major}\." <<< "$tags" | tail -1 || true)
 
           # The published releases, read in a statement of its own: a request
           # that failed must not read as "nothing is published".
@@ -291,15 +320,30 @@ jobs:
           # versionCode than the devices of that line already have, which no
           # device can install. Building an older release again, for its
           # existing GitHub Release, is fine.
-          if [[ "$exists" == false && "$TAG" != "$line_highest" ]]; then
+          if [[ "$kind" == release && "$exists" == false && "$TAG" != "$line_highest" ]]; then
             echo "::error::$TAG is below $line_highest, the highest release tag of major $major, and has no GitHub Release yet. A new release has to be the highest version of its line."
             exit 1
           fi
 
+          # The same for a preview: a new one comes before the release of its
+          # version, above the releases of its line, and is the highest
+          # preview of that version.
+          if [[ "$kind" == preview && "$exists" == false ]]; then
+            if [[ -n "$line_highest" && "$(printf '%s\n%s\n' "$base" "$line_highest" | sort -V | tail -1)" == "$line_highest" ]]; then
+              echo "::error::$TAG is a preview of ${base#v}, and $line_highest, the highest release tag of major $major, is not below that version. A new preview is published before its version is released, above the releases of its line."
+              exit 1
+            fi
+            preview_highest=$(grep -E "^${base//./\\.}-preview\.[1-9][0-9]*$" <<< "$names" | sort -V | tail -1)
+            if [[ "$TAG" != "$preview_highest" ]]; then
+              echo "::error::$TAG is below $preview_highest, the highest preview of ${base#v}, and has no GitHub Release yet. A new preview has to be the highest of its version."
+              exit 1
+            fi
+          fi
+
           # Only the highest version of all is the repository's latest
           # release. A release of a lower line, or an older one built again,
-          # must not take that mark.
-          if [[ "$TAG" == "$highest" ]]; then
+          # must not take that mark, and a preview never does.
+          if [[ "$kind" == release && "$TAG" == "$highest" ]]; then
             latest=true
           else
             latest=false
@@ -309,8 +353,9 @@ jobs:
             echo "tag=$TAG"
             echo "sha=$sha"
             echo "latest=$latest"
+            echo "kind=$kind"
           } >> "$GITHUB_OUTPUT"
-          echo "Release $TAG at $sha. Latest: $latest. GitHub Release exists: $exists."
+          echo "$([[ "$kind" == preview ]] && echo Preview || echo Release) $TAG at $sha. Latest: $latest. GitHub Release exists: $exists."
 
       # Every branch and the whole history, for the step below. The tag was
       # checked above, so the ref is a release tag that exists. Nothing of the
@@ -384,6 +429,7 @@ jobs:
           import json
           import os
           import sys
+          import time
           import urllib.error
           import urllib.parse
           import urllib.request
@@ -393,12 +439,31 @@ jobs:
           sha = os.environ["TARGET_SHA"]
           token = os.environ.get("TOKEN", "").strip()
           required = [line.strip() for line in os.environ.get("REQUIRED_CHECKS", "").splitlines() if line.strip()]
+          # Only android-qa.yml waits: its build starts with the push that also starts the checks. A
+          # release is decided from the checks as they are.
+          try:
+              wait_minutes = float(os.environ.get("CHECKS_WAIT_MINUTES") or 0)
+              poll_seconds = float(os.environ.get("CHECKS_POLL_SECONDS") or 30)
+          except ValueError:
+              sys.exit("::error::The time to wait for the checks is not a number.")
+          deadline = time.monotonic() + wait_minutes * 60
+          # And only android-qa.yml names a tag: the one of the pre-release its build is published as. A
+          # build that pre-release is already past is not published whatever its checks say, so the step
+          # does not wait for them.
+          rolling_tag = os.environ.get("ROLLING_TAG", "").strip()
 
 
-          def check_runs(name):
-              query = urllib.parse.urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+          class Unreadable(Exception):
+              """The checks could not be read. `again` says whether another request may succeed."""
+
+              def __init__(self, reason, again):
+                  super().__init__(reason)
+                  self.again = again
+
+
+          def read(path):
               request = urllib.request.Request(
-                  f"{api}/repos/{repository}/commits/{sha}/check-runs?{query}",
+                  f"{api}/repos/{repository}/{path}",
                   headers={
                       "Accept": "application/vnd.github+json",
                       "Authorization": f"Bearer {token}",
@@ -408,32 +473,86 @@ jobs:
               )
               try:
                   with urllib.request.urlopen(request, timeout=20) as response:
-                      document = json.load(response)
+                      return json.load(response)
               except urllib.error.HTTPError as error:
                   detail = error.read(300).decode(errors="replace").strip()
-                  sys.exit(f"::error::Cannot read the checks of {sha}: HTTP {error.code}: {detail}")
+                  # A server error and a rate limit pass; a token that may not read the checks does not.
+                  raise Unreadable(f"HTTP {error.code}: {detail}", error.code >= 500 or error.code == 429) from None
               except (OSError, ValueError) as error:
-                  sys.exit(f"::error::Cannot read the checks of {sha}: {error}")
+                  raise Unreadable(str(error) or type(error).__name__, True) from None
+
+
+          def check_runs(name):
+              query = urllib.parse.urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+              document = read(f"commits/{sha}/check-runs?{query}")
               runs = document.get("check_runs") if isinstance(document, dict) else None
               if not isinstance(runs, list):
-                  sys.exit(f"::error::Cannot read the checks of {sha}: the response has no check_runs list")
+                  raise Unreadable("the response has no check_runs list", True)
               return [run for run in runs if isinstance(run, dict) and run.get("name") == name]
 
 
-          rows = []
-          refused = []
-          for name in required:
-              runs = check_runs(name)
-              if not runs:
-                  rows.append((name, "not run", ""))
-                  refused.append(f"'{name}' did not run on the commit")
-                  continue
-              newest = max(runs, key=lambda run: (str(run.get("started_at") or ""), run.get("id") or 0))
-              state = newest.get("conclusion") or newest.get("status") or "unknown"
-              rows.append((name, state, newest.get("html_url") or ""))
-              if newest.get("status") != "completed" or newest.get("conclusion") != "success":
-                  refused.append(f"'{name}' is {state}")
+          def commits_past():
+              """How many commits the rolling tag is past this one: 0 when it is not, or when that cannot be told.
 
+              "ahead" is GitHub's word for a head (the tag) that contains the base (this commit) and more.
+              A tag that does not exist yet, a tag on another history and a request that failed are no
+              reason to stop waiting.
+              """
+              if not rolling_tag:
+                  return 0
+              try:
+                  document = read(f"compare/{sha}...{urllib.parse.quote(rolling_tag, safe='')}?per_page=1")
+              except Unreadable:
+                  return 0
+              if not isinstance(document, dict) or document.get("status") != "ahead":
+                  return 0
+              ahead = document.get("ahead_by")
+              return ahead if isinstance(ahead, int) and ahead > 0 else 0
+
+
+          past = 0
+          while True:
+              rows = []
+              refused = []
+              # Checks that may still succeed: not started on the commit yet, or not finished.
+              unfinished = []
+              try:
+                  for name in required:
+                      runs = check_runs(name)
+                      if not runs:
+                          rows.append((name, "not run", ""))
+                          refused.append(f"'{name}' did not run on the commit")
+                          unfinished.append(name)
+                          continue
+                      newest = max(runs, key=lambda run: (str(run.get("started_at") or ""), run.get("id") or 0))
+                      state = newest.get("conclusion") or newest.get("status") or "unknown"
+                      rows.append((name, state, newest.get("html_url") or ""))
+                      if newest.get("status") != "completed":
+                          refused.append(f"'{name}' is {state}")
+                          unfinished.append(name)
+                      elif newest.get("conclusion") != "success":
+                          refused.append(f"'{name}' is {state}")
+              except Unreadable as error:
+                  # Not an answer of the checks. Where the step waits, it asks many times, and one request
+                  # that failed is asked again until the wait is over. Without a wait it fails at once.
+                  remaining = deadline - time.monotonic()
+                  if not error.again or remaining <= 0:
+                      sys.exit(f"::error::Cannot read the checks of {sha}: {error}")
+                  print(f"Cannot read the checks of {sha} ({error}). Asking again.", flush=True)
+                  time.sleep(min(poll_seconds, remaining))
+                  continue
+              # A check that finished without success is final: waiting for the others changes nothing.
+              if not unfinished or len(refused) > len(unfinished):
+                  break
+              # Nor is anything waited for on behalf of a build that would not be published.
+              past = commits_past()
+              remaining = deadline - time.monotonic()
+              if past or remaining <= 0:
+                  break
+              print(f"Waiting for {', '.join(unfinished)} ({'; '.join(refused)}).", flush=True)
+              time.sleep(min(poll_seconds, remaining))
+
+          newer = f"{rolling_tag} is {past} commit{'' if past == 1 else 's'} past {sha[:7]}"
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write("#### Checks on the commit\n\n")
               if not rows:
@@ -443,23 +562,43 @@ jobs:
                   for name, state, url in rows:
                       summary.write(f"| {name} | {f'[{state}]({url})' if url else state} |\n")
                   summary.write("\n")
+              if past:
+                  summary.write(f"{newer}: a newer build is published. This build is not, and its checks are not waited for.\n\n")
 
           if not required:
               print("::notice::No check is required: required-checks is empty.")
           for name, state, _ in rows:
               print(f"{name}: {state}")
+          if past:
+              # Neither the checks' answer nor a failure: every pushed commit is built, and the build of
+              # a later one was published first. The output keeps the job that publishes from starting.
+              if os.environ.get("GITHUB_OUTPUT"):
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("superseded=true\n")
+              print(f"::notice title=A newer build is published::{newer}. This build is not published, so its "
+                    f"checks are not waited for ({'; '.join(refused)}).")
+              sys.exit(0)
           if refused:
-              print(f"::error title=The commit has not passed its checks::{sha[:7]}: {'; '.join(refused)}. "
-                    "Release a commit whose checks succeeded, or run them again on this one.")
+              # The checks answered, and the answer is no. A step that could not read them never gets
+              # here, so the output tells the two apart for the steps that follow.
+              if os.environ.get("GITHUB_OUTPUT"):
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("refused=true\n")
+              # Only when the wait ran out: a check that failed ended it early.
+              waited = f" after waiting {wait_minutes:g} minutes" if wait_minutes and len(refused) == len(unfinished) else ""
+              print(f"::error title=The commit has not passed its checks::{sha[:7]}: {'; '.join(refused)}{waited}. "
+                    "Take a commit whose checks succeeded, or run them again on this one.")
               sys.exit(1)
           CHECKS
 
+      # The version is the tag without its v: X.Y.Z, or X.Y.0-preview.N with
+      # the code of a preview, below the release of X.Y.0.
       - name: Compute the versionCode
         id: code
         uses: asleep-ai/actions/release-version@android-ci/v1
         with:
           operation: code
-          kind: release
+          kind: ${{ steps.tag.outputs.kind }}
           version: ${{ steps.tag.outputs.tag }}
 
       - name: Pick the runner
@@ -477,8 +616,9 @@ jobs:
     with:
       runs-on: ${{ needs.plan.outputs.runs-on || (startsWith(inputs.fallback-runs-on, '[') && inputs.fallback-runs-on) || toJSON(inputs.fallback-runs-on || 'ubuntu-latest') }}
       attempt: primary
+      kind: ${{ needs.plan.outputs.preview == 'true' && 'preview' || 'release' }}
       environment: ${{ inputs.environment }}
-      tag: ${{ needs.plan.outputs.tag }}
+      ref: refs/tags/${{ needs.plan.outputs.tag }}
       sha: ${{ needs.plan.outputs.sha }}
       version-name: ${{ needs.plan.outputs.version }}
       version-code: ${{ needs.plan.outputs.version-code }}
@@ -515,8 +655,9 @@ jobs:
     with:
       runs-on: ${{ (startsWith(inputs.fallback-runs-on, '[') && inputs.fallback-runs-on) || toJSON(inputs.fallback-runs-on || 'ubuntu-latest') }}
       attempt: fallback
+      kind: ${{ needs.plan.outputs.preview == 'true' && 'preview' || 'release' }}
       environment: ${{ inputs.environment }}
-      tag: ${{ needs.plan.outputs.tag }}
+      ref: refs/tags/${{ needs.plan.outputs.tag }}
       sha: ${{ needs.plan.outputs.sha }}
       version-name: ${{ needs.plan.outputs.version }}
       version-code: ${{ needs.plan.outputs.version-code }}
@@ -592,6 +733,12 @@ jobs:
       # release never happened (its build failed, and the fix got the next
       # version) has its changes listed here. Without any, the output is
       # empty and the notes cover the whole history.
+      #
+      # A release never starts at a preview: its notes cover everything since
+      # the release before it. A preview starts at the published preview of
+      # the same version before it, so its notes are what changed at the
+      # demo site, and the first preview of a version starts where the
+      # release of that version would.
       - name: Find the previous release of the line
         id: previous
         if: ${{ steps.release.outputs.exists == 'false' }}
@@ -606,17 +753,31 @@ jobs:
             echo "::error::Cannot list the releases of $GH_REPO."
             exit 1
           fi
-          contained=$(git tag --merged "refs/tags/$TAG" | grep -E "$pattern" || true)
-          # In rising order up to the tag itself: the last published one wins.
+          merged=$(git tag --merged "refs/tags/$TAG")
+          contained=$(grep -E "$pattern" <<< "$merged" || true)
+          # The version of the tag: the tag itself, or what a preview is a preview of.
+          base="${TAG%-preview.*}"
+          # In rising order up to the version itself: the last published one wins.
           previous=""
           while IFS= read -r candidate; do
-            if [[ "$candidate" == "$TAG" ]]; then
+            if [[ "$candidate" == "$base" ]]; then
               break
             fi
             if grep -qxF "$candidate" <<< "$published"; then
               previous="$candidate"
             fi
-          done < <(printf '%s\n%s\n' "$contained" "$TAG" | grep -E "$pattern" | sort -V -u)
+          done < <(printf '%s\n%s\n' "$contained" "$base" | grep -E "$pattern" | sort -V -u)
+          if [[ "$TAG" != "$base" ]]; then
+            previews="^${base//./\\.}-preview\.[1-9][0-9]*$"
+            while IFS= read -r candidate; do
+              if [[ "$candidate" == "$TAG" ]]; then
+                break
+              fi
+              if grep -qxF "$candidate" <<< "$published"; then
+                previous="$candidate"
+              fi
+            done < <(printf '%s\n%s\n' "$merged" "$TAG" | grep -E "$previews" | sort -V -u)
+          fi
           echo "tag=$previous" >> "$GITHUB_OUTPUT"
           echo "Previous release of the line: ${previous:-none}."
 
@@ -651,6 +812,7 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
           VERSION_CODE: ${{ needs.plan.outputs.version-code }}
           LATEST: ${{ needs.plan.outputs.latest }}
+          KIND: ${{ needs.plan.outputs.preview == 'true' && 'preview' || 'release' }}
           EXISTS: ${{ steps.release.outputs.exists }}
           APK_DIRECTORY: ${{ runner.temp }}/android-release-apk
           NOTES_FILE: ${{ runner.temp }}/android-release-notes.md
@@ -676,9 +838,14 @@ jobs:
             # --verify-tag: if the tag was deleted meanwhile, fail instead of
             # letting gh create it on the default branch. --latest is always
             # stated: a release of a lower line must not become the latest
-            # release because it is the newest.
-            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$NOTES_FILE" "--latest=$LATEST" "${apks[@]}"
-            action="Created the release with $names"
+            # release because it is the newest. A preview is a GitHub
+            # pre-release, which is never the latest release.
+            marks=("--latest=$LATEST")
+            if [[ "$KIND" == preview ]]; then
+              marks=(--prerelease --latest=false)
+            fi
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$NOTES_FILE" "${marks[@]}" "${apks[@]}"
+            action="Created the $([[ "$KIND" == preview ]] && echo pre-release || echo release) with $names"
           fi
 
           if [[ "$BUILT_ON" == fallback ]]; then
@@ -691,7 +858,7 @@ jobs:
           fi
           url="$GITHUB_SERVER_URL/$GH_REPO/releases/tag/$TAG"
           {
-            echo "### Android release $TAG"
+            echo "### Android $([[ "$KIND" == preview ]] && echo preview || echo release) $TAG"
             echo
             echo "$action: <$url>"
             echo

@@ -9,6 +9,12 @@ name: Android version bump
 # starts the caller's release workflow. Nobody is asked in between. The tag is
 # the release: no branch is moved unless the caller names one.
 #
+# With prerelease set to preview, the same version is planned and checked, and
+# the tag is vX.Y.0-preview.N: a preview of the version, which the release
+# workflow builds with the release key and publishes as a GitHub pre-release.
+# Only a new minor or major version has previews; with bump patch the plan is
+# refused.
+#
 # The caller's contract and every input are in android-ci/README.md.
 on:
   workflow_call:
@@ -43,6 +49,16 @@ on:
         required: false
         type: string
         default: ''
+      prerelease:
+        description: >-
+          Optional. Empty, the default, plans the release vX.Y.Z. preview
+          plans a preview of that version instead: the tag vX.Y.0-preview.N,
+          N one above the previews of X.Y.0 that exist. The version has to be
+          a new minor or major version: with bump patch, or a version whose
+          patch is not 0, the plan is refused. No other value is accepted.
+        required: false
+        type: string
+        default: ''
       dry_run:
         description: >-
           Plan and check only: nothing is tagged, pushed or started. True by
@@ -54,8 +70,9 @@ on:
       confirm:
         description: >-
           The version the plan is expected to compute, X.Y.Z or vX.Y.Z, as a
-          dry run showed it. Required when dry_run is false: the run tags only
-          when the plan computes this very version. Not read on a dry run.
+          dry run showed it; for a preview the whole name, vX.Y.0-preview.N.
+          Required when dry_run is false: the run tags only when the plan
+          computes this very version. Not read on a dry run.
         required: false
         type: string
         default: ''
@@ -72,10 +89,15 @@ on:
       required-checks:
         description: >-
           Names of the checks that must have succeeded on the commit, one per
-          line, as the commit's checks list shows them.
+          line, as the commit's checks list shows them. The default is the
+          pull request check and the QA build of the push (android-qa.yml,
+          called by a job named qa): android-pr-check.yml leaves the release
+          variant of a pushed commit to that build.
         required: false
         type: string
-        default: pr-check / result
+        default: |
+          pr-check / result
+          qa / built
       main-branch:
         description: >-
           Optional. A branch that is moved to the released commit, as a
@@ -116,7 +138,7 @@ on:
         description: The tag of the planned version.
         value: ${{ jobs.plan.outputs.tag }}
       version:
-        description: The planned version, X.Y.Z.
+        description: The planned version, X.Y.Z, or X.Y.0-preview.N for a preview.
         value: ${{ jobs.plan.outputs.version }}
       target-sha:
         description: The commit that is released.
@@ -174,12 +196,15 @@ jobs:
           sha: ${{ inputs.sha }}
           bump: ${{ inputs.bump }}
           version: ${{ inputs.version }}
+          prerelease: ${{ inputs.prerelease }}
           source-branch: ${{ inputs.source-branch || github.event.repository.default_branch }}
 
       - name: Write the plan to the summary
         env:
           TAG: ${{ steps.version.outputs.tag }}
           PREVIOUS_TAG: ${{ steps.version.outputs.previous-tag }}
+          PREVIOUS_PRERELEASE_TAG: ${{ steps.version.outputs.previous-prerelease-tag }}
+          NOTICE: ${{ steps.version.outputs.notice }}
           VERSION_CODE: ${{ steps.version.outputs.version-code }}
           TARGET_SHA: ${{ steps.version.outputs.target-sha }}
           LINE_BRANCH: ${{ steps.version.outputs.branch }}
@@ -187,6 +212,7 @@ jobs:
           PR: ${{ inputs.pr }}
           BUMP: ${{ inputs.bump }}
           VERSION_GIVEN: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
@@ -204,6 +230,17 @@ jobs:
             echo "- versionCode: $VERSION_CODE"
             if [[ -n "$VERSION_GIVEN" ]]; then
               echo "- The version was given (\`version\`); \`bump\` ($BUMP) is ignored."
+            fi
+            if [[ -n "$PRERELEASE" ]]; then
+              echo "- A $PRERELEASE, not a release: it is published as a GitHub pre-release, and \`${TAG%-"$PRERELEASE".*}\` is still to be released."
+              if [[ -n "$PREVIOUS_PRERELEASE_TAG" ]]; then
+                echo "- The $PRERELEASE before this one is \`$PREVIOUS_PRERELEASE_TAG\`; the list below is what this one adds to it."
+              fi
+            fi
+            if [[ -n "$NOTICE" ]]; then
+              echo
+              # printf: the sentence holds tag names, not a format.
+              printf '> [!WARNING]\n> %s.\n' "$NOTICE"
             fi
             echo
             echo "#### Included"
@@ -254,9 +291,11 @@ jobs:
           fi
           echo "$path at $short calls android-release.yml and can be started for the tag."
 
-      # A release is cut from a commit that passed the same checks a pull
-      # request has to pass. The newest check run of each name counts. A check
-      # that never ran on the commit is a refusal, like one that failed.
+      # A release is cut from a commit that passed the checks a pull request
+      # has to pass and whose release variant was built: by default the pull
+      # request check of the push and the QA build of the push, which builds
+      # that variant in its place. The newest check run of each name counts. A
+      # check that never ran on the commit is a refusal, like one that failed.
       # android-release.yml runs the same script on the tagged commit, and
       # android-ci's tests fail when the two copies differ.
       #
@@ -273,6 +312,7 @@ jobs:
           import json
           import os
           import sys
+          import time
           import urllib.error
           import urllib.parse
           import urllib.request
@@ -282,12 +322,31 @@ jobs:
           sha = os.environ["TARGET_SHA"]
           token = os.environ.get("TOKEN", "").strip()
           required = [line.strip() for line in os.environ.get("REQUIRED_CHECKS", "").splitlines() if line.strip()]
+          # Only android-qa.yml waits: its build starts with the push that also starts the checks. A
+          # release is decided from the checks as they are.
+          try:
+              wait_minutes = float(os.environ.get("CHECKS_WAIT_MINUTES") or 0)
+              poll_seconds = float(os.environ.get("CHECKS_POLL_SECONDS") or 30)
+          except ValueError:
+              sys.exit("::error::The time to wait for the checks is not a number.")
+          deadline = time.monotonic() + wait_minutes * 60
+          # And only android-qa.yml names a tag: the one of the pre-release its build is published as. A
+          # build that pre-release is already past is not published whatever its checks say, so the step
+          # does not wait for them.
+          rolling_tag = os.environ.get("ROLLING_TAG", "").strip()
 
 
-          def check_runs(name):
-              query = urllib.parse.urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+          class Unreadable(Exception):
+              """The checks could not be read. `again` says whether another request may succeed."""
+
+              def __init__(self, reason, again):
+                  super().__init__(reason)
+                  self.again = again
+
+
+          def read(path):
               request = urllib.request.Request(
-                  f"{api}/repos/{repository}/commits/{sha}/check-runs?{query}",
+                  f"{api}/repos/{repository}/{path}",
                   headers={
                       "Accept": "application/vnd.github+json",
                       "Authorization": f"Bearer {token}",
@@ -297,32 +356,86 @@ jobs:
               )
               try:
                   with urllib.request.urlopen(request, timeout=20) as response:
-                      document = json.load(response)
+                      return json.load(response)
               except urllib.error.HTTPError as error:
                   detail = error.read(300).decode(errors="replace").strip()
-                  sys.exit(f"::error::Cannot read the checks of {sha}: HTTP {error.code}: {detail}")
+                  # A server error and a rate limit pass; a token that may not read the checks does not.
+                  raise Unreadable(f"HTTP {error.code}: {detail}", error.code >= 500 or error.code == 429) from None
               except (OSError, ValueError) as error:
-                  sys.exit(f"::error::Cannot read the checks of {sha}: {error}")
+                  raise Unreadable(str(error) or type(error).__name__, True) from None
+
+
+          def check_runs(name):
+              query = urllib.parse.urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+              document = read(f"commits/{sha}/check-runs?{query}")
               runs = document.get("check_runs") if isinstance(document, dict) else None
               if not isinstance(runs, list):
-                  sys.exit(f"::error::Cannot read the checks of {sha}: the response has no check_runs list")
+                  raise Unreadable("the response has no check_runs list", True)
               return [run for run in runs if isinstance(run, dict) and run.get("name") == name]
 
 
-          rows = []
-          refused = []
-          for name in required:
-              runs = check_runs(name)
-              if not runs:
-                  rows.append((name, "not run", ""))
-                  refused.append(f"'{name}' did not run on the commit")
-                  continue
-              newest = max(runs, key=lambda run: (str(run.get("started_at") or ""), run.get("id") or 0))
-              state = newest.get("conclusion") or newest.get("status") or "unknown"
-              rows.append((name, state, newest.get("html_url") or ""))
-              if newest.get("status") != "completed" or newest.get("conclusion") != "success":
-                  refused.append(f"'{name}' is {state}")
+          def commits_past():
+              """How many commits the rolling tag is past this one: 0 when it is not, or when that cannot be told.
 
+              "ahead" is GitHub's word for a head (the tag) that contains the base (this commit) and more.
+              A tag that does not exist yet, a tag on another history and a request that failed are no
+              reason to stop waiting.
+              """
+              if not rolling_tag:
+                  return 0
+              try:
+                  document = read(f"compare/{sha}...{urllib.parse.quote(rolling_tag, safe='')}?per_page=1")
+              except Unreadable:
+                  return 0
+              if not isinstance(document, dict) or document.get("status") != "ahead":
+                  return 0
+              ahead = document.get("ahead_by")
+              return ahead if isinstance(ahead, int) and ahead > 0 else 0
+
+
+          past = 0
+          while True:
+              rows = []
+              refused = []
+              # Checks that may still succeed: not started on the commit yet, or not finished.
+              unfinished = []
+              try:
+                  for name in required:
+                      runs = check_runs(name)
+                      if not runs:
+                          rows.append((name, "not run", ""))
+                          refused.append(f"'{name}' did not run on the commit")
+                          unfinished.append(name)
+                          continue
+                      newest = max(runs, key=lambda run: (str(run.get("started_at") or ""), run.get("id") or 0))
+                      state = newest.get("conclusion") or newest.get("status") or "unknown"
+                      rows.append((name, state, newest.get("html_url") or ""))
+                      if newest.get("status") != "completed":
+                          refused.append(f"'{name}' is {state}")
+                          unfinished.append(name)
+                      elif newest.get("conclusion") != "success":
+                          refused.append(f"'{name}' is {state}")
+              except Unreadable as error:
+                  # Not an answer of the checks. Where the step waits, it asks many times, and one request
+                  # that failed is asked again until the wait is over. Without a wait it fails at once.
+                  remaining = deadline - time.monotonic()
+                  if not error.again or remaining <= 0:
+                      sys.exit(f"::error::Cannot read the checks of {sha}: {error}")
+                  print(f"Cannot read the checks of {sha} ({error}). Asking again.", flush=True)
+                  time.sleep(min(poll_seconds, remaining))
+                  continue
+              # A check that finished without success is final: waiting for the others changes nothing.
+              if not unfinished or len(refused) > len(unfinished):
+                  break
+              # Nor is anything waited for on behalf of a build that would not be published.
+              past = commits_past()
+              remaining = deadline - time.monotonic()
+              if past or remaining <= 0:
+                  break
+              print(f"Waiting for {', '.join(unfinished)} ({'; '.join(refused)}).", flush=True)
+              time.sleep(min(poll_seconds, remaining))
+
+          newer = f"{rolling_tag} is {past} commit{'' if past == 1 else 's'} past {sha[:7]}"
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write("#### Checks on the commit\n\n")
               if not rows:
@@ -332,14 +445,32 @@ jobs:
                   for name, state, url in rows:
                       summary.write(f"| {name} | {f'[{state}]({url})' if url else state} |\n")
                   summary.write("\n")
+              if past:
+                  summary.write(f"{newer}: a newer build is published. This build is not, and its checks are not waited for.\n\n")
 
           if not required:
               print("::notice::No check is required: required-checks is empty.")
           for name, state, _ in rows:
               print(f"{name}: {state}")
+          if past:
+              # Neither the checks' answer nor a failure: every pushed commit is built, and the build of
+              # a later one was published first. The output keeps the job that publishes from starting.
+              if os.environ.get("GITHUB_OUTPUT"):
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("superseded=true\n")
+              print(f"::notice title=A newer build is published::{newer}. This build is not published, so its "
+                    f"checks are not waited for ({'; '.join(refused)}).")
+              sys.exit(0)
           if refused:
-              print(f"::error title=The commit has not passed its checks::{sha[:7]}: {'; '.join(refused)}. "
-                    "Release a commit whose checks succeeded, or run them again on this one.")
+              # The checks answered, and the answer is no. A step that could not read them never gets
+              # here, so the output tells the two apart for the steps that follow.
+              if os.environ.get("GITHUB_OUTPUT"):
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("refused=true\n")
+              # Only when the wait ran out: a check that failed ended it early.
+              waited = f" after waiting {wait_minutes:g} minutes" if wait_minutes and len(refused) == len(unfinished) else ""
+              print(f"::error title=The commit has not passed its checks::{sha[:7]}: {'; '.join(refused)}{waited}. "
+                    "Take a commit whose checks succeeded, or run them again on this one.")
               sys.exit(1)
           CHECKS
 
@@ -351,7 +482,8 @@ jobs:
       # The branch follows the releases of the source branch only. A release
       # from a maintenance branch (release/<major>.x) is a commit the main
       # branch cannot move forward to, and it is left where it is. The source
-      # branch itself is never moved: it holds the commit already.
+      # branch itself is never moved: it holds the commit already. A preview
+      # moves no branch either: the branch follows the releases.
       - name: Check that the main branch can move
         id: main
         env:
@@ -359,11 +491,15 @@ jobs:
           LINE_BRANCH: ${{ steps.version.outputs.branch }}
           SOURCE_BRANCH: ${{ inputs.source-branch || github.event.repository.default_branch }}
           TARGET_SHA: ${{ steps.version.outputs.target-sha }}
+          PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
           moved="$MAIN_BRANCH"
           if [[ -z "$MAIN_BRANCH" ]]; then
             line="No branch is moved: the tag is the release."
+          elif [[ -n "$PRERELEASE" ]]; then
+            moved=""
+            line="\`$MAIN_BRANCH\` is not moved: it follows the releases, and this is a $PRERELEASE."
           elif [[ "$MAIN_BRANCH" == "$SOURCE_BRANCH" ]]; then
             moved=""
             line="No branch is moved: \`$MAIN_BRANCH\` is the branch the release is cut from."
@@ -434,9 +570,10 @@ jobs:
           if [[ -z "$confirm" ]]; then
             refuse "The release is not confirmed" "The plan computed $TAG ($plan), and confirm is empty: a run that is not a dry run has to name the planned version."
           fi
-          # Only a version is printed back.
-          if [[ ! "$confirm" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            refuse "confirm is not a version" "The plan computed $TAG ($plan), and confirm is not of the form X.Y.Z or vX.Y.Z."
+          # Only a version is printed back: X.Y.Z, or the name of a prerelease
+          # of one, X.Y.0-preview.N.
+          if [[ ! "$confirm" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-z]+\.[0-9]+)?$ ]]; then
+            refuse "confirm is not a version" "The plan computed $TAG ($plan), and confirm is not of the form X.Y.Z or vX.Y.Z (X.Y.0-preview.N for a preview)."
           fi
           if [[ "$confirm" != "$TAG" && "$confirm" != "$VERSION" ]]; then
             refuse "confirm does not name the planned version" "The plan computed $TAG ($plan), and confirm is $confirm."
@@ -504,6 +641,7 @@ jobs:
           sha: ${{ needs.plan.outputs.target-sha }}
           bump: ${{ inputs.bump }}
           version: ${{ inputs.version }}
+          prerelease: ${{ inputs.prerelease }}
           source-branch: ${{ inputs.source-branch || github.event.repository.default_branch }}
 
       # One atomic push. With a main-branch, the tag and the branch move

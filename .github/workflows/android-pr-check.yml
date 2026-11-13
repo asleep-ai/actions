@@ -95,12 +95,25 @@ on:
         required: false
         type: string
         default: ''
-      release-build-skip-push-branches:
+      release-build-on-push:
         description: >-
-          Branch names, separated by whitespace or commas. A push to one of
-          them skips the release build, for a branch whose pushes another
-          workflow already builds the release variant for. The check of such
-          a push then does not cover the release variant.
+          Whether a push to the source branch or to a maintenance branch
+          (release/<major>.x) runs the release build too. False, the default:
+          it is skipped there, because android-qa.yml builds the release
+          variant of every such push, and its check (qa / built) is what
+          android-version-bump.yml and android-release.yml require next to
+          result. Set true in a repository that does not call android-qa.yml,
+          and take that check out of the required-checks of the two. A pull
+          request and a push to any other branch always run the release
+          build.
+        required: false
+        type: boolean
+        default: false
+      source-branch:
+        description: >-
+          The branch releases are cut from; empty means the default branch of
+          the repository. Read only to tell which pushes android-qa.yml
+          builds, for release-build-on-push.
         required: false
         type: string
         default: ''
@@ -246,7 +259,8 @@ jobs:
       verify-args: ${{ inputs.verify-args }}
       verify-signing-key: ${{ inputs.verify-signing-key }}
       release-build-args: ${{ inputs.release-build-args }}
-      release-build-skip-push-branches: ${{ inputs.release-build-skip-push-branches }}
+      release-build-on-push: ${{ inputs.release-build-on-push }}
+      source-branch: ${{ inputs.source-branch }}
       checkout-submodules: ${{ inputs.checkout-submodules }}
       local-properties: ${{ inputs.local-properties }}
       paths-ignore: ${{ inputs.paths-ignore }}
@@ -288,7 +302,8 @@ jobs:
       verify-args: ${{ inputs.verify-args }}
       verify-signing-key: ${{ inputs.verify-signing-key }}
       release-build-args: ${{ inputs.release-build-args }}
-      release-build-skip-push-branches: ${{ inputs.release-build-skip-push-branches }}
+      release-build-on-push: ${{ inputs.release-build-on-push }}
+      source-branch: ${{ inputs.source-branch }}
       checkout-submodules: ${{ inputs.checkout-submodules }}
       local-properties: ${{ inputs.local-properties }}
       paths-ignore: ${{ inputs.paths-ignore }}

@@ -391,7 +391,7 @@ def plan(jobs, repo: Path, job: str = "verify", **env: str) -> tuple[str, str]:
         "EVENT_NAME": "pull_request",
         "REF": "refs/pull/1/merge",
         "PATHS_IGNORE": DEFAULT_IGNORE,
-        "SKIP_PUSH_BRANCHES": "",
+        "QA_SOURCE_BRANCH": "",
         "GITHUB_OUTPUT": str(output),
         **env,
     }
@@ -482,9 +482,11 @@ def pushed(tmp_path: Path, changes: dict[str, str | None]) -> Path:
         {},
     ],
 )
-@pytest.mark.parametrize("ref", ["refs/heads/develop", "refs/heads/main", "refs/heads/release/1.x", "refs/heads/feature"])
+@pytest.mark.parametrize("ref",["refs/heads/develop", "refs/heads/main", "refs/heads/release/1.x", "refs/heads/feature"])
 @pytest.mark.parametrize("job", ["verify", "release-build"])
 def test_plan_of_a_push_always_builds(jobs, tmp_path, changes, ref, job):
+    # With no branch left to the QA build (the verify job always, the release build with
+    # release-build-on-push), every push is built, whatever it changed.
     repo = pushed(tmp_path, changes)
     decision, log = plan(jobs, repo, job=job, EVENT_NAME="push", REF=ref)
     assert decision == "true"
@@ -496,7 +498,7 @@ def test_plan_of_a_push_does_not_read_the_previous_tip(jobs):
     # predecessor never passed. Neither Gradle job takes the previous tip any more.
     for job in ("verify", "release-build"):
         decide = step(jobs[job], "Decide whether to build")
-        assert set(decide["env"]) == {"EVENT_NAME", "REF", "PATHS_IGNORE", "SKIP_PUSH_BRANCHES"}
+        assert set(decide["env"]) == {"EVENT_NAME", "REF", "PATHS_IGNORE", "QA_SOURCE_BRANCH"}
         assert "github.event.before" not in str(jobs[job])
         assert "fetch" not in decide["run"]
 
@@ -504,42 +506,99 @@ def test_plan_of_a_push_does_not_read_the_previous_tip(jobs):
 @pytest.mark.parametrize("event", ["workflow_dispatch", "schedule", "merge_group"])
 def test_plan_of_other_events_always_builds(jobs, tmp_path, event):
     repo = merged_pull_request(tmp_path, {"docs/guide.md": "more\n"})
-    decision, log = plan(jobs, repo, EVENT_NAME=event, REF="refs/heads/develop", SKIP_PUSH_BRANCHES="develop")
+    decision, log = plan(jobs, repo, EVENT_NAME=event, REF="refs/heads/develop", QA_SOURCE_BRANCH="develop")
     assert decision == "true"
     assert f"a {event} run always builds" in log
 
 
 @pytest.mark.parametrize(
-    ("event", "ref", "skip", "build"),
+    ("event", "ref", "source", "build"),
     [
+        # The branches android-qa.yml builds: the source branch and release/<major>.x.
         ("push", "refs/heads/develop", "develop", "false"),
-        ("push", "refs/heads/develop", "main, develop", "false"),
-        ("push", "refs/heads/develop", "main,release", "true"),
+        ("push", "refs/heads/release/1.x", "develop", "false"),
+        ("push", "refs/heads/release/12.x", "main", "false"),
+        ("push", "refs/heads/main", "main", "false"),
+        # Every other push has no QA build, and keeps its release build.
+        ("push", "refs/heads/main", "develop", "true"),
         ("push", "refs/heads/develop-2", "develop", "true"),
+        ("push", "refs/heads/feature/develop", "develop", "true"),
+        ("push", "refs/heads/release/1.x/fix", "develop", "true"),
+        ("push", "refs/heads/release/next", "develop", "true"),
+        ("push", "refs/heads/release/01.x", "develop", "true"),
         ("push", "refs/tags/develop", "develop", "true"),
-        ("push", "refs/heads/develop", "*", "true"),
+        ("push", "refs/tags/release/1.x", "develop", "true"),
+        # release-build-on-push: no branch is left to the QA build.
         ("push", "refs/heads/develop", "", "true"),
+        ("push", "refs/heads/release/1.x", "", "true"),
+        # A pull request into such a branch is built as ever: R8 breakage surfaces before the merge.
         ("pull_request", "refs/heads/develop", "develop", "true"),
+        ("pull_request", "refs/pull/1/merge", "develop", "true"),
     ],
 )
-def test_plan_skips_the_release_build_on_pushes_to_the_named_branches(jobs, tmp_path, event, ref, skip, build):
+def test_the_release_build_of_a_push_is_left_to_the_qa_build_of_that_push(jobs, tmp_path, event, ref, source, build):
     if event == "push":
         repo = pushed(tmp_path, {"app/Main.kt": "fun main() = Unit\n"})
     else:
         repo = merged_pull_request(tmp_path, {"app/Main.kt": "fun main() = Unit\n"})
-    decision, log = plan(jobs, repo, job="release-build", EVENT_NAME=event, REF=ref, SKIP_PUSH_BRANCHES=skip)
+    decision, log = plan(jobs, repo, job="release-build", EVENT_NAME=event, REF=ref, QA_SOURCE_BRANCH=source)
     assert decision == build
-    assert ("this build is skipped on a push to develop" in log) == (build == "false")
+    branch = ref.split("refs/heads/", 1)[-1]
+    left = f"the release variant of a push to {branch} is built by the QA build of the same push (android-qa.yml)"
+    assert (left in log) == (build == "false")
+    if build == "false":
+        assert "a release requires the check of that build next to this one" in log
 
 
-def test_only_the_release_build_has_a_push_skip_list(jobs):
-    assert step(jobs["verify"], "Decide whether to build")["env"]["SKIP_PUSH_BRANCHES"] == ""
-    assert (
-        step(jobs["release-build"], "Decide whether to build")["env"]["SKIP_PUSH_BRANCHES"]
-        == "${{ inputs.release-build-skip-push-branches }}"
+def test_only_the_release_build_leaves_a_push_to_the_qa_build(entry, jobs):
+    # The verify job builds and tests every push: its check is half of what a release requires.
+    assert step(jobs["verify"], "Decide whether to build")["env"]["QA_SOURCE_BRANCH"] == ""
+    assert step(jobs["release-build"], "Decide whether to build")["env"]["QA_SOURCE_BRANCH"] == (
+        "${{ !inputs.release-build-on-push && (inputs.source-branch || github.event.repository.default_branch) || '' }}"
     )
     env = step(jobs["verify"], "Decide whether to build")["env"]
     assert env["PATHS_IGNORE"] == "${{ inputs.paths-ignore }}"
+    inputs = trigger(entry)["inputs"]
+    assert inputs["release-build-on-push"] == {
+        **inputs["release-build-on-push"], "type": "boolean", "default": False, "required": False,
+    }
+    assert inputs["source-branch"]["default"] == ""
+    assert "release-build-skip-push-branches" not in inputs
+    for run in ("primary", "fallback"):
+        passed = entry["jobs"][run]["with"]
+        assert passed["release-build-on-push"] == "${{ inputs.release-build-on-push }}"
+        assert passed["source-branch"] == "${{ inputs.source-branch }}"
+
+
+def test_what_the_push_build_no_longer_covers_is_required_of_a_release_by_default(entry):
+    # The other half of the rule, in the two workflows that release: a commit is tagged and built
+    # for release only when the QA build of its push succeeded too. The defaults change together,
+    # so a caller that takes them cannot end up with a release whose variant no job has built.
+    assert trigger(entry)["inputs"]["release-build-on-push"]["default"] is False
+    for name in ("android-version-bump.yml", "android-release.yml"):
+        assert trigger(load(name))["inputs"]["required-checks"]["default"].splitlines() == [
+            "pr-check / result", "qa / built",
+        ], name
+    # "qa / built" is the job `built` of android-qa.yml under a calling job named qa, for a push.
+    qa = load("android-qa.yml")["jobs"]["built"]
+    assert qa["name"] == "${{ github.event_name == 'push' && 'built' || 'built (manual run)' }}"
+    example = yaml.safe_load((ROOT / "android-ci" / "qa.yml.example").read_text())
+    assert list(example["jobs"]) == ["qa"]
+
+
+def test_the_readme_names_what_changed_for_a_caller_of_the_major_tag(entry):
+    # The three changes reach every caller of android-ci/v1 with the move of that tag: an input
+    # that is gone (a caller that passes it does not start), a build a push no longer makes, and a
+    # check a release requires from then on. The README says so where the tags are described.
+    section = (ROOT / "android-ci" / "README.md").read_text().split("### Changes within `android-ci/v1`", 1)[1].split("\n## ", 1)[0]
+    assert "release-build-skip-push-branches" not in trigger(entry)["inputs"]
+    for word in ("`release-build-skip-push-branches`", "`release-build-on-push: false`", "`pr-check / result` **and `qa / built`**"):
+        assert word in section, word
+    assert "Search for the callers first" in section and "Not while a version bump or a release is running" in section
+    # And where the two settings of a caller without a QA build are described: in the time before
+    # its qa.yml, only a commit pushed after release-build-on-push: true has its release variant built.
+    skipped = (ROOT / "android-ci" / "README.md").read_text().split("### Skipped builds", 1)[1].split("\n### ", 1)[0]
+    assert "only a commit that was pushed after `release-build-on-push: true` reached the branch" in skipped
 
 
 def test_plan_of_the_default_paths_ignore(entry, jobs, tmp_path):
@@ -800,7 +859,7 @@ def test_verify_and_release_build_differ_only_where_they_must(jobs):
                 if ours[key].get(name) != theirs[key].get(name)
             }
     assert differing == {
-        "Decide whether to build": {("env", "SKIP_PUSH_BRANCHES")},
+        "Decide whether to build": {("env", "QA_SOURCE_BRANCH")},
         "Write local.properties": {("env", "SIGNING_KEY")},
         "Run Gradle": {("env", "GRADLE_TASK"), ("env", "GRADLE_ARGS")},
         # Both runs upload in one workflow run, so the names must not collide.

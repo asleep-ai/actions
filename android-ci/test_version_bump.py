@@ -40,13 +40,16 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
     env = {
         "TAG": "v1.13.1",
         "PREVIOUS_TAG": "v1.13.0",
-        "VERSION_CODE": "101350001",
+        "PREVIOUS_PRERELEASE_TAG": "",
+        "NOTICE": "",
+        "VERSION_CODE": "101350100",
         "TARGET_SHA": "3ff9b1a3" + "0" * 32,
         "LINE_BRANCH": "develop",
         "PRS": prs,
         "PR": "858",
         "BUMP": "patch",
         "VERSION_GIVEN": "",
+        "PRERELEASE": "",
         "DRY_RUN": "false",
         "GITHUB_SERVER_URL": "https://github.invalid",
         "GITHUB_REPOSITORY": "acme/app",
@@ -60,13 +63,14 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
     assert "- Commit: [`3ff9b1a`](https://github.invalid/acme/app/commit/3ff9b1a3" in text
     assert ", the merge commit of #858\n" in text
     assert "- Release line: `develop`\n" in text
-    assert "- versionCode: 101350001\n" in text
+    assert "- versionCode: 101350100\n" in text
     # The titles are written as they are.
     assert prs + "\n" in text
     # A run that releases says so at the top: nothing waits between the plan and the tag.
     assert "**Dry run.**" not in text
     assert "**Not a dry run.** When every check below passes and `confirm` names `v1.13.1`, the commit is tagged" in text
     assert "is ignored" not in text
+    assert "not a release" not in text and "[!WARNING]" not in text
 
     # A first release whose version was given, as a dry run.
     summary.write_text("")
@@ -80,6 +84,32 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
     assert "merge commit of" not in text
     assert "- The version was given (`version`); `bump` (patch) is ignored.\n" in text
     assert "Nothing listed." in text
+
+    # A preview: the summary says that it is not the release, and what its list starts at.
+    summary.write_text("")
+    env.update({
+        "PREVIOUS_TAG": "v1.13.0", "TAG": "v2.0.0-preview.2", "PREVIOUS_PRERELEASE_TAG": "v2.0.0-preview.1",
+        "PRS": "- #31 Fix found at the demo", "PRERELEASE": "preview", "VERSION_CODE": "200049002",
+    })
+    result = run_script(script, env, tmp_path)
+    assert result.returncode == 0, result.stderr
+    text = summary.read_text()
+    assert text.startswith("### v1.13.0 → v2.0.0-preview.2\n")
+    assert "- A preview, not a release: it is published as a GitHub pre-release, and `v2.0.0` is still to be released.\n" in text
+    assert "- The preview before this one is `v2.0.0-preview.1`; the list below is what this one adds to it.\n" in text
+    assert "- versionCode: 200049002\n" in text
+    assert "[!WARNING]" not in text
+
+    # A plan that is allowed and has a consequence: the sentence of release-version, as a warning.
+    # A release whose commit leaves out the last preview of its version is one.
+    summary.write_text("")
+    notice = "the commit (3ff9b1a) does not contain v2.0.0-preview.2, the last preview of 2.0.0 (100% sure, %s)"
+    env.update({"TAG": "v2.0.0", "PREVIOUS_PRERELEASE_TAG": "", "PRERELEASE": "", "NOTICE": notice})
+    result = run_script(script, env, tmp_path)
+    assert result.returncode == 0, result.stderr
+    text = summary.read_text()
+    assert f"> [!WARNING]\n> {notice}.\n" in text
+    assert "The preview before this one" not in text
 
 
 # --- plan: the release workflow of the commit ----------------------------------------------
@@ -238,7 +268,9 @@ def test_a_release_without_confirm_is_refused(jobs, tmp_path, confirm):
     assert "Nothing is tagged." in summary
 
 
-@pytest.mark.parametrize("confirm", ["v1.13.2", "1.14.0", "v1.13.0", "v2.0.0", "1.13.10", "v1.13.01"])
+@pytest.mark.parametrize(
+    "confirm", ["v1.13.2", "1.14.0", "v1.13.0", "v2.0.0", "1.13.10", "v1.13.01", "v1.13.1-preview.1", "v1.13.1-rc.1"]
+)
 def test_confirm_of_another_version_is_refused_and_names_the_planned_one(jobs, tmp_path, confirm):
     # A wrong pr or bump: the person expected one version and the plan computed another.
     result, summary = check_confirmation(jobs, tmp_path, confirm)
@@ -250,7 +282,13 @@ def test_confirm_of_another_version_is_refused_and_names_the_planned_one(jobs, t
     assert "Confirmed" not in result.stdout + summary
 
 
-@pytest.mark.parametrize("confirm", ["yes", "true", "v2.5", "v1.13.1-rc.1", "v1.13.1 v1.13.1", "v1.13.1\n::notice::x", "$(id)"])
+@pytest.mark.parametrize(
+    "confirm",
+    [
+        "yes", "true", "v2.5", "v1.13.1-rc", "v1.13.1-preview", "v1.13.1-Preview.1", "v1.13.1-preview.1.2",
+        "v1.13.1 v1.13.1", "v1.13.1\n::notice::x", "$(id)",
+    ],
+)
 def test_confirm_that_is_not_a_version_is_refused_without_being_printed(jobs, tmp_path, confirm):
     result, summary = check_confirmation(jobs, tmp_path, confirm)
     assert result.returncode == 1
@@ -264,6 +302,35 @@ def test_a_first_release_is_confirmed_like_any_other(jobs, tmp_path):
     assert result.returncode == 1
     assert "The plan computed v2.0.0 (no release yet → v2.0.0), and confirm is empty" in result.stdout
     assert check_confirmation(jobs, tmp_path, "2.0.0", tag="v2.0.0", previous="")[0].returncode == 0
+
+
+@pytest.mark.parametrize("confirm", ["v2.0.0-preview.2", "2.0.0-preview.2", " v2.0.0-preview.2 "])
+def test_a_preview_is_confirmed_by_its_whole_name(jobs, tmp_path, confirm):
+    result, summary = check_confirmation(jobs, tmp_path, confirm, tag="v2.0.0-preview.2")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Confirmed: v2.0.0-preview.2." in result.stdout
+
+
+@pytest.mark.parametrize("confirm", ["v2.0.0", "2.0.0", "v2.0.0-preview.1", "v2.0.0-preview.3", "v2.0.0-rc.2", "v2.0.1-preview.2"])
+def test_a_preview_is_not_confirmed_by_the_version_alone_or_by_another_number(jobs, tmp_path, confirm):
+    # The release of the version and a preview of it are two different things to start, and the
+    # number says which preview: one that someone else cut in between changes it.
+    result, _ = check_confirmation(jobs, tmp_path, confirm, tag="v2.0.0-preview.2")
+    assert result.returncode == 1
+    assert (
+        "::error title=confirm does not name the planned version::The plan computed v2.0.0-preview.2 "
+        f"(v1.13.0 → v2.0.0-preview.2), and confirm is {confirm}. Nothing is tagged."
+    ) in result.stdout
+    assert "start the run again with confirm=v2.0.0-preview.2" in result.stdout
+    # And the other way round: a release is not confirmed by the name of a preview of it.
+    result, _ = check_confirmation(jobs, tmp_path, "v2.0.0-preview.2", tag="v2.0.0")
+    assert result.returncode == 1
+
+
+def test_a_dry_run_of_a_preview_says_the_whole_name_to_pass(jobs, tmp_path):
+    result, summary = check_confirmation(jobs, tmp_path, "", dry_run="true", tag="v2.0.0-preview.2")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "`dry_run` off and `confirm` set to `v2.0.0-preview.2`" in summary
 
 
 @pytest.mark.parametrize("confirm", ["", "v1.13.1", "v9.9.9", "anything"])
@@ -308,15 +375,28 @@ def check_run(name="pr-check / result", conclusion="success", status="completed"
 
 @contextlib.contextmanager
 def check_runs_api():
-    """A local GitHub API that answers the check-runs request with the runs set on it."""
+    """A local GitHub API that answers the check-runs request with the runs set on it.
+
+    `compare` holds the answers to "how does a tag compare with the commit", which only the QA
+    build asks: one for each request, the last one from then on. Empty, the tag does not exist.
+    """
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
             server.requests.append((self.path, self.headers.get("Authorization")))
             url = urllib.parse.urlsplit(self.path)
             query = urllib.parse.parse_qs(url.query)
-            if server.status != 200 or url.path != f"/repos/acme/app/commits/{SHA}/check-runs":
-                self.send_response(server.status if server.status != 200 else 404)
+            # `statuses` answers the next requests one by one, `status` every request after them.
+            status = server.statuses.pop(0) if server.statuses else server.status
+            if status == 200 and url.path.startswith(f"/repos/acme/app/compare/{SHA}...") and server.compare:
+                answer = server.compare.pop(0) if len(server.compare) > 1 else server.compare[0]
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(answer).encode())
+                return
+            if status != 200 or url.path != f"/repos/acme/app/commits/{SHA}/check-runs":
+                self.send_response(status if status != 200 else 404)
                 self.end_headers()
                 self.wfile.write(b'{"message": "Resource not accessible by integration"}')
                 return
@@ -332,7 +412,8 @@ def check_runs_api():
             pass
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
-    server.runs, server.requests, server.status, server.body = [], [], 200, None
+    server.runs, server.requests, server.status, server.statuses, server.body = [], [], 200, [], None
+    server.compare = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -438,15 +519,51 @@ def test_an_unreadable_answer_is_not_a_pass(jobs, tmp_path, api):
     result, _ = check_checks(jobs, tmp_path, api)
     assert result.returncode == 1
     assert "the response has no check_runs list" in result.stderr
+    # A release is decided from one reading: only android-qa.yml, which waits, asks again.
+    api.requests.clear()
+    api.status, api.body = 502, None
+    result, _ = check_checks(jobs, tmp_path, api)
+    assert result.returncode == 1 and "HTTP 502" in result.stderr
+    assert len(api.requests) == 1
 
 
-def test_the_default_required_check_is_the_result_of_the_pull_request_check(jobs):
+def test_the_default_required_checks_are_the_pull_request_check_and_the_qa_build_of_the_push(jobs):
+    # The pull request check of a pushed commit does not build the release variant on a branch
+    # that is released from (android-pr-check.yml leaves it to android-qa.yml), so a release
+    # requires the check of that build too. The two defaults belong together.
     inputs = trigger(load(ENTRY))["inputs"]
-    assert inputs["required-checks"]["default"] == "pr-check / result"
+    assert inputs["required-checks"]["default"].splitlines() == ["pr-check / result", "qa / built"]
+    assert inputs["required-checks"]["default"] == trigger(load("android-release.yml"))["inputs"]["required-checks"]["default"]
     pr_check = load("android-pr-check.yml")
     assert "result" in pr_check["jobs"]
+    assert trigger(pr_check)["inputs"]["release-build-on-push"]["default"] is False
     example = yaml.safe_load((ROOT / "android-ci" / "pr-check.yml.example").read_text())
     assert list(example["jobs"]) == ["pr-check"]
+    assert "built" in load("android-qa.yml")["jobs"]
+    example = yaml.safe_load((ROOT / "android-ci" / "qa.yml.example").read_text())
+    assert list(example["jobs"]) == ["qa"]
+
+
+def test_a_commit_without_the_qa_build_of_its_push_is_not_released(jobs, tmp_path, api):
+    # What the default requires, read by the script: the pull request check passed, and the QA
+    # build never ran on the commit (no push built it), failed, or was cancelled by hand.
+    required = trigger(load(ENTRY))["inputs"]["required-checks"]["default"]
+    api.runs = [check_run()]
+    result, summary = check_checks(jobs, tmp_path, api, required=required)
+    assert result.returncode == 1
+    assert "'qa / built' did not run on the commit" in result.stdout
+    assert "| qa / built | not run |" in summary
+    for conclusion in ("failure", "cancelled", "skipped"):
+        api.runs = [check_run(), check_run(name="qa / built", conclusion=conclusion)]
+        result, _ = check_checks(jobs, tmp_path, api, required=required)
+        assert result.returncode == 1 and f"'qa / built' is {conclusion}" in result.stdout
+    # The build of a manual run has another name and does not stand in for it.
+    api.runs = [check_run(), check_run(name="qa / built (manual run)")]
+    assert check_checks(jobs, tmp_path, api, required=required)[0].returncode == 1
+    api.runs = [check_run(), check_run(name="qa / built")]
+    result, summary = check_checks(jobs, tmp_path, api, required=required)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "| qa / built | [success]" in summary
 
 
 # --- plan: the main branch ------------------------------------------------------------------
@@ -472,7 +589,7 @@ def remote(clone: Path, *args: str) -> str:
     return git(clone.parent / "origin.git", *args)
 
 
-def check_branch(jobs, clone: Path, target: str, branch: str = "main", line: str = "develop"):
+def check_branch(jobs, clone: Path, target: str, branch: str = "main", line: str = "develop", prerelease: str = ""):
     summary, output = clone.parent / "summary", clone.parent / "main-output"
     summary.write_text("")
     output.write_text("")
@@ -481,6 +598,7 @@ def check_branch(jobs, clone: Path, target: str, branch: str = "main", line: str
         "LINE_BRANCH": line,
         "SOURCE_BRANCH": "develop",
         "TARGET_SHA": target,
+        "PRERELEASE": prerelease,
         "GITHUB_STEP_SUMMARY": str(summary),
         "GITHUB_OUTPUT": str(output),
     }
@@ -518,6 +636,18 @@ def test_a_release_from_a_maintenance_branch_leaves_main_where_it_is(jobs, clone
     assert result.returncode == 0, result.stdout + result.stderr
     assert "`main` is not moved: it follows the releases of `develop`, and this one is cut from `release/1.x`." in summary
     assert check_branch.moved == "main-branch=\n"
+
+
+def test_a_preview_leaves_main_where_it_is(jobs, clone):
+    # The branch follows the releases. A preview is not one, also when the branch could move.
+    target = commit(clone, {"a.kt": "1"}, "one (#1)")
+    result, summary = check_branch(jobs, clone, target, prerelease="preview")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "`main` is not moved: it follows the releases, and this is a preview." in summary
+    assert check_branch.moved == "main-branch=\n"
+    # Without a main-branch there is nothing to say about it.
+    result, summary = check_branch(jobs, clone, target, branch="", prerelease="preview")
+    assert "No branch is moved: the tag is the release." in summary
 
 
 def test_main_with_a_commit_the_release_lacks_refuses(jobs, clone):
@@ -696,6 +826,8 @@ def test_the_version_is_planned_again_before_the_push(jobs):
         "sha": "${{ needs.plan.outputs.target-sha }}",
         "bump": "${{ inputs.bump }}",
         "version": "${{ inputs.version }}",
+        # A preview is numbered again too: another preview of the version cut meanwhile changes the tag.
+        "prerelease": "${{ inputs.prerelease }}",
         "source-branch": source,
     }
     env = tag["steps"][ids.index("push")]["env"]
@@ -714,11 +846,13 @@ def test_the_version_is_planned_again_before_the_push(jobs):
         "bump": "${{ inputs.bump }}",
         # An exact version, when the caller gave one; the action then does not read the bump.
         "version": "${{ inputs.version }}",
+        "prerelease": "${{ inputs.prerelease }}",
         "source-branch": source,
     }
     main = step(jobs["plan"], "Check that the main branch can move")
     assert main["env"]["SOURCE_BRANCH"] == source
     assert main["env"]["LINE_BRANCH"] == "${{ steps.version.outputs.branch }}"
+    assert main["env"]["PRERELEASE"] == "${{ inputs.prerelease }}"
 
 
 # --- tag: the release workflow --------------------------------------------------------------
@@ -818,9 +952,11 @@ def test_only_the_tag_job_writes_and_only_after_the_plan(jobs):
 def test_inputs_secrets_and_outputs(jobs):
     call = trigger(load(ENTRY))
     assert list(call["inputs"]) == [
-        "pr", "sha", "bump", "version", "dry_run", "confirm", "source-branch", "required-checks", "main-branch",
-        "release-workflow", "environment",
+        "pr", "sha", "bump", "version", "prerelease", "dry_run", "confirm", "source-branch", "required-checks",
+        "main-branch", "release-workflow", "environment",
     ]
+    # A release unless the run says otherwise.
+    assert call["inputs"]["prerelease"] == {**call["inputs"]["prerelease"], "type": "string", "default": "", "required": False}
     # A run is a dry run unless it says otherwise, and a run that says otherwise has to name the
     # planned version: no job waits for an approval, so these two are what stands before the tag.
     assert call["inputs"]["dry_run"] == {**call["inputs"]["dry_run"], "type": "boolean", "default": True}
@@ -860,13 +996,25 @@ def test_the_example_passes_only_what_the_workflow_declares():
     assert job["uses"] == f"asleep-ai/actions/.github/workflows/{ENTRY}@android-ci/v1"
     assert set(job["with"]) <= set(call["inputs"])
     dispatch = example[True]["workflow_dispatch"]["inputs"]
-    assert list(dispatch) == ["pr", "sha", "bump", "version", "dry_run", "confirm"]
+    assert list(dispatch) == ["pr", "sha", "bump", "version", "prerelease", "dry_run", "confirm"]
     assert dispatch["bump"]["options"] == ["patch", "minor", "major"]
+    # A list, so that another kind of prerelease is one more entry. Its first entry and default is
+    # the release, which the called workflow takes as an empty value.
+    assert dispatch["prerelease"]["type"] == "choice" and dispatch["prerelease"]["default"] == "none"
+    assert dispatch["prerelease"]["options"] == ["none", "preview"]
+    assert job["with"]["prerelease"] == "${{ inputs.prerelease != 'none' && inputs.prerelease || '' }}"
+    import sys
+
+    sys.path.insert(0, str(ROOT / "release-version"))
+    import release_version
+
+    assert tuple(dispatch["prerelease"]["options"][1:]) == release_version.PRERELEASES
     # The form opens as a dry run, like the called workflow: a release is a run that unticks it.
     assert dispatch["dry_run"]["type"] == "boolean" and dispatch["dry_run"]["default"] is True
     assert "default" not in dispatch["confirm"]
     for name in dispatch:
-        assert job["with"][name] == f"${{{{ inputs.{name} }}}}"
+        if name != "prerelease":
+            assert job["with"][name] == f"${{{{ inputs.{name} }}}}"
     # Nothing else is passed: no branch is moved and the tag job runs in no environment, by default.
     assert set(job["with"]) == set(dispatch)
     # The called workflow cannot be given more than the caller has.
@@ -902,4 +1050,5 @@ def test_readme_lists_every_input_with_its_default():
         elif isinstance(default, bool):
             assert shown == f"`{str(default).lower()}`", name
         else:
-            assert shown == f"`{default}`", name
+            # A default of several lines is shown line by line.
+            assert shown == "<br>".join(f"`{line}`" for line in default.splitlines()), name

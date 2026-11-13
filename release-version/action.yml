@@ -2,14 +2,15 @@ name: release-version
 description: >-
   Plan the next release of a repository whose versions are git tags: find the
   last release tag, compute the next version, check the commit to release and
-  list the pull requests it adds. Also computes the versionCode of an Android
-  build.
+  list the pull requests it adds. Also plans a preview of that version and a
+  QA build of a branch, and computes the versionCode of an Android build.
 
 inputs:
   operation:
     description: >-
-      What to do: next (plan the next release) or code (compute a
-      versionCode).
+      What to do: next (plan the next release or preview), code (compute a
+      versionCode), qa (plan a QA build of a branch) or changes (list what a
+      commit adds to an earlier one).
     required: false
     default: next
   pr:
@@ -20,8 +21,8 @@ inputs:
     default: ''
   sha:
     description: >-
-      For next, the exception to pr. Id of the commit to release, 7 or more
-      hex digits.
+      For next, the exception to pr: id of the commit to release, 7 or more
+      hex digits. For qa and changes: id of the commit that is built.
     required: false
     default: ''
   bump:
@@ -30,13 +31,22 @@ inputs:
       major. Not read when version is given.
     required: false
     default: patch
+  prerelease:
+    description: >-
+      For next, optional. Empty plans the release vX.Y.Z. preview plans a
+      preview of that version instead: the tag vX.Y.0-preview.N, N one above
+      the previews of X.Y.0 that exist. Only a new minor or major version has
+      previews: with a patch release the plan is refused.
+    required: false
+    default: ''
   source-branch:
     description: >-
       For next, optional. The branch releases are normally cut from. When
       given, the commit has to be in the first-parent history of the branch of
       its release line: release/<major>.x when that branch exists for the
       major of the next version, otherwise this branch. Branches are read from
-      the remote origin. When empty, no branch is checked.
+      the remote origin. When empty, no branch is checked. For qa, required:
+      a QA build is built from this branch or from release/<major>.x.
     required: false
     default: ''
   tag-prefix:
@@ -53,51 +63,165 @@ inputs:
     default: ${{ github.token }}
   version:
     description: >-
-      For code: the version, as X.Y.Z or as its tag. For next, optional: the
-      exact version to release instead of raising the last one by bump. It has
-      to be higher than the last release the commit contains and must not be
-      tagged yet.
+      For code: the version, as X.Y.Z or as its tag; with kind preview, as
+      X.Y.0-preview.N. For next, optional: the exact version to release
+      instead of raising the last one by bump. It has to be higher than the
+      last release the commit contains and must not be tagged yet. For qa,
+      optional: the version this one build leads up to instead of the next
+      patch, which has to be the next minor or the next major version after
+      the last release, and later than the version the builds of the branch
+      lead up to without it (so before a first release none is accepted).
+      The build is then published apart from the rolling build of the
+      branch. Not with label.
     required: false
     default: ''
   kind:
-    description: 'For code. release, or qa for a QA build made after the release named by version.'
+    description: >-
+      For code. release; preview for the preview named by version; or qa for
+      a QA build of the minor version of version.
     required: false
     default: release
   qa-sequence:
     description: >-
-      For code with kind qa. Number of the QA build, 1 or higher; a later
-      build has a higher number.
+      For code with kind qa, and for qa. Number of the QA build, 1 or higher;
+      a later build has a higher number. Not read for a label build.
+    required: false
+    default: ''
+  qa-sequence-offset:
+    description: >-
+      For qa, optional. A whole number added to qa-sequence, for a counter
+      that started again below the builds that are installed.
+    required: false
+    default: ''
+  ref:
+    description: >-
+      For qa. The full ref the build was started for, refs/heads/<branch>.
+      Any ref but the source branch and release/<major>.x is refused.
+    required: false
+    default: ''
+  next-version:
+    description: >-
+      For qa, optional. The version the branch is heading for, when it is
+      not the patch after its last release: 2.0.0 before a first release, or
+      the next minor or major. It is used while it is higher than the last
+      release the commit contains, no higher than the next major version
+      after it, and not released; it is ignored after.
+    required: false
+    default: ''
+  label:
+    description: >-
+      For qa, optional. Makes the build a label build, a named test build
+      made after the last release of its line: lowercase letters, digits and
+      single hyphens. The version name is <next patch>-<label>.<number>, the
+      versionCode the release's plus that number, and the label is added to
+      release-tag. Refused when the line has no release yet.
+    required: false
+    default: ''
+  since:
+    description: >-
+      For changes. Name of the tag that marks the earlier build, such as the
+      release-tag of qa. It need not exist.
+    required: false
+    default: ''
+  version-code:
+    description: >-
+      For changes, optional. The versionCode of the build that is about to
+      be published as the since tag. code-taken-by then says whether another
+      rolling tag holds a build of that versionCode.
     required: false
     default: ''
 
 outputs:
   version:
-    description: The version as X.Y.Z. For next, the next version.
+    description: >-
+      The version as X.Y.Z. For next, the next version, or X.Y.0-preview.N
+      with prerelease. For qa, the version the build leads up to.
     value: ${{ steps.version.outputs.version }}
   tag:
-    description: For next. The tag of the next version.
+    description: For next. The tag of the next version or preview.
     value: ${{ steps.version.outputs.tag }}
   previous-tag:
     description: >-
-      For next. The last release the commit contains; empty when the
-      repository has no release tag.
+      For next and qa. The last release the commit contains; empty when it
+      contains none.
     value: ${{ steps.version.outputs.previous-tag }}
+  previous-prerelease-tag:
+    description: >-
+      For next with prerelease. The preview of the same version before this
+      one, which the pull request list then starts at; empty for the first.
+    value: ${{ steps.version.outputs.previous-prerelease-tag }}
+  notice:
+    description: >-
+      For next. A sentence for the person who releases, when the plan is
+      allowed and has a consequence worth reading: a release whose commit
+      does not contain the last preview of its version. Empty otherwise.
+    value: ${{ steps.version.outputs.notice }}
   branch:
     description: >-
-      For next with source-branch. The branch of the release line: the source
-      branch or release/<major>.x.
+      For next with source-branch, and for qa. The branch of the release
+      line: the source branch or release/<major>.x.
     value: ${{ steps.version.outputs.branch }}
   target-sha:
-    description: For next. Full id of the commit to release.
+    description: For next, qa and changes. Full id of the commit.
     value: ${{ steps.version.outputs.target-sha }}
   prs:
     description: >-
-      For next. Markdown list of the pull requests (number and title) between
-      the last release and the commit to release, oldest first.
+      For next and changes. Markdown list of the pull requests (number and
+      title) the commit adds, oldest first.
     value: ${{ steps.version.outputs.prs }}
   version-code:
-    description: The Android versionCode of the version.
+    description: The Android versionCode of the version or build.
     value: ${{ steps.version.outputs.version-code }}
+  version-name:
+    description: >-
+      For qa. The versionName of the build: <version>-qa.<number>, or
+      <version>-<label>.<number> for a label build.
+    value: ${{ steps.version.outputs.version-name }}
+  kind:
+    description: For qa. qa, or label for a label build.
+    value: ${{ steps.version.outputs.kind }}
+  number:
+    description: >-
+      For qa. The number in the version name: of a QA build, qa-sequence plus
+      qa-sequence-offset; of a label build, one above the label builds
+      published after the same release.
+    value: ${{ steps.version.outputs.number }}
+  line:
+    description: For qa. The branch as it appears in names, slashes as hyphens.
+    value: ${{ steps.version.outputs.line }}
+  major:
+    description: >-
+      For qa. The major version of the maintenance branch the build is of;
+      empty for a build of the source branch.
+    value: ${{ steps.version.outputs.major }}
+  release-tag:
+    description: >-
+      For qa. The tag of the rolling pre-release of the build: qa-<line>,
+      qa-<line>-<label> for a label build, qa-<line>-<version> when version
+      was given. It never starts with the tag prefix of a release.
+    value: ${{ steps.version.outputs.release-tag }}
+  since:
+    description: >-
+      For changes. What the list starts at: the commit of the since tag, the
+      last release tag, or empty for the whole history.
+    value: ${{ steps.version.outputs.since }}
+  since-object:
+    description: >-
+      For changes. The id of the object the since tag names in the checkout,
+      the tag object of an annotated tag; empty when the tag does not exist.
+    value: ${{ steps.version.outputs.since-object }}
+  stale:
+    description: "For changes. 'true' when the since tag names a later commit that contains this one."
+    value: ${{ steps.version.outputs.stale }}
+  unchanged:
+    description: "For changes. 'true' when the since tag names this very commit."
+    value: ${{ steps.version.outputs.unchanged }}
+  code-taken-by:
+    description: >-
+      For changes with version-code. The rolling tag (qa-*), other than the
+      since tag, whose message names a build of that versionCode; empty when
+      there is none.
+    value: ${{ steps.version.outputs.code-taken-by }}
 
 runs:
   using: composite
@@ -110,10 +234,17 @@ runs:
         PR: ${{ inputs.pr }}
         SHA: ${{ inputs.sha }}
         BUMP: ${{ inputs.bump }}
+        PRERELEASE: ${{ inputs.prerelease }}
         SOURCE_BRANCH: ${{ inputs.source-branch }}
         TAG_PREFIX: ${{ inputs.tag-prefix }}
         TOKEN: ${{ inputs.token }}
         VERSION: ${{ inputs.version }}
         KIND: ${{ inputs.kind }}
         QA_SEQUENCE: ${{ inputs.qa-sequence }}
+        QA_SEQUENCE_OFFSET: ${{ inputs.qa-sequence-offset }}
+        REF: ${{ inputs.ref }}
+        NEXT_VERSION: ${{ inputs.next-version }}
+        LABEL: ${{ inputs.label }}
+        SINCE: ${{ inputs.since }}
+        VERSION_CODE: ${{ inputs.version-code }}
       run: python3 "$GITHUB_ACTION_PATH/release_version.py"
