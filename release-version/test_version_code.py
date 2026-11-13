@@ -47,6 +47,26 @@ def test_a_release_is_higher_than_every_earlier_release():
     assert codes == sorted(set(codes))
 
 
+@pytest.mark.parametrize("major", [0, 1, 2, 19])
+def test_a_higher_major_line_is_above_the_whole_line_below_it(major):
+    # A maintenance branch keeps releasing 1.x after 2.0.0 exists. Whatever it releases or builds
+    # for QA stays below everything of the next major, QA builds included.
+    highest_below = max(
+        release_code(major, version_code.MAX_MINOR, version_code.MAX_PATCH),
+        qa_code(major, version_code.MAX_MINOR, version_code.MAX_QA_SEQUENCE),
+    )
+    lowest_above = min(release_code(major + 1, 0, 0), qa_code(major + 1, 0, 1))
+    assert highest_below < lowest_above
+
+
+def test_a_line_keeps_its_order_while_another_line_releases():
+    # Released in this order in time; each line only has to rise within itself.
+    in_time = [(1, 13, 0), (2, 0, 0), (1, 13, 1), (2, 0, 1), (1, 14, 0), (2, 1, 0)]
+    for major in (1, 2):
+        codes = [release_code(*version) for version in in_time if version[0] == major]
+        assert codes == sorted(set(codes))
+
+
 def test_the_codes_continue_above_what_the_apps_have_shipped():
     # sleephub shipped 1.13.0 as 101_300_000 under its earlier formula, with test builds up to
     # 101_150_086; its next release is 1.13.1 or 1.14.0.

@@ -119,6 +119,7 @@ def test_a_repository_without_release_tags_counts_from_zero(repo, tmp_path, bump
         "target-sha": target,
         "prs": "- `" + git(repo, "rev-parse", "HEAD~1")[:7] + "` Initial commit\n- #1 Add the first feature",
         "version-code": str({"0.0.1": 50_001, "0.1.0": 150_000, "1.0.0": 100_050_000}[version]),
+        "branch": "",
     }
 
 
@@ -288,13 +289,26 @@ def test_the_commit_of_the_last_release_has_nothing_new(repo, tmp_path, capsys):
     assert "is the commit of v1.0.0: there is nothing new to release" in error_of(capsys)
 
 
-def test_a_commit_before_the_last_release_is_refused(repo, tmp_path, capsys):
+def test_a_commit_before_the_first_release_is_refused(repo, tmp_path, capsys):
     older = commit(repo, "Older (#1)")
     commit(repo, "Released (#2)")
     git(repo, "tag", "v1.0.0")
     code, _ = run(tmp_path, sha=older)
     assert code == 1
-    assert "does not contain the last release v1.0.0" in error_of(capsys)
+    assert "contains no release tag, and the repository has releases up to v1.0.0" in error_of(capsys)
+
+
+@pytest.mark.parametrize("bump", ["patch", "minor"])
+def test_a_commit_before_the_last_release_of_its_line_is_refused(repo, tmp_path, capsys, bump):
+    git(repo, "tag", "v1.2.0")
+    older = commit(repo, "Older (#1)")
+    commit(repo, "Released (#2)")
+    git(repo, "tag", "v1.3.0")
+    code, _ = run(tmp_path, sha=older, bump=bump)
+    assert code == 1
+    message = error_of(capsys)
+    assert "builds on v1.2.0" in message
+    assert "the last release of major 1 is v1.3.0, which the commit does not contain" in message
 
 
 def test_a_commit_on_a_branch_that_lacks_the_last_release_is_refused(repo, tmp_path, capsys):
@@ -310,13 +324,157 @@ def test_a_commit_on_a_branch_that_lacks_the_last_release_is_refused(repo, tmp_p
     assert code == 1
     message = error_of(capsys)
     assert "the merge commit of pull request #857" in message
-    assert "does not contain the last release v1.13.0" in message
+    assert "contains no release tag, and the repository has releases up to v1.13.0" in message
     # Once develop has received main, the same pull request can be released.
     git(repo, "merge", "-q", "--no-ff", "-m", "Merge branch 'main' into develop", "main")
     target = commit(repo, "Another fix (#858)")
     code, out = run(tmp_path, pulls(**{"858": merged(target)}), pr="858")
     assert code == 0
     assert out["tag"] == "v1.13.1"
+
+
+# --- release lines ----------------------------------------------------------------------
+
+
+def origin(repo: Path, branch: str, revision: str = "HEAD") -> None:
+    """Record a branch of the remote, as a checkout with fetch-depth: 0 has it."""
+    git(repo, "update-ref", f"refs/remotes/origin/{branch}", git(repo, "rev-parse", revision))
+
+
+@pytest.fixture
+def lines(repo) -> dict:
+    """Two lines: 1.x maintained on release/1.x, and develop, which went on to 2.x.
+
+        develop:      base(v1.13.0) ── a ── b(v2.0.0) ── c
+        release/1.x:    └── h1(v1.13.1) ── h2
+    """
+    commits = {"base": commit(repo, "Last change of 1.13.0 (#10)")}
+    git(repo, "tag", "-a", "v1.13.0", "-m", "v1.13.0")
+    git(repo, "checkout", "-q", "-b", "release/1.x")
+    commits["h1"] = commit(repo, "Hotfix one (#21)")
+    git(repo, "tag", "v1.13.1")
+    commits["h2"] = commit(repo, "Hotfix two (#22)")
+    git(repo, "checkout", "-q", "develop")
+    commits["a"] = commit(repo, "Redesign (#30)")
+    commits["b"] = commit(repo, "Finish the redesign (#31)")
+    git(repo, "tag", "v2.0.0")
+    commits["c"] = commit(repo, "Fix after 2.0 (#32)")
+    origin(repo, "develop", "develop")
+    origin(repo, "release/1.x", "release/1.x")
+    return commits
+
+
+def test_each_line_continues_from_the_last_release_its_commit_contains(lines, tmp_path):
+    # 2.0.0 is the highest tag of the repository, and the maintenance branch still goes on from 1.13.1.
+    code, out = run(tmp_path, sha=lines["h2"], source_branch="develop")
+    assert code == 0
+    assert (out["previous-tag"], out["tag"], out["branch"]) == ("v1.13.1", "v1.13.2", "release/1.x")
+    assert out["prs"] == "- #22 Hotfix two"
+    assert out["version-code"] == "101350002"
+    code, out = run(tmp_path, sha=lines["c"], source_branch="develop")
+    assert code == 0
+    assert (out["previous-tag"], out["tag"], out["branch"]) == ("v2.0.0", "v2.0.1", "develop")
+    assert out["prs"] == "- #32 Fix after 2.0"
+
+
+def test_a_minor_release_on_the_maintenance_branch_stays_in_its_line(lines, tmp_path):
+    code, out = run(tmp_path, sha=lines["h2"], bump="minor", source_branch="develop")
+    assert (code, out["tag"], out["branch"]) == (0, "v1.14.0", "release/1.x")
+
+
+def test_a_maintenance_branch_cannot_release_another_major(lines, repo, tmp_path, capsys):
+    # 2.0.0 exists, so major from 1.13.1 would repeat it.
+    code, _ = run(tmp_path, sha=lines["h2"], bump="major", source_branch="develop")
+    assert code == 1
+    assert "the last release of major 2 is v2.0.0, which the commit does not contain" in error_of(capsys)
+    # Also when the next major has no release yet.
+    git(repo, "tag", "-d", "v2.0.0")
+    code, _ = run(tmp_path, sha=lines["h2"], bump="major", source_branch="develop")
+    assert code == 1
+    message = error_of(capsys)
+    assert "is on release/1.x, and the bump gives v2.0.0, a release of major 2" in message
+    assert "A maintenance branch releases its own major version only" in message
+
+
+@pytest.mark.parametrize("bump", ["patch", "minor"])
+def test_the_main_line_cannot_take_a_version_of_a_maintained_major(repo, tmp_path, capsys, bump):
+    # develop has not moved on to the next major yet, and 1.x already has its branch.
+    git(repo, "tag", "v1.13.0")
+    origin(repo, "release/1.x")
+    target = commit(repo, "New work (#30)")
+    origin(repo, "develop")
+    code, _ = run(tmp_path, sha=target, bump=bump, source_branch="develop")
+    assert code == 1
+    message = error_of(capsys)
+    assert "is a release of major 1, which is released from release/1.x" in message
+    assert "On develop, raise the major version" in message
+    code, out = run(tmp_path, sha=target, bump="major", source_branch="develop")
+    assert (code, out["tag"], out["branch"]) == (0, "v2.0.0", "develop")
+
+
+def test_the_main_line_cannot_repeat_a_version_the_maintenance_branch_released(lines, repo, tmp_path, capsys):
+    # A commit of develop from before 2.0.0: it contains v1.13.0 only, and v1.13.1 is on release/1.x.
+    code, _ = run(tmp_path, sha=lines["a"])
+    assert code == 1
+    assert "the last release of major 1 is v1.13.1, which the commit does not contain" in error_of(capsys)
+
+
+def test_a_commit_shared_by_both_lines_is_released_on_the_branch_of_its_major(repo, tmp_path):
+    git(repo, "tag", "v1.13.0")
+    shared = commit(repo, "Before the lines split (#11)")
+    origin(repo, "release/1.x")
+    commit(repo, "Redesign (#30)")
+    origin(repo, "develop")
+    code, out = run(tmp_path, sha=shared, source_branch="develop")
+    assert (code, out["tag"], out["branch"]) == (0, "v1.13.1", "release/1.x")
+
+
+def test_a_repository_without_maintenance_branches_releases_from_the_source_branch(repo, tmp_path):
+    git(repo, "tag", "v1.13.0")
+    target = commit(repo, "Fix (#12)")
+    origin(repo, "develop")
+    origin(repo, "main", "HEAD~1")
+    for bump, tag in (("patch", "v1.13.1"), ("minor", "v1.14.0"), ("major", "v2.0.0")):
+        code, out = run(tmp_path, sha=target, bump=bump, source_branch="develop")
+        assert (code, out["tag"], out["branch"]) == (0, tag, "develop")
+
+
+def test_a_commit_that_was_not_merged_is_refused(repo, tmp_path, capsys):
+    git(repo, "tag", "v1.13.0")
+    commit(repo, "Merged (#12)")
+    origin(repo, "develop")
+    git(repo, "checkout", "-q", "-b", "feature")
+    head = commit(repo, "Head of an open pull request")
+    code, _ = run(tmp_path, sha=head, source_branch="develop")
+    assert code == 1
+    assert "is not on develop. A release is cut from a commit that was merged into develop" in error_of(capsys)
+    # Without source-branch the action checks tags only.
+    code, out = run(tmp_path, sha=head)
+    assert (code, out["tag"], out["branch"]) == (0, "v1.13.1", "")
+
+
+def test_a_branch_that_only_looks_like_a_maintenance_branch_is_not_one(repo, tmp_path, capsys):
+    git(repo, "tag", "v1.13.0")
+    origin(repo, "develop")
+    git(repo, "checkout", "-q", "-b", "release/next")
+    target = commit(repo, "On another release branch")
+    origin(repo, "release/next")
+    code, _ = run(tmp_path, sha=target, source_branch="develop")
+    assert code == 1
+    assert "is not on develop" in error_of(capsys)
+
+
+@pytest.mark.parametrize(
+    ("branch", "message"),
+    [("trunk", "branch trunk is not in this checkout"), ("-x", "source-branch is not a branch name"),
+     ("a b", "source-branch is not a branch name")],
+)
+def test_the_source_branch_has_to_exist(repo, tmp_path, capsys, branch, message):
+    target = commit(repo, "Fix (#1)")
+    origin(repo, "develop")
+    code, _ = run(tmp_path, sha=target, source_branch=branch)
+    assert code == 1
+    assert message in error_of(capsys)
 
 
 def test_a_shallow_checkout_is_refused(repo, tmp_path, capsys, monkeypatch):

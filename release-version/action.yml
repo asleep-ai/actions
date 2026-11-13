@@ -28,6 +28,15 @@ inputs:
     description: 'For next. Which part of the last version to raise: patch, minor or major.'
     required: false
     default: patch
+  source-branch:
+    description: >-
+      For next, optional. The branch releases are normally cut from. When
+      given, the commit has to be on the branch of its release line:
+      release/<major>.x when that branch exists for the major of the next
+      version, otherwise this branch. Branches are read from the remote
+      origin. When empty, no branch is checked.
+    required: false
+    default: ''
   tag-prefix:
     description: >-
       What a release tag starts with, before X.Y.Z. Only tags of exactly
@@ -63,8 +72,15 @@ outputs:
     description: For next. The tag of the next version.
     value: ${{ steps.version.outputs.tag }}
   previous-tag:
-    description: For next. The last release tag; empty when the repository has none.
+    description: >-
+      For next. The last release the commit contains; empty when the
+      repository has no release tag.
     value: ${{ steps.version.outputs.previous-tag }}
+  branch:
+    description: >-
+      For next with source-branch. The branch of the release line: the source
+      branch or release/<major>.x.
+    value: ${{ steps.version.outputs.branch }}
   target-sha:
     description: For next. Full id of the commit to release.
     value: ${{ steps.version.outputs.target-sha }}
@@ -88,6 +104,7 @@ runs:
         PR: ${{ inputs.pr }}
         SHA: ${{ inputs.sha }}
         BUMP: ${{ inputs.bump }}
+        SOURCE_BRANCH: ${{ inputs.source-branch }}
         TAG_PREFIX: ${{ inputs.tag-prefix }}
         TOKEN: ${{ inputs.token }}
         VERSION: ${{ inputs.version }}

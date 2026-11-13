@@ -5,16 +5,22 @@ ever interpolated into a shell command.
 
 Operations:
 
-next  Find the last release tag, compute the next version, resolve the commit
-      to release and check that it can be released:
-      - The last release tag is the highest <prefix>X.Y.Z among all tags of the
-        repository, compared as numbers. Tags with a suffix (v1.2.3-rc.1), a
-        leading zero or another prefix are not release tags.
+next  Resolve the commit to release, find the last release it builds on,
+      compute the next version and check that it can be released:
       - The commit is the merge commit of a merged pull request (pr) or, as the
         exception, a commit named directly (sha).
-      - The commit has to contain the last release tag and at least one commit
-        after it. Without a release tag there is nothing to contain, and the
-        version is counted from 0.0.0.
+      - The last release is the highest <prefix>X.Y.Z among the tags the commit
+        contains, compared as numbers. Tags with a suffix (v1.2.3-rc.1), a
+        leading zero or another prefix are not release tags. A repository
+        without any release tag counts from 0.0.0.
+      - A major version is a release line. The next version continues its
+        line: the last release of that major anywhere in the repository has to
+        be the one the commit contains, and the commit has to add something to
+        it. A maintenance branch (v1.4.2 on release/1.x) and the main line
+        (v2.1.0) are planned independently this way.
+      - With source-branch, the commit also has to be on the branch of its
+        line: release/<major>.x when that branch exists, otherwise the source
+        branch.
       The pull requests between the two are listed from the first-parent
       history, read from the commit subjects.
 
@@ -48,6 +54,7 @@ VERSION = re.compile(rf"{NUMBER}\.{NUMBER}\.{NUMBER}")
 # Characters git allows in a ref name and that need no quoting anywhere a tag is used. Not a leading
 # hyphen: git would read such a tag as an option.
 TAG_PREFIX = re.compile(r"([A-Za-z0-9._/][A-Za-z0-9._/-]*)?")
+BRANCH = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")
 SHA = re.compile(r"[0-9a-fA-F]{7,64}")
 SQUASH_SUBJECT = re.compile(r"(?P<title>.*\S)\s*\(#(?P<number>[0-9]+)\)")
 MERGE_SUBJECT = re.compile(r"Merge pull request #(?P<number>[0-9]+) from \S+")
@@ -71,6 +78,7 @@ class Plan:
     target_sha: str
     prs: str  # markdown list
     version_code: int
+    branch: str  # the branch of the release line; empty when no source branch was given
 
 
 def escape(text: str) -> str:
@@ -105,15 +113,59 @@ def bump_version(version: tuple, bump: str) -> tuple:
     return (major, minor, patch + 1)
 
 
-def last_release(prefix: str) -> Optional[tuple]:
-    """The highest release version among the tags, or None when there is none."""
+def release_versions(prefix: str, merged_into: Optional[str] = None) -> list:
+    """The versions of the release tags: all of them, or those a commit contains."""
+    arguments = ["tag", "--list"] + (["--merged", merged_into] if merged_into else [])
     versions = []
-    for name in git("tag", "--list").stdout.splitlines():
+    for name in git(*arguments).stdout.splitlines():
         if name.startswith(prefix):
             match = VERSION.fullmatch(name[len(prefix):])
             if match:
                 versions.append(tuple(int(part) for part in match.groups()))
-    return max(versions) if versions else None
+    return versions
+
+
+def is_ancestor(commit: str, of: str) -> bool:
+    return git("merge-base", "--is-ancestor", commit, of, check=False).returncode == 0
+
+
+def line_branch(version: tuple, target: str, source_branch: str, what: str, tag: str) -> str:
+    """The branch the release line of `version` lives on, after checking that the commit is on it.
+
+    A major version with a branch release/<major>.x is released from that
+    branch only. Every other major is released from the source branch. So a
+    commit of an open pull request, of an unmerged branch or of another line's
+    branch is refused, however green its own checks are.
+    """
+    if not BRANCH.fullmatch(source_branch):
+        raise Failure(f"source-branch is not a branch name: {source_branch!r}")
+    source = commit_of(f"refs/remotes/origin/{source_branch}")
+    if source is None:
+        raise Failure(f"branch {source_branch} is not in this checkout")
+    major = version[0]
+    maintenance = f"release/{major}.x"
+    maintenance_tip = commit_of(f"refs/remotes/origin/{maintenance}")
+    if maintenance_tip is not None:
+        if not is_ancestor(target, maintenance_tip):
+            raise Failure(
+                f"{tag} is a release of major {major}, which is released from {maintenance}, and {what} "
+                f"({target[:7]}) is not on that branch. On {source_branch}, raise the major version"
+            )
+        return maintenance
+    if is_ancestor(target, source):
+        return source_branch
+    # Say which line the commit belongs to, when it is on a maintenance branch of another major.
+    refs = git("for-each-ref", "--format=%(refname:short)", "--contains", target, "refs/remotes/origin/release/")
+    others = [name[len("origin/"):] for name in refs.stdout.split() if re.fullmatch(r"origin/release/[0-9]+\.x", name)]
+    if others:
+        raise Failure(
+            f"{what} ({target[:7]}) is on {', '.join(others)}, and the bump gives {tag}, a release of major "
+            f"{major}. A maintenance branch releases its own major version only"
+        )
+    raise Failure(
+        f"{what} ({target[:7]}) is not on {source_branch}. A release is cut from a commit that was merged "
+        f"into {source_branch} or into the release/<major>.x branch of its line"
+    )
 
 
 def commit_of(revision: str) -> Optional[str]:
@@ -254,7 +306,21 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
     if git("rev-parse", "--is-shallow-repository").stdout.strip() == "true":
         raise Failure("the checkout is shallow, so tags and history are incomplete; check out with fetch-depth: 0")
 
-    previous = last_release(prefix)
+    source_branch = env.get("SOURCE_BRANCH", "").strip()
+
+    target = merge_commit_of(pr, env, fetch) if pr else named_commit(sha)
+    what = f"the merge commit of pull request #{pr}" if pr else "the commit"
+
+    everything = release_versions(prefix)
+    contained = release_versions(prefix, merged_into=target)
+    if everything and not contained:
+        highest = prefix + format_version(max(everything))
+        raise Failure(
+            f"{what} ({target[:7]}) contains no release tag, and the repository has releases up to {highest}. "
+            "A release has to build on the one before it: merge the history of the last release into the "
+            "branch that is released first"
+        )
+    previous = max(contained) if contained else None
     version = bump_version(previous or ZERO, bump)
     tag = prefix + format_version(version)
     previous_tag = prefix + format_version(previous) if previous else ""
@@ -263,8 +329,17 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
     except VersionCodeError as exc:
         raise Failure(str(exc)) from None
 
-    target = merge_commit_of(pr, env, fetch) if pr else named_commit(sha)
-    what = f"the merge commit of pull request #{pr}" if pr else "the commit"
+    # The line of the next version is its major. Its last release, wherever in the repository it is
+    # tagged, has to be the release this commit builds on; otherwise the version would repeat one of
+    # the line or fall behind it.
+    line = [candidate for candidate in everything if candidate[0] == version[0]]
+    if line and max(line) != previous:
+        line_last = prefix + format_version(max(line))
+        raise Failure(
+            f"{what} ({target[:7]}) builds on {previous_tag or 'no release'}, and {bump} gives {tag}, but the "
+            f"last release of major {version[0]} is {line_last}, which the commit does not contain. Release "
+            f"from the branch that carries {line_last}, merge it into this branch first, or raise the major version"
+        )
 
     previous_commit = None
     if previous_tag:
@@ -273,12 +348,8 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
             raise Failure(f"tag {previous_tag} does not name a commit")
         if previous_commit == target:
             raise Failure(f"{what} ({target[:7]}) is the commit of {previous_tag}: there is nothing new to release")
-        if git("merge-base", "--is-ancestor", previous_commit, target, check=False).returncode != 0:
-            raise Failure(
-                f"{what} ({target[:7]}) does not contain the last release {previous_tag} ({previous_commit[:7]}). "
-                f"A release has to build on the one before it: merge the history of {previous_tag} into the "
-                "branch that is released first"
-            )
+
+    branch = line_branch(version, target, source_branch, what, tag) if source_branch else ""
     return Plan(
         version=format_version(version),
         tag=tag,
@@ -286,6 +357,7 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
         target_sha=target,
         prs=pull_requests(previous_commit, target),
         version_code=code,
+        branch=branch,
     )
 
 
@@ -305,8 +377,10 @@ def write_outputs(env: Mapping[str, str], outputs: Mapping[str, str]) -> None:
 
 def run_next(env: Mapping[str, str], fetch: Fetch) -> None:
     plan = plan_next(env, fetch)
-    print(f"Last release: {plan.previous_tag or 'none'}")
+    print(f"Last release the commit contains: {plan.previous_tag or 'none'}")
     print(f"Next release: {plan.tag} (versionCode {plan.version_code}) at {plan.target_sha}")
+    if plan.branch:
+        print(f"Release line: {plan.branch}")
     print(plan.prs or "No commits listed.")
     write_outputs(env, {
         "version": plan.version,
@@ -315,6 +389,7 @@ def run_next(env: Mapping[str, str], fetch: Fetch) -> None:
         "target-sha": plan.target_sha,
         "prs": plan.prs,
         "version-code": str(plan.version_code),
+        "branch": plan.branch,
     })
 
 

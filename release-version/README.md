@@ -4,7 +4,7 @@ Composite action for repositories whose versions are git tags. One input, `opera
 
 | operation | what it does |
 |-----------|--------------|
-| `next` (default) | Finds the last release tag, computes the next version, resolves the commit to release, checks that it can be released and lists the pull requests it adds. |
+| `next` (default) | Resolves the commit to release, finds the last release it builds on, computes the next version, checks that it can be released and lists the pull requests it adds. |
 | `code` | Computes the Android versionCode of a release or of a QA build. |
 
 The action reads and computes. It creates no tag and pushes nothing; [`android-version-bump.yml`](../android-ci/README.md#android-version-bumpyml) is the workflow that does, with this action's outputs.
@@ -57,6 +57,7 @@ The `release-version/v1` tag does not exist until the first release; pin a full 
 | `pr` | `next` | `''` | Number of a merged pull request; its merge commit is released. Exactly one of `pr` and `sha` is given. |
 | `sha` | `next` | `''` | The exception to `pr`: id of the commit to release, 7 or more hex digits. |
 | `bump` | `next` | `patch` | Which part of the last version to raise: `patch`, `minor` or `major`. The parts below it become 0. |
+| `source-branch` | `next` | `''` | Optional. The branch releases are normally cut from. When given, the commit has to be on the branch of its release line. See [Release lines](#release-lines). |
 | `tag-prefix` | all | `v` | What a release tag starts with, before `X.Y.Z`. Letters, digits and `. _ / -`, not starting with `-`; may be empty. |
 | `token` | `next` with `pr` | `github.token` | Token that can read the pull request (`pull-requests: read`). |
 | `version` | `code` | `''` | The version, as `X.Y.Z` or as its tag. |
@@ -71,8 +72,9 @@ Inputs reach the script as environment variables, never through shell interpolat
 |------|--------|-------------|
 | `version` | all | The version as `X.Y.Z`. For `next`, the next version. |
 | `tag` | `next` | The tag of the next version, `<tag-prefix>X.Y.Z`. |
-| `previous-tag` | `next` | The last release tag. Empty when the repository has none. |
+| `previous-tag` | `next` | The last release the commit contains. Empty when the repository has no release tag. |
 | `target-sha` | `next` | Full id of the commit to release. |
+| `branch` | `next` with `source-branch` | The branch of the release line: the source branch or `release/<major>.x`. |
 | `prs` | `next` | Markdown list of what the release adds, oldest first. |
 | `version-code` | all | The Android versionCode of `version`. |
 
@@ -80,9 +82,9 @@ Inputs reach the script as environment variables, never through shell interpolat
 
 ### The last release
 
-- The last release is the highest `<tag-prefix>X.Y.Z` among **all** tags of the repository, compared as numbers: `v1.10.0` is above `v1.9.3`. It is not the newest tag, and not the nearest tag in the history of the commit.
+- The last release is the highest `<tag-prefix>X.Y.Z` among the tags **the commit contains**, compared as numbers: `v1.10.0` is above `v1.9.3`. It is not the newest tag, not the nearest one in the history, and not the highest tag of the repository: a commit on a maintenance branch does not contain the releases the main line made after the two parted.
 - Only tags of exactly that form are releases. A tag with a suffix (`v1.2.3-rc.1`, `v1.11.2-test.84`), a floating tag (`v1`), a number with a leading zero and a tag with another prefix are ignored.
-- A repository without a release tag counts from `0.0.0`: `patch` gives `0.0.1`, `minor` `0.1.0`, `major` `1.0.0`.
+- A repository without any release tag counts from `0.0.0`: `patch` gives `0.0.1`, `minor` `0.1.0`, `major` `1.0.0`.
 
 ### The commit to release
 
@@ -90,16 +92,35 @@ Inputs reach the script as environment variables, never through shell interpolat
 - `sha` has to be a commit id. A branch or tag name is refused, because it would name another commit on the next run.
 - The commit has to be in the checkout.
 
+### Release lines
+
+A major version is a release line. The next version continues its line, wherever in the repository that line was last released:
+
+```
+develop      ── v1.13.0 ──────── v2.0.0 ── v2.0.1      patch → v2.0.2
+release/1.x     └── v1.13.1 ── v1.13.2                 patch → v1.13.3, minor → v1.14.0
+```
+
+- The last release of the next version's major, among all tags of the repository, has to be the release the commit contains. Otherwise the version would repeat one of the line or fall behind it: a commit of `develop` from before `v2.0.0` cannot become `v1.13.1` once `release/1.x` has released it.
+- A commit that contains no release tag, in a repository that has some, is refused. Counting from `0.0.0` is for a repository without releases.
+
+With `source-branch`, the commit also has to be on the branch of its line. Branches are read from the remote `origin`, as a checkout with `fetch-depth: 0` has them:
+
+- When a branch `release/<major>.x` exists for the major of the next version, the commit has to be on it. On the source branch, `patch` or `minor` of that major is refused: the source branch has to raise the major.
+- Otherwise the commit has to be on the source branch. A commit that is only on `release/1.x` cannot become `v2.0.0`: a maintenance branch releases its own major only.
+- A commit of an open pull request or of a branch that was never merged is on neither, and is refused.
+
+The `branch` output names the line's branch. Without `source-branch`, only the tag rules above apply.
+
 ### The checks
 
 The step fails, with an `::error::` annotation that names the rule, when:
 
 - the commit is the commit of the last release: there is nothing new;
-- the commit does not contain the last release. A release builds on the one before it; a commit on a branch that never received the last release tag cannot be released until that history is merged into it;
+- the last release of the next version's major is not the one the commit contains, or the commit contains no release tag while the repository has some;
+- with `source-branch`: the commit is not on the branch of its release line;
 - the checkout is shallow, so tags or history may be missing;
 - the next version has no versionCode under the formula below.
-
-Without a last release there is nothing to contain, and any commit can be the first release.
 
 ### The pull request list
 
@@ -128,6 +149,8 @@ Android installs an APK over an installed one only when its versionCode is not l
 - a later QA build is higher than an earlier one.
 
 A QA build is numbered from the last release tag. After `X.Y.0` is released, QA builds are in the block of `X.Y` and above the releases of the minor version before it.
+
+Across [release lines](#release-lines), each major version has a block of 100000000 codes. A release is higher than the earlier releases of its own line, and every code of a line, QA builds included, is below every code of the next major. A maintenance release made after the next major exists has a lower code than that major, so it never installs over it.
 
 Limits: `X` up to 20, `Y` up to 999, `Z` and `N` up to 49999, so that no code exceeds 2100000000. A value outside them fails the step.
 

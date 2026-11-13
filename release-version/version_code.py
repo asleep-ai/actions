@@ -19,6 +19,12 @@ A QA build is numbered from the last release tag, so after X.Y.0 is released
 the QA builds move into the block of X.Y and are higher than the releases of
 the minor version before it.
 
+A major version is a release line and owns a block of 100_000_000 codes. A
+maintenance branch can keep releasing 1.x after 2.0.0 exists: every code of a
+line, QA builds included, is below every code of the next major, and within a
+line the order above holds. A release is therefore higher than the earlier
+releases of its own line, not than every release made before it.
+
 To change the formula, change this file and its tests in test_version_code.py;
 nothing else computes a versionCode.
 """
