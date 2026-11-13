@@ -8,6 +8,7 @@ Shared GitHub Actions, local lint hooks, and adoption templates for `asleep-ai` 
 |------|-------------|
 | [`release-notes/`](./release-notes/) | AI-drafted markdown release notes from a git tag range, with a deterministic commit-list fallback. |
 | [`pre-commit-changed/`](./pre-commit-changed/) | Run the caller's pre-commit hooks against event-specific changes, with full scans for lint configuration changes. |
+| [`pick-runner/`](./pick-runner/) | Decide `runs-on` before jobs are queued: self-hosted labels when a matching runner is online, else a GitHub-hosted fallback. |
 
 ## Local hooks
 

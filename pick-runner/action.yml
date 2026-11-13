@@ -1,0 +1,58 @@
+name: pick-runner
+description: >-
+  Decide a workflow's runs-on before its jobs are queued: the caller's
+  self-hosted labels when at least one runner carrying all of them is online,
+  otherwise a GitHub-hosted fallback.
+
+inputs:
+  labels:
+    description: >-
+      The self-hosted runs-on labels as a JSON array of strings, e.g.
+      '["self-hosted","Linux","X64"]'. A runner matches when it carries every
+      label (compared case-insensitively, as GitHub matches runs-on labels).
+    required: true
+  token:
+    description: >-
+      Token allowed to list the organization's self-hosted runners: the
+      organization permission "Self-hosted runners" (read). GITHUB_TOKEN cannot
+      list organization runners. When empty, the check is skipped and the
+      self-hosted labels are picked with a warning.
+    required: true
+  fallback:
+    description: >-
+      runs-on to use when no matching runner is online: a single label, or a
+      JSON array of labels.
+    required: false
+    default: ubuntu-latest
+  organization:
+    description: Organization whose runners are checked.
+    required: false
+    default: ${{ github.repository_owner }}
+
+outputs:
+  runs-on:
+    description: >-
+      runs-on as JSON, for `runs-on: ${{ fromJSON(...) }}`: the labels array or
+      the fallback.
+    value: ${{ steps.pick.outputs.runs-on }}
+  self-hosted:
+    description: "'true' when the self-hosted labels were picked, else 'false'."
+    value: ${{ steps.pick.outputs.self-hosted }}
+  online-count:
+    description: >-
+      Number of online runners carrying every label. Empty when the check could
+      not run.
+    value: ${{ steps.pick.outputs.online-count }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the self-hosted runners
+      id: pick
+      shell: bash
+      env:
+        LABELS: ${{ inputs.labels }}
+        FALLBACK: ${{ inputs.fallback }}
+        TOKEN: ${{ inputs.token }}
+        ORG: ${{ inputs.organization }}
+      run: python3 "$GITHUB_ACTION_PATH/pick.py"
