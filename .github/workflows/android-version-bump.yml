@@ -248,7 +248,7 @@ jobs:
             echo "::error title=The commit's release workflow is not the shared one::$path at $short does not call android-release.yml. A commit from before the repository adopted that workflow holds the earlier one, which would build the tag without its checks and without the tag's version. $later"
             exit 1
           fi
-          if ! grep -Eq '^[^#]*workflow_dispatch' <<< "$content"; then
+          if ! grep -Eq '^[[:space:]]*(-[[:space:]]*)?workflow_dispatch[[:space:]]*(:|$)|^[[:space:]]*on:.*workflow_dispatch' <<< "$content"; then
             echo "::error title=The commit's release workflow cannot be started::$path at $short has no workflow_dispatch trigger, which is how the release is started for the tag. $later"
             exit 1
           fi
@@ -396,8 +396,9 @@ jobs:
       # The last step of the plan, and the only word a person has in a
       # release: no job waits for anyone. A run that is not a dry run goes on
       # to tag only when confirm repeats the version this plan computed, which
-      # the person knows from the summary of a dry run. A wrong pr, bump or
-      # version then ends here instead of in a published release. A dry run
+      # the person knows from the summary of a dry run. A wrong bump or
+      # version then ends here instead of in a published release; a wrong pr
+      # merged after the last release plans the same version and is not caught. A dry run
       # does not read confirm; having passed every check, it says what to pass.
       - name: Check the confirmation
         env:
