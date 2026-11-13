@@ -3,9 +3,10 @@ name: Android release build
 # The build job of android-release.yml and of android-qa.yml. Each calls this
 # file once on the runner it picked and, after an infrastructure failure on a
 # self-hosted runner, once more on a GitHub-hosted runner. The job builds a
-# release tag with ./gradlew ciRelease, or a branch commit with ./gradlew ciQa,
-# signs with the caller's keystore, checks every APK the build left and
-# uploads them as one artifact for the publish job.
+# release or preview tag with ./gradlew ciRelease, or a branch commit with
+# ./gradlew ciQa (a QA build or a label build), signs with the caller's
+# keystore, checks every APK the build left and uploads them as one artifact
+# for the publish job.
 #
 # This file is internal to those two workflows: call them, not this one. The
 # inputs are documented there and in android-ci/README.md.
@@ -19,14 +20,17 @@ on:
       attempt:
         description: >-
           primary or fallback. Both calls share one workflow run, so the
-          artifact with the signed APKs is named android-<kind>-apk-<attempt>.
+          artifact with the signed APKs is named android-release-apk-<attempt>
+          or android-qa-apk-<attempt>.
         required: true
         type: string
       kind:
         description: >-
-          release or qa. It decides the Gradle task (ciRelease or ciQa), the
-          name of the artifact and how long it is kept: 90 days for a release,
-          1 day for a QA build, whose publish job deletes it.
+          What is built: release or preview (a tag, with ciRelease), qa or
+          label (a branch commit, with ciQa). The build gets it as
+          -PciBuildKind. It also decides the name of the artifact and how long
+          it is kept: 90 days for a release or preview, 1 day for a QA or
+          label build, whose publish job deletes it.
         required: true
         type: string
       environment:
@@ -135,8 +139,11 @@ jobs:
     # code without asking gradle-log-verdict in two cases, because another
     # runner would end the same way: a missing secret, and APKs the build left
     # that cannot be released as they are.
+    #
+    # code as well when the plan of the calling workflow passed something
+    # empty: the same plan would pass it to the second build.
     outputs:
-      verdict: ${{ (steps.values.outcome == 'failure' || steps.apk.outputs.refused == 'true') && 'code' || steps.verdict.outputs.verdict }}
+      verdict: ${{ (steps.planned.outcome == 'failure' || steps.values.outcome == 'failure' || steps.apk.outputs.refused == 'true') && 'code' || steps.verdict.outputs.verdict }}
     steps:
       # A self-hosted runner keeps its work folder between jobs, and the jobs
       # before this one may have built a pull request: files in the folder, git
@@ -160,6 +167,44 @@ jobs:
           fi
           find "$GITHUB_WORKSPACE" -mindepth 1 -delete
           echo "Emptied $GITHUB_WORKSPACE."
+
+      # What the plan job of the calling workflow decided arrives as inputs.
+      # An empty one means the runner dropped a job output there: it does that
+      # to an output that contains the value of a secret, without failing the
+      # job that set it. The build would then fail much later, on a version
+      # Gradle cannot read, with nothing that names the reason.
+      - name: Check what was planned
+        id: planned
+        env:
+          KIND: ${{ inputs.kind }}
+          REF: ${{ inputs.ref }}
+          PLANNED_SHA: ${{ inputs.sha }}
+          VERSION_NAME: ${{ inputs.version-name }}
+          VERSION_CODE: ${{ inputs.version-code }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for name in KIND REF PLANNED_SHA VERSION_NAME VERSION_CODE; do
+            if [[ -z "${!name}" ]]; then
+              missing="${missing:+$missing, }$name"
+            fi
+          done
+          # A version name that ends in a hyphen or starts with one lost a part.
+          if [[ -z "$missing" && ! "$VERSION_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9]+(-[a-z0-9]+)*\.[0-9]+)?$ ]]; then
+            missing="part of VERSION_NAME ($VERSION_NAME)"
+          fi
+          if [[ -n "$missing" ]]; then
+            echo "::error title=The plan is incomplete::Empty: $missing. The plan job passed, so the runner dropped an output: it does that to an output that contains the value of a secret. Look for a secret whose value is a short word or number."
+            exit 1
+          fi
+          case "$KIND" in
+            release|preview|qa|label) ;;
+            *)
+              echo "::error::kind is none of release, preview, qa and label."
+              exit 1
+              ;;
+          esac
+          echo "Planned: $KIND build $VERSION_NAME ($VERSION_CODE) of $REF at $PLANNED_SHA."
 
       # Before anything is checked out, so a build that cannot be made
       # stops here and names everything that is missing at once. The four
@@ -377,12 +422,13 @@ jobs:
           KOTLIN_DAEMON_JVMARGS: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
         run: |
           set -euo pipefail
-          # The task is one of two names, never a value a caller wrote.
+          # The task is one of two names, never a value a caller wrote, and the
+          # kind one of four words.
           case "$KIND" in
-            release) task=ciRelease ;;
-            qa) task=ciQa ;;
+            release|preview) task=ciRelease ;;
+            qa|label) task=ciQa ;;
             *)
-              echo "::error::kind is neither release nor qa."
+              echo "::error::kind is none of release, preview, qa and label."
               exit 1
               ;;
           esac
@@ -406,13 +452,17 @@ jobs:
           else
             echo "SENTRY_AUTH_TOKEN is not set: the build uploads nothing to Sentry."
           fi
-          echo "Task: $task. Version: $VERSION_NAME ($VERSION_CODE). Gradle user home: $GRADLE_USER_HOME"
+          echo "Task: $task. Kind: $KIND. Version: $VERSION_NAME ($VERSION_CODE). Gradle user home: $GRADLE_USER_HOME"
           # A build that is signed is built from its sources alone: no daemon
           # of an earlier build, no build cache entry from anywhere. The copy
           # in the temp directory is what gradle-log-verdict reads.
+          #
+          # -PciBuildKind says which of the four kinds the build is, for a
+          # build that puts it into the name of the APK. A build that does not
+          # read the property is not affected by it.
           set -f
           # shellcheck disable=SC2086 # word splitting is intended: the value is an argument list
-          ./gradlew "$task" "-PciVersionName=$VERSION_NAME" "-PciVersionCode=$VERSION_CODE" $GRADLE_ARGS \
+          ./gradlew "$task" "-PciVersionName=$VERSION_NAME" "-PciVersionCode=$VERSION_CODE" "-PciBuildKind=$KIND" $GRADLE_ARGS \
             --no-daemon --no-build-cache ${extra[@]+"${extra[@]}"} 2>&1 | tee "$RUNNER_TEMP/gradle.log"
 
       # The task leaves the APKs of the build under apk-directory: one, or
@@ -440,13 +490,24 @@ jobs:
             echo "refused=true" >> "$GITHUB_OUTPUT"
             exit 1
           }
-          if [[ "$KIND" == qa ]]; then
-            task=ciQa
-            what="the QA build"
-          else
-            task=ciRelease
-            what="the release"
-          fi
+          case "$KIND" in
+            qa)
+              task=ciQa
+              what="the QA build"
+              ;;
+            label)
+              task=ciQa
+              what="the label build"
+              ;;
+            preview)
+              task=ciRelease
+              what="the preview"
+              ;;
+            *)
+              task=ciRelease
+              what="the release"
+              ;;
+          esac
           if [[ -z "$APK_DIRECTORY" || "$APK_DIRECTORY" == -* || ! -d "$APK_DIRECTORY" ]]; then
             refuse "apk-directory ($APK_DIRECTORY) is not a directory after the build."
           fi
@@ -461,6 +522,12 @@ jobs:
           duplicates=$(for apk in "${apks[@]}"; do basename "$apk"; done | sort | uniq -d)
           if [[ -n "$duplicates" ]]; then
             refuse "Several APKs under $APK_DIRECTORY share a file name: ${duplicates//$'\n'/, }. Give each flavor's APK its own name."
+          fi
+          # GitHub changes the name of an asset that holds other characters,
+          # and the publish job finds the APKs of a release by their names.
+          odd=$(for apk in "${apks[@]}"; do basename "$apk"; done | grep -Ev '^[A-Za-z0-9][A-Za-z0-9._-]*\.apk$' || true)
+          if [[ -n "$odd" ]]; then
+            refuse "APK file names may hold letters, digits and . _ - only, and these do not: ${odd//$'\n'/, }."
           fi
 
           sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
@@ -525,9 +592,9 @@ jobs:
         id: upload
         uses: actions/upload-artifact@v7
         with:
-          name: android-${{ inputs.kind }}-apk-${{ inputs.attempt }}
+          name: android-${{ (inputs.kind == 'qa' || inputs.kind == 'label') && 'qa' || 'release' }}-apk-${{ inputs.attempt }}
           path: ${{ steps.apk.outputs.paths }}
-          retention-days: ${{ inputs.kind == 'qa' && 1 || 90 }}
+          retention-days: ${{ (inputs.kind == 'qa' || inputs.kind == 'label') && 1 || 90 }}
           if-no-files-found: error
           # A re-run of the job uploads under the same name.
           overwrite: true
@@ -560,14 +627,15 @@ jobs:
             echo "Emptied $GITHUB_WORKSPACE."
           fi
 
-      # The secrets check is left out of setup-outcome: a missing secret is
-      # reported as code by the job output, because no other runner has it.
+      # The secrets check and the check of the plan are left out of
+      # setup-outcome: a missing secret or an incomplete plan is reported as
+      # code by the job output, because no other runner would have it.
       # job-status covers the steps after the build (the APK check, the
       # signature, the upload): when one of them fails, the verdict is infra,
       # which the job output turns into code when the APKs were refused.
       - name: Report the verdict
         id: verdict
-        if: ${{ always() && steps.values.outcome != 'failure' }}
+        if: ${{ always() && steps.planned.outcome != 'failure' && steps.values.outcome != 'failure' }}
         uses: asleep-ai/actions/gradle-log-verdict@android-ci/v1
         with:
           log-file: ${{ runner.temp }}/gradle.log

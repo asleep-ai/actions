@@ -4,6 +4,11 @@ name: PR Check
 # default branch, and release/** for maintenance branches (release/1.x). The
 # version bump and the release build a commit only when this check succeeded
 # on it, and a merge commit gets the check from the push run on its branch.
+#
+# On such a push the release build is left to qa.yml, which builds the release
+# variant of the same commit and whose check (`qa / built`) a release requires
+# too. A repository without qa.yml passes `release-build-on-push: true` here
+# and `required-checks: pr-check / result` in version-bump.yml and release.yml.
 on:
   pull_request:
     branches: [main, develop, 'release/**']

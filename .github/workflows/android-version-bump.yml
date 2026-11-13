@@ -10,8 +10,10 @@ name: Android version bump
 # the release: no branch is moved unless the caller names one.
 #
 # With prerelease set to preview, the same version is planned and checked, and
-# the tag is vX.Y.Z-preview.N: a preview of the version, which the release
+# the tag is vX.Y.0-preview.N: a preview of the version, which the release
 # workflow builds with the release key and publishes as a GitHub pre-release.
+# Only a new minor or major version has previews; with bump patch the plan is
+# refused.
 #
 # The caller's contract and every input are in android-ci/README.md.
 on:
@@ -50,9 +52,10 @@ on:
       prerelease:
         description: >-
           Optional. Empty, the default, plans the release vX.Y.Z. preview
-          plans a preview of that version instead: the tag vX.Y.Z-preview.N,
-          N one above the previews of X.Y.Z that exist. No other value is
-          accepted.
+          plans a preview of that version instead: the tag vX.Y.0-preview.N,
+          N one above the previews of X.Y.0 that exist. The version has to be
+          a new minor or major version: with bump patch, or a version whose
+          patch is not 0, the plan is refused. No other value is accepted.
         required: false
         type: string
         default: ''
@@ -67,7 +70,7 @@ on:
       confirm:
         description: >-
           The version the plan is expected to compute, X.Y.Z or vX.Y.Z, as a
-          dry run showed it; for a preview the whole name, vX.Y.Z-preview.N.
+          dry run showed it; for a preview the whole name, vX.Y.0-preview.N.
           Required when dry_run is false: the run tags only when the plan
           computes this very version. Not read on a dry run.
         required: false
@@ -86,10 +89,15 @@ on:
       required-checks:
         description: >-
           Names of the checks that must have succeeded on the commit, one per
-          line, as the commit's checks list shows them.
+          line, as the commit's checks list shows them. The default is the
+          pull request check and the QA build of the push (android-qa.yml,
+          called by a job named qa): android-pr-check.yml leaves the release
+          variant of a pushed commit to that build.
         required: false
         type: string
-        default: pr-check / result
+        default: |
+          pr-check / result
+          qa / built
       main-branch:
         description: >-
           Optional. A branch that is moved to the released commit, as a
@@ -130,7 +138,7 @@ on:
         description: The tag of the planned version.
         value: ${{ jobs.plan.outputs.tag }}
       version:
-        description: The planned version, X.Y.Z, or X.Y.Z-preview.N for a preview.
+        description: The planned version, X.Y.Z, or X.Y.0-preview.N for a preview.
         value: ${{ jobs.plan.outputs.version }}
       target-sha:
         description: The commit that is released.
@@ -283,9 +291,11 @@ jobs:
           fi
           echo "$path at $short calls android-release.yml and can be started for the tag."
 
-      # A release is cut from a commit that passed the same checks a pull
-      # request has to pass. The newest check run of each name counts. A check
-      # that never ran on the commit is a refusal, like one that failed.
+      # A release is cut from a commit that passed the checks a pull request
+      # has to pass and whose release variant was built: by default the pull
+      # request check of the push and the QA build of the push, which builds
+      # that variant in its place. The newest check run of each name counts. A
+      # check that never ran on the commit is a refusal, like one that failed.
       # android-release.yml runs the same script on the tagged commit, and
       # android-ci's tests fail when the two copies differ.
       #
@@ -322,6 +332,14 @@ jobs:
           deadline = time.monotonic() + wait_minutes * 60
 
 
+          class Unreadable(Exception):
+              """The checks could not be read. `again` says whether another request may succeed."""
+
+              def __init__(self, reason, again):
+                  super().__init__(reason)
+                  self.again = again
+
+
           def check_runs(name):
               query = urllib.parse.urlencode({"check_name": name, "filter": "latest", "per_page": 100})
               request = urllib.request.Request(
@@ -338,12 +356,13 @@ jobs:
                       document = json.load(response)
               except urllib.error.HTTPError as error:
                   detail = error.read(300).decode(errors="replace").strip()
-                  sys.exit(f"::error::Cannot read the checks of {sha}: HTTP {error.code}: {detail}")
+                  # A server error and a rate limit pass; a token that may not read the checks does not.
+                  raise Unreadable(f"HTTP {error.code}: {detail}", error.code >= 500 or error.code == 429) from None
               except (OSError, ValueError) as error:
-                  sys.exit(f"::error::Cannot read the checks of {sha}: {error}")
+                  raise Unreadable(str(error) or type(error).__name__, True) from None
               runs = document.get("check_runs") if isinstance(document, dict) else None
               if not isinstance(runs, list):
-                  sys.exit(f"::error::Cannot read the checks of {sha}: the response has no check_runs list")
+                  raise Unreadable("the response has no check_runs list", True)
               return [run for run in runs if isinstance(run, dict) and run.get("name") == name]
 
 
@@ -352,21 +371,31 @@ jobs:
               refused = []
               # Checks that may still succeed: not started on the commit yet, or not finished.
               unfinished = []
-              for name in required:
-                  runs = check_runs(name)
-                  if not runs:
-                      rows.append((name, "not run", ""))
-                      refused.append(f"'{name}' did not run on the commit")
-                      unfinished.append(name)
-                      continue
-                  newest = max(runs, key=lambda run: (str(run.get("started_at") or ""), run.get("id") or 0))
-                  state = newest.get("conclusion") or newest.get("status") or "unknown"
-                  rows.append((name, state, newest.get("html_url") or ""))
-                  if newest.get("status") != "completed":
-                      refused.append(f"'{name}' is {state}")
-                      unfinished.append(name)
-                  elif newest.get("conclusion") != "success":
-                      refused.append(f"'{name}' is {state}")
+              try:
+                  for name in required:
+                      runs = check_runs(name)
+                      if not runs:
+                          rows.append((name, "not run", ""))
+                          refused.append(f"'{name}' did not run on the commit")
+                          unfinished.append(name)
+                          continue
+                      newest = max(runs, key=lambda run: (str(run.get("started_at") or ""), run.get("id") or 0))
+                      state = newest.get("conclusion") or newest.get("status") or "unknown"
+                      rows.append((name, state, newest.get("html_url") or ""))
+                      if newest.get("status") != "completed":
+                          refused.append(f"'{name}' is {state}")
+                          unfinished.append(name)
+                      elif newest.get("conclusion") != "success":
+                          refused.append(f"'{name}' is {state}")
+              except Unreadable as error:
+                  # Not an answer of the checks. Where the step waits, it asks many times, and one request
+                  # that failed is asked again until the wait is over. Without a wait it fails at once.
+                  remaining = deadline - time.monotonic()
+                  if not error.again or remaining <= 0:
+                      sys.exit(f"::error::Cannot read the checks of {sha}: {error}")
+                  print(f"Cannot read the checks of {sha} ({error}). Asking again.", flush=True)
+                  time.sleep(min(poll_seconds, remaining))
+                  continue
               # A check that finished without success is final: waiting for the others changes nothing.
               remaining = deadline - time.monotonic()
               if not unfinished or len(refused) > len(unfinished) or remaining <= 0:
@@ -389,6 +418,11 @@ jobs:
           for name, state, _ in rows:
               print(f"{name}: {state}")
           if refused:
+              # The checks answered, and the answer is no. A step that could not read them never gets
+              # here, so the output tells the two apart for the steps that follow.
+              if os.environ.get("GITHUB_OUTPUT"):
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("refused=true\n")
               # Only when the wait ran out: a check that failed ended it early.
               waited = f" after waiting {wait_minutes:g} minutes" if wait_minutes and len(refused) == len(unfinished) else ""
               print(f"::error title=The commit has not passed its checks::{sha[:7]}: {'; '.join(refused)}{waited}. "
@@ -493,9 +527,9 @@ jobs:
             refuse "The release is not confirmed" "The plan computed $TAG ($plan), and confirm is empty: a run that is not a dry run has to name the planned version."
           fi
           # Only a version is printed back: X.Y.Z, or the name of a prerelease
-          # of one, X.Y.Z-preview.N.
+          # of one, X.Y.0-preview.N.
           if [[ ! "$confirm" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-z]+\.[0-9]+)?$ ]]; then
-            refuse "confirm is not a version" "The plan computed $TAG ($plan), and confirm is not of the form X.Y.Z or vX.Y.Z (X.Y.Z-preview.N for a preview)."
+            refuse "confirm is not a version" "The plan computed $TAG ($plan), and confirm is not of the form X.Y.Z or vX.Y.Z (X.Y.0-preview.N for a preview)."
           fi
           if [[ "$confirm" != "$TAG" && "$confirm" != "$VERSION" ]]; then
             refuse "confirm does not name the planned version" "The plan computed $TAG ($plan), and confirm is $confirm."

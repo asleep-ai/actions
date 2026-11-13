@@ -42,7 +42,7 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
         "PREVIOUS_TAG": "v1.13.0",
         "PREVIOUS_PRERELEASE_TAG": "",
         "NOTICE": "",
-        "VERSION_CODE": "101350001",
+        "VERSION_CODE": "101350100",
         "TARGET_SHA": "3ff9b1a3" + "0" * 32,
         "LINE_BRANCH": "develop",
         "PRS": prs,
@@ -63,7 +63,7 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
     assert "- Commit: [`3ff9b1a`](https://github.invalid/acme/app/commit/3ff9b1a3" in text
     assert ", the merge commit of #858\n" in text
     assert "- Release line: `develop`\n" in text
-    assert "- versionCode: 101350001\n" in text
+    assert "- versionCode: 101350100\n" in text
     # The titles are written as they are.
     assert prs + "\n" in text
     # A run that releases says so at the top: nothing waits between the plan and the tag.
@@ -89,7 +89,7 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
     summary.write_text("")
     env.update({
         "PREVIOUS_TAG": "v1.13.0", "TAG": "v2.0.0-preview.2", "PREVIOUS_PRERELEASE_TAG": "v2.0.0-preview.1",
-        "PRS": "- #31 Fix found at the demo", "PRERELEASE": "preview", "VERSION_CODE": "200040002",
+        "PRS": "- #31 Fix found at the demo", "PRERELEASE": "preview", "VERSION_CODE": "200049002",
     })
     result = run_script(script, env, tmp_path)
     assert result.returncode == 0, result.stderr
@@ -97,16 +97,18 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
     assert text.startswith("### v1.13.0 → v2.0.0-preview.2\n")
     assert "- A preview, not a release: it is published as a GitHub pre-release, and `v2.0.0` is still to be released.\n" in text
     assert "- The preview before this one is `v2.0.0-preview.1`; the list below is what this one adds to it.\n" in text
-    assert "- versionCode: 200040002\n" in text
+    assert "- versionCode: 200049002\n" in text
     assert "[!WARNING]" not in text
 
     # A plan that is allowed and has a consequence: the sentence of release-version, as a warning.
+    # A release whose commit leaves out the last preview of its version is one.
     summary.write_text("")
-    env.update({"PREVIOUS_PRERELEASE_TAG": "", "NOTICE": "v2.0.1-preview.1 does not install over v2.0.0 (100% sure, %s)"})
+    notice = "the commit (3ff9b1a) does not contain v2.0.0-preview.2, the last preview of 2.0.0 (100% sure, %s)"
+    env.update({"TAG": "v2.0.0", "PREVIOUS_PRERELEASE_TAG": "", "PRERELEASE": "", "NOTICE": notice})
     result = run_script(script, env, tmp_path)
     assert result.returncode == 0, result.stderr
     text = summary.read_text()
-    assert "> [!WARNING]\n> v2.0.1-preview.1 does not install over v2.0.0 (100% sure, %s).\n" in text
+    assert f"> [!WARNING]\n> {notice}.\n" in text
     assert "The preview before this one" not in text
 
 
@@ -380,8 +382,10 @@ def check_runs_api():
             server.requests.append((self.path, self.headers.get("Authorization")))
             url = urllib.parse.urlsplit(self.path)
             query = urllib.parse.parse_qs(url.query)
-            if server.status != 200 or url.path != f"/repos/acme/app/commits/{SHA}/check-runs":
-                self.send_response(server.status if server.status != 200 else 404)
+            # `statuses` answers the next requests one by one, `status` every request after them.
+            status = server.statuses.pop(0) if server.statuses else server.status
+            if status != 200 or url.path != f"/repos/acme/app/commits/{SHA}/check-runs":
+                self.send_response(status if status != 200 else 404)
                 self.end_headers()
                 self.wfile.write(b'{"message": "Resource not accessible by integration"}')
                 return
@@ -397,7 +401,7 @@ def check_runs_api():
             pass
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
-    server.runs, server.requests, server.status, server.body = [], [], 200, None
+    server.runs, server.requests, server.status, server.statuses, server.body = [], [], 200, [], None
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -503,15 +507,51 @@ def test_an_unreadable_answer_is_not_a_pass(jobs, tmp_path, api):
     result, _ = check_checks(jobs, tmp_path, api)
     assert result.returncode == 1
     assert "the response has no check_runs list" in result.stderr
+    # A release is decided from one reading: only android-qa.yml, which waits, asks again.
+    api.requests.clear()
+    api.status, api.body = 502, None
+    result, _ = check_checks(jobs, tmp_path, api)
+    assert result.returncode == 1 and "HTTP 502" in result.stderr
+    assert len(api.requests) == 1
 
 
-def test_the_default_required_check_is_the_result_of_the_pull_request_check(jobs):
+def test_the_default_required_checks_are_the_pull_request_check_and_the_qa_build_of_the_push(jobs):
+    # The pull request check of a pushed commit does not build the release variant on a branch
+    # that is released from (android-pr-check.yml leaves it to android-qa.yml), so a release
+    # requires the check of that build too. The two defaults belong together.
     inputs = trigger(load(ENTRY))["inputs"]
-    assert inputs["required-checks"]["default"] == "pr-check / result"
+    assert inputs["required-checks"]["default"].splitlines() == ["pr-check / result", "qa / built"]
+    assert inputs["required-checks"]["default"] == trigger(load("android-release.yml"))["inputs"]["required-checks"]["default"]
     pr_check = load("android-pr-check.yml")
     assert "result" in pr_check["jobs"]
+    assert trigger(pr_check)["inputs"]["release-build-on-push"]["default"] is False
     example = yaml.safe_load((ROOT / "android-ci" / "pr-check.yml.example").read_text())
     assert list(example["jobs"]) == ["pr-check"]
+    assert "built" in load("android-qa.yml")["jobs"]
+    example = yaml.safe_load((ROOT / "android-ci" / "qa.yml.example").read_text())
+    assert list(example["jobs"]) == ["qa"]
+
+
+def test_a_commit_without_the_qa_build_of_its_push_is_not_released(jobs, tmp_path, api):
+    # What the default requires, read by the script: the pull request check passed, and the QA
+    # build never ran on the commit (no push built it), failed, or was cancelled by hand.
+    required = trigger(load(ENTRY))["inputs"]["required-checks"]["default"]
+    api.runs = [check_run()]
+    result, summary = check_checks(jobs, tmp_path, api, required=required)
+    assert result.returncode == 1
+    assert "'qa / built' did not run on the commit" in result.stdout
+    assert "| qa / built | not run |" in summary
+    for conclusion in ("failure", "cancelled", "skipped"):
+        api.runs = [check_run(), check_run(name="qa / built", conclusion=conclusion)]
+        result, _ = check_checks(jobs, tmp_path, api, required=required)
+        assert result.returncode == 1 and f"'qa / built' is {conclusion}" in result.stdout
+    # The build of a manual run has another name and does not stand in for it.
+    api.runs = [check_run(), check_run(name="qa / built (manual run)")]
+    assert check_checks(jobs, tmp_path, api, required=required)[0].returncode == 1
+    api.runs = [check_run(), check_run(name="qa / built")]
+    result, summary = check_checks(jobs, tmp_path, api, required=required)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "| qa / built | [success]" in summary
 
 
 # --- plan: the main branch ------------------------------------------------------------------
@@ -998,4 +1038,5 @@ def test_readme_lists_every_input_with_its_default():
         elif isinstance(default, bool):
             assert shown == f"`{str(default).lower()}`", name
         else:
-            assert shown == f"`{default}`", name
+            # A default of several lines is shown line by line.
+            assert shown == "<br>".join(f"`{line}`" for line in default.splitlines()), name

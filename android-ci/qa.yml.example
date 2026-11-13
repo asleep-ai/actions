@@ -5,27 +5,27 @@ name: QA Build
 # manual run started on one of them. Each build replaces the APK of the
 # rolling pre-release of its line: qa-<default branch>, qa-release-1.x.
 #
+# The build of a push is also what a release of that commit requires: the
+# check `qa / built`, next to `pr-check / result`. So every push starts a run
+# (no paths filter), and no run is cancelled for a later one (no concurrency
+# block): a commit whose build was skipped or cancelled could not be released.
+#
 # A manual run on any other branch fails in its first job and says why: a QA
 # build is signed with the release key, so it is built from merged code only.
 on:
   push:
-    branches: [develop, 'release/**']
+    # release/*.x, not release/**: the workflow builds release/<major>.x only.
+    branches: [develop, 'release/*.x']
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Optional: the version X.Y.Z this one build leads up to, instead of the one computed from the tags'
-        required: false
-        type: string
       label:
-        description: 'Optional: a label (ble-test) for a build kept apart from the rolling one, as qa-<line>-<label>'
+        description: 'Optional: a label (ble-test) for a named test build. It installs over the last release, and the next patch release over it. Published apart, as qa-<line>-<label>'
         required: false
         type: string
-
-# The newest commit of a line wins: a push cancels the build of the push
-# before it. A labelled build is a line of its own.
-concurrency:
-  group: qa-${{ github.ref }}-${{ inputs.label }}
-  cancel-in-progress: true
+      version:
+        description: 'Optional: the next minor or major version X.Y.Z, for one QA build of it that installs over the releases that are out. Published apart, as qa-<line>-<version>. Not with label'
+        required: false
+        type: string
 
 # The called workflow can use no more than what is granted here, and it fails
 # to start when one of these is missing.
@@ -36,13 +36,16 @@ permissions:
   actions: write        # delete the build's artifact once it is published
 
 jobs:
+  # The name of this job is part of the check a release requires by default,
+  # `qa / built`. With another name, name the check in the required-checks of
+  # version-bump.yml and release.yml.
   qa:
     uses: asleep-ai/actions/.github/workflows/android-qa.yml@android-ci/v1
     with:
       # Leave runner-labels out to build on a GitHub-hosted runner only.
       runner-labels: '["self-hosted","Linux","X64"]'
-      version: ${{ inputs.version }}
       label: ${{ inputs.label }}
+      version: ${{ inputs.version }}
       # Secrets and variables written to local.properties under their own
       # names, next to the four signing keys.
       local-properties-secrets: |

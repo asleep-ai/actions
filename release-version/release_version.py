@@ -29,25 +29,35 @@ next  Resolve the commit to release, find the last release it builds on,
       history, read from the commit subjects.
 
       With prerelease (preview), the same version is planned and checked, and
-      the tag is <prefix>X.Y.Z-preview.N instead, N being one above the
-      previews of X.Y.Z that are tagged already. The commit has to contain
-      the last of them and add something to it.
+      the tag is <prefix>X.Y.0-preview.N instead, N being one above the
+      previews of X.Y.0 that are tagged already. The commit has to contain
+      the last of them and add something to it. Only a new minor or major
+      version has previews: a patch release is refused.
 
 code  The versionCode of a release, of a preview or of a QA build, from
       version_code.py.
 
-qa    Plan a QA build of a branch head: the version it leads up to, its
-      version name <version>-<line or label>.<number> and its versionCode.
+qa    Plan a QA build of a branch head: its version name, its versionCode and
+      the rolling pre-release it is published as.
       - Only the source branch and the maintenance branches release/<major>.x
         are built, and only a commit in their first-parent history.
-      - The version is the next release of the line: the last release the
-        commit contains, raised by patch. On the source branch it is the next
-        major instead once the last release has a maintenance branch, and on
-        a maintenance branch without a release of its major, <major>.0.0.
-        next-version names a later version the branch is heading for; it is
-        used while it is higher than the last release. version names the
-        version of this one build and is refused when it cannot be.
-      - The number is qa-sequence plus qa-sequence-offset.
+      - A QA build is <version>-qa.<number>. The version is the next release
+        of the line: the last release the commit contains, raised by patch.
+        On the source branch it is the next major instead once the last
+        release has a maintenance branch, and on a maintenance branch without
+        a release of its major, <major>.0.0. next-version names a later
+        version the branch is heading for; it is used while it is higher than
+        the last release. The number is qa-sequence plus qa-sequence-offset.
+      - version names the version of this one build: the next minor or the
+        next major version, whose QA builds install over the releases that
+        are out. Such a build is published apart from the rolling build of
+        its branch.
+      - With label, the build is a label build, <version>-<label>.<number>: a
+        named test build made after the last release of its line. The version
+        is the patch after that release, and the versionCode is the release's
+        plus the number, which counts the label builds published after that
+        release. It installs over the release, and the next patch release
+        installs over it. A line without a release has no label builds.
 
 changes
       What a commit adds to the commit a tag names (the previous build of a
@@ -73,7 +83,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional
 
-from version_code import VersionCodeError, preview_code, qa_code, release_code
+from version_code import MAX_LABEL as MAX_LABEL_BUILDS
+from version_code import VersionCodeError, label_code, preview_code, qa_code, release_code
 
 BUMPS = ("patch", "minor", "major")
 KINDS = ("release", "preview", "qa")
@@ -85,9 +96,18 @@ NUMBER = r"(0|[1-9][0-9]*)"
 VERSION = re.compile(rf"{NUMBER}\.{NUMBER}\.{NUMBER}")
 # X.Y.Z-preview.N. The number starts at 1.
 PRERELEASE = re.compile(rf"(?P<version>{NUMBER}\.{NUMBER}\.{NUMBER})-(?P<kind>[a-z]+)\.(?P<number>[1-9][0-9]*)")
-# What a QA build can be labelled with: it becomes part of a version name and of a tag name.
+# The label of a label build: it becomes part of a version name and of a tag name.
 LABEL = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 MAX_LABEL = 40
+# What stands in a version name where a label build has its label: 1.13.1-qa.57, 2.0.0-preview.3.
+# A label build is none of them, and it is not a release.
+QA_SUFFIX = "qa"
+RESERVED_LABELS = (QA_SUFFIX, "release") + PRERELEASES
+# The tags of the rolling pre-releases QA builds are published as. Each is an annotated tag whose
+# message names the build it holds, "<version name> (<versionCode>)": the label builds after a
+# release are counted from these messages.
+ROLLING_TAGS = "refs/tags/qa-*"
+ROLLING_MESSAGE = re.compile(r"(?P<name>\S+) \((?P<code>[1-9][0-9]*)\)")
 MAINTENANCE = re.compile(r"release/(?P<major>0|[1-9][0-9]*)\.x")
 # Characters git allows in a ref name and that need no quoting anywhere a tag is used. Not a leading
 # hyphen: git would read such a tag as an option.
@@ -110,7 +130,7 @@ class Failure(Exception):
 
 @dataclass(frozen=True)
 class Plan:
-    version: str  # X.Y.Z, or X.Y.Z-preview.N for a prerelease
+    version: str  # X.Y.Z, or X.Y.0-preview.N for a prerelease
     tag: str
     previous_tag: str  # empty when the repository has no release tag
     target_sha: str
@@ -124,10 +144,12 @@ class Plan:
 @dataclass(frozen=True)
 class QaPlan:
     version: str  # the version the build leads up to, X.Y.Z
-    version_name: str
+    version_name: str  # <version>-qa.<number>, or <version>-<label>.<number> for a label build
     version_code: int
-    sequence: int
+    kind: str  # qa or label
+    number: int  # of a QA build, the sequence number; of a label build, its place after the release
     line: str  # the branch as it appears in names: develop, release-1.x
+    major: str  # the major version of a maintenance branch; empty on the source branch
     release_tag: str  # the tag of the rolling pre-release the build is published as
     previous_tag: str  # the last release the commit contains
     branch: str
@@ -435,6 +457,16 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
     else:
         version = bump_version(previous or ZERO, bump)
         tag = prefix + format_version(version)
+    if prerelease and version[2] != 0:
+        # The codes of a minor version: QA builds, then the previews, then the releases. A preview of
+        # a patch release would be below the release that is installed.
+        how = f"version {format_version(version)} was given" if exact else f"bump {bump} plans {format_version(version)}"
+        raise Failure(
+            f"{how}, a patch release, and a {prerelease} is of a new minor or major version (X.Y.0): within a "
+            f"minor version every {prerelease} is below every release, so a {prerelease} of a patch would not "
+            f"install over the release that is out. Choose bump minor or major for the {prerelease}. To try a "
+            "fix on a device before the patch is released, make a label build (the QA workflow, input label)"
+        )
     try:
         code = release_code(*version)
     except VersionCodeError as exc:
@@ -474,6 +506,20 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
                 f"{previous_tag or 'no release'}. Release a commit that contains {newer}"
             )
     if not prerelease:
+        # A preview of this version may be on devices outside the team, and the release installs
+        # over it. A release cut from a commit before that preview would take away what the preview
+        # had. That can be meant (the preview was a dead end), so it is said and not refused.
+        notice = ""
+        for kind in PRERELEASES:
+            numbers = prerelease_numbers(prefix, version, kind)
+            last_tag = f"{prefix}{format_version(version)}-{kind}.{max(numbers)}" if numbers else ""
+            last_commit = commit_of(last_tag) if last_tag else None
+            if last_commit and not contains(target, last_commit):
+                notice = (
+                    f"{what} ({target[:7]}) does not contain {last_tag}, the last {kind} of "
+                    f"{format_version(version)}. {tag} installs over that {kind}, with code that lacks what the "
+                    f"{kind} had. Release a commit that contains {last_tag}, unless leaving it out is meant"
+                )
         return Plan(
             version=format_version(version),
             tag=tag,
@@ -482,6 +528,7 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
             prs=pull_requests(previous_commit, target),
             version_code=code,
             branch=branch,
+            notice=notice,
         )
 
     # The version passed every rule of a release. Its prerelease is numbered after the ones of the
@@ -508,16 +555,6 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
                 f"{format_version(version)}. A {prerelease} builds on the one before it: choose a commit that contains it"
             )
         since = last_commit
-    notice = ""
-    if previous and previous[:2] == version[:2]:
-        # The codes of a minor version: QA builds, then previews, then releases. A preview of a
-        # patch release is therefore below the release that is installed.
-        notice = (
-            f"{prefix}{name} (versionCode {code}) does not install over {previous_tag} (versionCode "
-            f"{release_code(*previous)}): within a minor version every preview is below every release. A device "
-            f"with {previous_tag} takes this preview only after an uninstall. Preview the next minor version "
-            "instead when it has to install over the release"
-        )
     return Plan(
         version=name,
         tag=prefix + name,
@@ -527,7 +564,6 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
         version_code=code,
         branch=branch,
         previous_prerelease_tag=last_tag,
-        notice=notice,
     )
 
 
@@ -539,15 +575,21 @@ def qa_base(
     `major` is the major version of a maintenance branch, None on the source
     branch. The source branch builds every major that has no maintenance
     branch; a maintenance branch builds its own.
+
+    Returns the version, the last release the commit contains, the last
+    release of the branch's own line among them (None when the line has no
+    release yet) and the reason for the version.
     """
     if major is None:
         last = max(contained) if contained else None
         moved_on = last is not None and commit_of(f"refs/remotes/origin/release/{last[0]}.x") is not None
         if moved_on:
             default = (last[0] + 1, 0, 0)
+            own = None
             why = f"the next major: {prefix}{format_version(last)} is the last release, and release/{last[0]}.x has its line"
         else:
             default = bump_version(last or ZERO, "patch")
+            own = last
             why = f"the patch after {prefix}{format_version(last)}" if last else "no release yet"
 
         def refusal(version: tuple) -> str:
@@ -560,8 +602,9 @@ def qa_base(
                 f"{branch} contains {prefix}{format_version(max(contained))}, a release of a later major version. "
                 f"A maintenance branch holds the releases of major {major} and of the ones before it"
             )
-        own = [version for version in contained if version[0] == major]
-        last = max(own) if own else None
+        mine = [version for version in contained if version[0] == major]
+        last = max(mine) if mine else None
+        own = last
         default = bump_version(last, "patch") if last else (major, 0, 0)
         why = f"the patch after {prefix}{format_version(last)}" if last else f"the first release of major {major}"
 
@@ -576,19 +619,64 @@ def qa_base(
             return f"it is not higher than {prefix}{format_version(last)}, the last release the commit contains"
         return refusal(version)
 
-    if exact:
-        version = parse_version(exact[len(prefix):] if prefix and exact.startswith(prefix) else exact)
-        problem = usable(version)
-        if problem:
-            raise Failure(f"version {format_version(version)} was given for this QA build, and {problem}")
-        return version, last, "given as version"
+    def parsed(text: str) -> tuple:
+        return parse_version(text[len(prefix):] if prefix and text.startswith(prefix) else text)
+
     if hint:
-        version = parse_version(hint[len(prefix):] if prefix and hint.startswith(prefix) else hint)
+        version = parsed(hint)
         problem = usable(version)
-        if not problem:
-            return version, last, "next-version"
-        why = f"{why}; next-version {format_version(version)} is not used: {problem}"
-    return default, last, why
+        # The same ceiling as for version below: a line reaches its next major at most.
+        if not problem and last and version > bump_version(last, "major"):
+            ceiling = format_version(bump_version(last, "major"))
+            problem = f"it is above {ceiling}, the next major version after {prefix}{format_version(last)}"
+        if problem:
+            why = f"{why}; next-version {format_version(version)} is not used: {problem}"
+        else:
+            default, why = version, "next-version"
+    if not exact:
+        return default, last, own, why
+
+    # version is typed into a form for one run, and a build of it is signed with the release key:
+    # every device that takes it refuses each lower versionCode afterwards. So it names one of the
+    # two versions the line can reach after its next patch, and nothing above them.
+    version = parsed(exact)
+    problem = usable(version)
+    if not problem and last:
+        steps = (bump_version(last, "minor"), bump_version(last, "major"))
+        if version not in steps:
+            problem = (
+                f"it is neither {format_version(steps[0])} nor {format_version(steps[1])}, the next minor and the "
+                f"next major version after {prefix}{format_version(last)}. Without version, the build is one of "
+                f"{format_version(default)}"
+            )
+    elif not problem and version > default:
+        problem = (
+            f"it is above {format_version(default)}, the version this branch is heading for before its first "
+            "release. A later version is named in next-version, in the calling file"
+        )
+    if problem:
+        raise Failure(f"version {format_version(version)} was given for this QA build, and {problem}")
+    return version, last, own, "given as version"
+
+
+def label_numbers(base: tuple) -> list:
+    """The numbers of the label builds published after the release `base`.
+
+    A rolling pre-release holds one build, and its tag says which: the publish
+    job writes "<version name> (<versionCode>)" into the annotated tag it moves.
+    The label builds after a release are the tags whose versionCode is in the
+    ninety-nine codes after that release's, whatever their label and branch.
+    A build that was planned and never published took no number.
+    """
+    low = release_code(*base)
+    listing = git("for-each-ref", "--format=%(objecttype)%1f%(contents:subject)", ROLLING_TAGS).stdout
+    numbers = []
+    for line in listing.splitlines():
+        kind, _, subject = line.partition("\x1f")
+        match = ROLLING_MESSAGE.fullmatch(subject.strip()) if kind == "tag" else None
+        if match and low < int(match["code"]) <= low + MAX_LABEL_BUILDS:
+            numbers.append(int(match["code"]) - low)
+    return numbers
 
 
 def changes_since(target: str, since_tag: str, prefix: str) -> Changes:
@@ -622,7 +710,10 @@ def plan_qa(env: Mapping[str, str]) -> QaPlan:
     sha = env.get("SHA", "").strip()
     prefix = env.get("TAG_PREFIX", "")
     source_branch = env.get("SOURCE_BRANCH", "").strip()
-    label = env.get("LABEL", "").strip()
+    # Both as they were given, not stripped: the caller puts the names of the build together from
+    # the same inputs, and a value that is only whitespace has to be refused here, not read as none.
+    label = env.get("LABEL", "")
+    exact = env.get("VERSION", "")
     if not TAG_PREFIX.fullmatch(prefix):
         raise Failure(f"tag-prefix may hold only letters, digits and . _ / -, and not start with -, got {prefix!r}")
     if not BRANCH.fullmatch(source_branch):
@@ -639,6 +730,7 @@ def plan_qa(env: Mapping[str, str]) -> QaPlan:
             "push builds it), or start the run on one of them"
         )
     major = int(maintenance["major"]) if maintenance and branch != source_branch else None
+    line = branch.replace("/", "-")
 
     if label:
         if not LABEL.fullmatch(label) or len(label) > MAX_LABEL:
@@ -646,9 +738,13 @@ def plan_qa(env: Mapping[str, str]) -> QaPlan:
                 f"label must be lowercase letters and digits in segments joined by single hyphens, at most "
                 f"{MAX_LABEL} characters (ble-test), got {label!r}"
             )
-        line_name = branch.replace("/", "-")
-        if label in PRERELEASES or label == line_name:
+        if label in RESERVED_LABELS or label == line:
             raise Failure(f"label {label!r} is the name of another kind of build; choose another one")
+        if exact:
+            raise Failure(
+                f"version ({exact}) and label ({label}) were both given. A label build is numbered right after "
+                "the last release of its line and takes no version; version is for a QA build without a label"
+            )
 
     if git("rev-parse", "--is-shallow-repository").stdout.strip() == "true":
         raise Failure("the checkout is shallow, so tags and history are incomplete; check out with fetch-depth: 0")
@@ -664,33 +760,62 @@ def plan_qa(env: Mapping[str, str]) -> QaPlan:
 
     everything = release_versions(prefix)
     contained = release_versions(prefix, merged_into=target)
-    version, last, why = qa_base(
-        branch, major, contained, everything, env.get("VERSION", "").strip(), env.get("NEXT_VERSION", "").strip(), prefix
+    version, last, own, why = qa_base(
+        branch, major, contained, everything, exact, env.get("NEXT_VERSION", "").strip(), prefix
     )
 
-    sequence = whole_number(env.get("QA_SEQUENCE", "").strip(), "qa-sequence")
-    sequence += whole_number(env.get("QA_SEQUENCE_OFFSET", "").strip() or "0", "qa-sequence-offset", signed=True)
     try:
-        code = qa_code(version[0], version[1], sequence)
+        if label:
+            # A label build is a named test build of what follows a release: right above that
+            # release, below its next patch. Without a release there is nothing to sit above.
+            if own is None:
+                raise Failure(
+                    f"label {label!r} was given, and the commit ({target[:7]}) contains no release of major "
+                    f"{version[0]}, the line {branch} builds. A label build is numbered right after the last "
+                    f"release of its line, so it installs over that release. Before the first release, test "
+                    f"with the QA builds of {branch} or with a preview"
+                )
+            version = bump_version(own, "patch")
+            released = prefix + format_version(own)
+            if version in everything:
+                raise Failure(
+                    f"{prefix}{format_version(version)} is released already, and the commit ({target[:7]}) does "
+                    f"not contain it: its last release is {released}. A label build is made after the last "
+                    "release of its line. Start the run on the branch as it is now"
+                )
+            number = max(label_numbers(own), default=0) + 1
+            if number > MAX_LABEL_BUILDS:
+                raise Failure(
+                    f"{MAX_LABEL_BUILDS} label builds were published after {released}, and the versionCode after "
+                    f"them is the one of {prefix}{format_version(version)}. Release {format_version(version)}: "
+                    "the label builds after it are counted from 1 again"
+                )
+            kind = "label"
+            code = label_code(*own, number)
+            name = f"{format_version(version)}-{label}.{number}"
+            release_tag = f"qa-{line}-{label}"
+            why = f"label build {number} after {released}"
+        else:
+            number = whole_number(env.get("QA_SEQUENCE", "").strip(), "qa-sequence")
+            number += whole_number(env.get("QA_SEQUENCE_OFFSET", "").strip() or "0", "qa-sequence-offset", signed=True)
+            kind = "qa"
+            code = qa_code(version[0], version[1], number)
+            name = f"{format_version(version)}-{QA_SUFFIX}.{number}"
+            # A build of a version that was given is in another block of versionCodes than the
+            # builds of the branch. It gets a pre-release of its own, so the rolling build of the
+            # branch stays one that every device with an earlier one can take.
+            release_tag = f"qa-{line}" + (f"-{format_version(version)}" if exact else "")
     except VersionCodeError as exc:
         raise Failure(str(exc)) from None
 
-    line = branch.replace("/", "-")
-    release_tag = f"qa-{line}" + (f"-{label}" if label else "")
-    # An older build does not replace a newer one: a run that was started again after a later commit
-    # of the branch was published.
-    published = commit_of(f"refs/tags/{release_tag}")
-    if published and published != target and contains(published, target):
-        raise Failure(
-            f"{release_tag} is at {published[:7]} already, a later commit of {branch} that contains {target[:7]}. "
-            "An older build does not replace a newer one"
-        )
     return QaPlan(
         version=format_version(version),
-        version_name=f"{format_version(version)}-{label or line}.{sequence}",
+        version_name=name,
         version_code=code,
-        sequence=sequence,
+        kind=kind,
+        number=number,
         line=line,
+        major="" if major is None else str(major),
         release_tag=release_tag,
         previous_tag=prefix + format_version(last) if last else "",
         branch=branch,
@@ -756,6 +881,11 @@ def run_code(env: Mapping[str, str]) -> None:
             if not match or match["kind"] not in PRERELEASES:
                 raise Failure(f"{text!r} is not a prerelease of the form X.Y.Z-{PRERELEASES[0]}.N")
             version = parse_version(match["version"])
+            if version[2] != 0:
+                raise Failure(
+                    f"{text!r} is a {match['kind']} of a patch release, and a {match['kind']} is of a new minor or "
+                    f"major version: X.Y.0-{match['kind']}.N"
+                )
             name = text
             code = preview_code(version[0], version[1], int(match["number"]))
         else:
@@ -777,14 +907,17 @@ def run_qa(env: Mapping[str, str]) -> None:
     print(f"Last release the commit contains: {plan.previous_tag or 'none'}")
     print(f"QA build of {plan.branch} at {plan.target_sha}")
     print(f"Version: {plan.version} ({plan.why})")
-    print(f"Version name: {plan.version_name} (versionCode {plan.version_code}, QA build {plan.sequence})")
+    what = "label build" if plan.kind == "label" else "QA build"
+    print(f"Version name: {plan.version_name} (versionCode {plan.version_code}, {what} {plan.number})")
     print(f"Published as: {plan.release_tag}")
     write_outputs(env, {
         "version": plan.version,
         "version-name": plan.version_name,
         "version-code": str(plan.version_code),
-        "sequence": str(plan.sequence),
+        "kind": plan.kind,
+        "number": str(plan.number),
         "line": plan.line,
+        "major": plan.major,
         "release-tag": plan.release_tag,
         "previous-tag": plan.previous_tag,
         "branch": plan.branch,
@@ -803,6 +936,10 @@ def run_changes(env: Mapping[str, str]) -> None:
         raise Failure("the checkout is shallow, so tags and history are incomplete; check out with fetch-depth: 0")
     target = named_commit(env.get("SHA", "").strip())
     changes = changes_since(target, since_tag, prefix)
+    # What the tag names in this checkout, unpeeled: the tag object of an annotated tag. A caller
+    # that moves the tag afterwards can tell whether it is still where this list was read from.
+    named = git("rev-parse", "--verify", "--quiet", f"refs/tags/{since_tag}", check=False) if since_tag else None
+    since_object = named.stdout.strip() if named is not None and named.returncode == 0 else ""
     if changes.stale:
         print(f"{since_tag} is at {changes.since[:7]}, a later commit that contains {target[:7]}.")
     elif changes.unchanged:
@@ -813,6 +950,7 @@ def run_changes(env: Mapping[str, str]) -> None:
     write_outputs(env, {
         "target-sha": target,
         "since": changes.since,
+        "since-object": since_object,
         "prs": changes.prs,
         "stale": "true" if changes.stale else "false",
         "unchanged": "true" if changes.unchanged else "false",

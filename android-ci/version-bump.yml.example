@@ -13,8 +13,13 @@ name: Version Bump
 # started from.
 #
 # With prerelease set to preview, the run plans a preview of the same version
-# instead: the tag vX.Y.Z-preview.N, which release.yml publishes as a GitHub
-# pre-release.
+# instead: the tag vX.Y.0-preview.N, which release.yml publishes as a GitHub
+# pre-release. Only a new minor or major version has previews: with bump
+# patch the plan is refused.
+#
+# The commit has to have passed two checks, the defaults of the workflow:
+# `pr-check / result` (pr-check.yml on the push) and `qa / built` (qa.yml on
+# the push, which builds the release variant of the commit).
 on:
   workflow_dispatch:
     inputs:
@@ -40,7 +45,7 @@ on:
         required: false
         type: string
       prerelease:
-        description: 'none: the release vX.Y.Z. preview: a preview of that version, vX.Y.Z-preview.N'
+        description: 'none: the release vX.Y.Z. preview: a preview of a new minor or major version, vX.Y.0-preview.N (not with bump patch)'
         required: true
         default: none
         type: choice

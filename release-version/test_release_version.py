@@ -118,7 +118,7 @@ def test_a_repository_without_release_tags_counts_from_zero(repo, tmp_path, bump
         "previous-tag": "",
         "target-sha": target,
         "prs": "- `" + git(repo, "rev-parse", "HEAD~1")[:7] + "` Initial commit\n- #1 Add the first feature",
-        "version-code": str({"0.0.1": 50_001, "0.1.0": 150_000, "1.0.0": 100_050_000}[version]),
+        "version-code": str({"0.0.1": 50_100, "0.1.0": 150_000, "1.0.0": 100_050_000}[version]),
         "branch": "",
         # Only a prerelease has one before it, and only a plan with a consequence has a notice.
         "previous-prerelease-tag": "",
@@ -128,7 +128,7 @@ def test_a_repository_without_release_tags_counts_from_zero(repo, tmp_path, bump
 
 @pytest.mark.parametrize(
     ("bump", "version", "code"),
-    [("patch", "1.13.1", "101350001"), ("minor", "1.14.0", "101450000"), ("major", "2.0.0", "200050000")],
+    [("patch", "1.13.1", "101350100"), ("minor", "1.14.0", "101450000"), ("major", "2.0.0", "200050000")],
 )
 def test_bump_raises_one_part_and_resets_the_lower_ones(repo, tmp_path, bump, version, code):
     git(repo, "tag", "v1.13.0")
@@ -373,7 +373,7 @@ def test_each_line_continues_from_the_last_release_its_commit_contains(lines, tm
     assert code == 0
     assert (out["previous-tag"], out["tag"], out["branch"]) == ("v1.13.1", "v1.13.2", "release/1.x")
     assert out["prs"] == "- #22 Hotfix two"
-    assert out["version-code"] == "101350002"
+    assert out["version-code"] == "101350200"
     code, out = run(tmp_path, sha=lines["c"], source_branch="develop")
     assert code == 0
     assert (out["previous-tag"], out["tag"], out["branch"]) == ("v2.0.0", "v2.0.1", "develop")
@@ -716,18 +716,18 @@ def test_a_version_the_formula_cannot_hold_is_refused(repo, tmp_path, capsys):
 @pytest.mark.parametrize(
     ("inputs", "outputs"),
     [
-        ({"version": "v1.13.1"}, {"version": "1.13.1", "version-code": "101350001"}),
-        ({"version": "1.13.1", "kind": "release"}, {"version": "1.13.1", "version-code": "101350001"}),
+        ({"version": "v1.13.1"}, {"version": "1.13.1", "version-code": "101350100"}),
+        ({"version": "1.13.1", "kind": "release"}, {"version": "1.13.1", "version-code": "101350100"}),
         ({"version": "v0.1.0", "kind": "qa", "qa_sequence": "412"}, {"version": "0.1.0", "version-code": "100412"}),
         ({"version": "app-v2.0.0", "tag_prefix": "app-v"}, {"version": "2.0.0", "version-code": "200050000"}),
         # A preview is named whole: its number is part of the version name and of the code.
         (
             {"version": "v2.0.0-preview.3", "kind": "preview"},
-            {"version": "2.0.0-preview.3", "version-code": "200040003"},
+            {"version": "2.0.0-preview.3", "version-code": "200049003"},
         ),
         (
-            {"version": "1.14.2-preview.12", "kind": "preview"},
-            {"version": "1.14.2-preview.12", "version-code": "101440012"},
+            {"version": "1.14.0-preview.12", "kind": "preview"},
+            {"version": "1.14.0-preview.12", "version-code": "101449012"},
         ),
     ],
 )
@@ -745,10 +745,11 @@ def test_code(tmp_path, inputs, outputs):
         ({"version": "1.0.0", "kind": "debug"}, "kind must be one of release, preview, qa"),
         ({"version": "1.0.0", "kind": "qa"}, "qa-sequence must be a whole number"),
         ({"version": "1.0.0", "kind": "qa", "qa_sequence": "-3"}, "qa-sequence must be a whole number"),
-        ({"version": "1.0.0", "kind": "qa", "qa_sequence": "0"}, "QA sequence number 0 is outside 1..39999"),
-        # 40000 is where the previews of the minor version start.
-        ({"version": "1.0.0", "kind": "qa", "qa_sequence": "40000"}, "QA sequence number 40000 is outside 1..39999"),
-        ({"version": "1.0.50000"}, "patch version 50000 is outside 0..49999"),
+        ({"version": "1.0.0", "kind": "qa", "qa_sequence": "0"}, "QA sequence number 0 is outside 1..48999"),
+        # 49000 is where the previews of the minor version start.
+        ({"version": "1.0.0", "kind": "qa", "qa_sequence": "49000"}, "QA sequence number 49000 is outside 1..48999"),
+        # One hundred codes per patch release: the release and the label builds after it.
+        ({"version": "1.0.500"}, "patch version 500 is outside 0..499"),
         ({"version": "21.0.0"}, "above the limit of 2100000000"),
         # A preview tag is not a release, and a release is not a preview.
         ({"version": "v2.0.0-preview.1"}, "is not a version of the form X.Y.Z"),
@@ -756,7 +757,9 @@ def test_code(tmp_path, inputs, outputs):
         ({"version": "2.0.0-rc.1", "kind": "preview"}, "is not a prerelease of the form X.Y.Z-preview.N"),
         ({"version": "2.0.0-preview.0", "kind": "preview"}, "is not a prerelease of the form X.Y.Z-preview.N"),
         ({"version": "2.0.0-preview.01", "kind": "preview"}, "is not a prerelease of the form X.Y.Z-preview.N"),
-        ({"version": "2.0.0-preview.10000", "kind": "preview"}, "preview number 10000 is outside 1..9999"),
+        ({"version": "2.0.0-preview.1000", "kind": "preview"}, "preview number 1000 is outside 1..999"),
+        # A tag somebody pushed by hand: a patch release has no preview.
+        ({"version": "v1.14.2-preview.1", "kind": "preview"}, "is a preview of a patch release"),
     ],
 )
 def test_code_refuses_what_it_cannot_compute(tmp_path, capsys, inputs, message):
@@ -783,11 +786,11 @@ def test_a_preview_is_the_next_version_with_a_number(repo, tmp_path, capsys):
         "target-sha": target,
         "prs": "- `" + git(repo, "rev-parse", "HEAD~2")[:7] + "` Initial commit\n- #1 Feature\n- #2 Ready for the demo",
         # Above every QA build of 2.0 and below the release 2.0.0.
-        "version-code": "200040001",
+        "version-code": "200049001",
         "branch": "develop",
         "notice": "",
     }
-    assert "Next prerelease: v2.0.0-preview.1 (versionCode 200040001)" in capsys.readouterr().out
+    assert "Next prerelease: v2.0.0-preview.1 (versionCode 200049001)" in capsys.readouterr().out
 
 
 def test_previews_of_one_version_are_numbered_in_order_and_list_what_each_adds(repo, tmp_path):
@@ -801,7 +804,7 @@ def test_previews_of_one_version_are_numbered_in_order_and_list_what_each_adds(r
     origin(repo, "develop")
     code, out = run(tmp_path, sha=second, bump="major", prerelease="preview", source_branch="develop")
     assert code == 0
-    assert (out["tag"], out["version"], out["version-code"]) == ("v2.0.0-preview.2", "2.0.0-preview.2", "200040002")
+    assert (out["tag"], out["version"], out["version-code"]) == ("v2.0.0-preview.2", "2.0.0-preview.2", "200049002")
     # The release it leads up to still counts from the last release; the list starts at the preview before.
     assert (out["previous-tag"], out["previous-prerelease-tag"]) == ("v1.13.0", "v2.0.0-preview.1")
     assert out["prs"] == "- #31 Fix found at the demo"
@@ -823,16 +826,17 @@ def test_previews_do_not_change_what_the_release_is(repo, tmp_path):
     git(repo, "tag", "qa-develop")
     target = commit(repo, "Last fix (#31)")
     origin(repo, "develop")
-    for bump, tag, code in (("patch", "v1.13.1", "101350001"), ("major", "v2.0.0", "200050000")):
+    for bump, tag, code in (("patch", "v1.13.1", "101350100"), ("major", "v2.0.0", "200050000")):
         status, out = run(tmp_path, sha=target, bump=bump, source_branch="develop")
         assert (status, out["tag"], out["previous-tag"], out["version-code"]) == (0, tag, "v1.13.0", code)
         assert out["prs"] == "- #30 Redesign\n- #31 Last fix"
-        assert out["previous-prerelease-tag"] == ""
+        # The commit contains the previews of the version, so there is nothing to say about them.
+        assert (out["previous-prerelease-tag"], out["notice"]) == ("", "")
     # Each version numbers its own previews.
     _, out = run(tmp_path, sha=target, bump="minor", prerelease="preview", source_branch="develop")
     assert out["tag"] == "v1.14.0-preview.5"
-    _, out = run(tmp_path, sha=target, bump="patch", prerelease="preview", source_branch="develop")
-    assert out["tag"] == "v1.13.1-preview.1"
+    _, out = run(tmp_path, sha=target, bump="major", prerelease="preview", source_branch="develop")
+    assert out["tag"] == "v2.0.0-preview.2"
 
 
 def test_a_preview_has_to_add_something_to_the_one_before_it(repo, tmp_path, capsys):
@@ -855,7 +859,7 @@ def test_a_preview_has_to_add_something_to_the_one_before_it(repo, tmp_path, cap
 def test_a_preview_is_held_to_the_rules_of_its_release(lines, repo, tmp_path, capsys):
     # The commit of the last release has nothing new; a version that is released has no preview; and
     # the lines keep apart.
-    code, _ = run(tmp_path, sha=lines["b"], prerelease="preview", source_branch="develop")
+    code, _ = run(tmp_path, sha=lines["b"], bump="minor", prerelease="preview", source_branch="develop")
     assert code == 1
     assert "is the commit of v2.0.0: there is nothing new to release" in error_of(capsys)
     code, _ = run(tmp_path, sha=lines["c"], version="2.0.0", prerelease="preview", source_branch="develop")
@@ -865,32 +869,68 @@ def test_a_preview_is_held_to_the_rules_of_its_release(lines, repo, tmp_path, ca
     assert code == 1
     assert "the last release of major 2 is v2.0.0, which the commit does not contain" in error_of(capsys)
     code, out = run(tmp_path, sha=lines["h2"], bump="minor", prerelease="preview", source_branch="develop")
-    assert (code, out["tag"], out["branch"], out["version-code"]) == (0, "v1.14.0-preview.1", "release/1.x", "101440001")
+    assert (code, out["tag"], out["branch"], out["version-code"]) == (0, "v1.14.0-preview.1", "release/1.x", "101449001")
     assert out["notice"] == ""
 
 
-def test_a_preview_of_a_patch_release_says_that_it_is_below_the_release(lines, tmp_path, capsys):
-    # 2.0.1-preview.1 is 200040001 and 2.0.0 is 200050000: allowed, and worth a sentence in the plan.
+def test_a_patch_release_has_no_preview(lines, repo, tmp_path, capsys):
+    # 2.0.0 is out. A preview of 2.0.1 would be numbered below it, in the block of 2.0, and no
+    # device with 2.0.0 could take it: the plan is refused and says what to choose.
     code, out = run(tmp_path, sha=lines["c"], bump="patch", prerelease="preview", source_branch="develop")
-    assert code == 0
-    assert (out["tag"], out["version-code"]) == ("v2.0.1-preview.1", "200040001")
-    assert "v2.0.1-preview.1 (versionCode 200040001) does not install over v2.0.0 (versionCode 200050000)" in out["notice"]
-    assert "Preview the next minor version instead" in out["notice"]
-    assert "::warning title=release-version::v2.0.1-preview.1" in capsys.readouterr().out
-    # The next minor version is above it.
+    assert (code, out) == (1, {})
+    message = error_of(capsys)
+    assert "bump patch plans 2.0.1, a patch release, and a preview is of a new minor or major version (X.Y.0)" in message
+    assert "Choose bump minor or major for the preview" in message
+    assert "make a label build" in message
+    # The same for a version that was given, and for the patch of a maintenance line.
+    code, _ = run(tmp_path, sha=lines["c"], version="2.0.1", prerelease="preview", source_branch="develop")
+    assert code == 1
+    assert "version 2.0.1 was given, a patch release" in error_of(capsys)
+    code, _ = run(tmp_path, sha=lines["h2"], prerelease="preview", source_branch="develop")
+    assert code == 1
+    assert "bump patch plans 1.13.2, a patch release" in error_of(capsys)
+    # The next minor and the next major version are above the release that is out.
     _, out = run(tmp_path, sha=lines["c"], bump="minor", prerelease="preview", source_branch="develop")
-    assert (out["tag"], out["version-code"], out["notice"]) == ("v2.1.0-preview.1", "200140001", "")
+    assert (out["tag"], out["version-code"], out["notice"]) == ("v2.1.0-preview.1", "200149001", "")
+    _, out = run(tmp_path, sha=lines["c"], bump="major", prerelease="preview", source_branch="develop")
+    assert (out["tag"], out["version-code"]) == ("v3.0.0-preview.1", "300049001")
+    # The release of the patch itself is planned as before.
+    code, out = run(tmp_path, sha=lines["c"], bump="patch", source_branch="develop")
+    assert (code, out["tag"], out["version-code"]) == (0, "v2.0.1", "200050100")
+
+
+def test_a_release_that_leaves_out_the_last_preview_of_its_version_says_so(repo, tmp_path, capsys):
+    # preview.2 is on the demo devices, and the release installs over it. A release cut from the
+    # commit before that preview would take its changes away again: allowed, and said.
+    git(repo, "tag", "v1.13.0")
+    older = commit(repo, "In preview 1 (#30)")
+    git(repo, "tag", "v1.14.0-preview.1")
+    previewed = commit(repo, "Fix found at the demo (#31)")
+    git(repo, "tag", "v1.14.0-preview.2")
+    later = commit(repo, "After the demo (#32)")
+    origin(repo, "develop")
+    code, out = run(tmp_path, sha=older, bump="minor", source_branch="develop")
+    assert (code, out["tag"]) == (0, "v1.14.0")
+    assert f"({older[:7]}) does not contain v1.14.0-preview.2, the last preview of 1.14.0" in out["notice"]
+    assert "Release a commit that contains v1.14.0-preview.2, unless leaving it out is meant" in out["notice"]
+    assert "::warning title=release-version::" in capsys.readouterr().out
+    for target in (previewed, later):
+        code, out = run(tmp_path, sha=target, bump="minor", source_branch="develop")
+        assert (code, out["tag"], out["notice"]) == (0, "v1.14.0", "")
+    # The previews of another version say nothing about this one.
+    code, out = run(tmp_path, sha=older, bump="major", source_branch="develop")
+    assert (code, out["tag"], out["notice"]) == (0, "v2.0.0", "")
 
 
 def test_the_previews_of_a_version_are_limited_by_their_range_of_codes(repo, tmp_path, capsys):
     git(repo, "tag", "v1.13.0")
     commit(repo, "Previewed (#30)")
-    git(repo, "tag", "v1.14.0-preview.9999")
+    git(repo, "tag", "v1.14.0-preview.999")
     target = commit(repo, "One more (#31)")
     origin(repo, "develop")
     code, _ = run(tmp_path, sha=target, bump="minor", prerelease="preview", source_branch="develop")
     assert code == 1
-    assert "preview number 10000 is outside 1..9999" in error_of(capsys)
+    assert "preview number 1000 is outside 1..999" in error_of(capsys)
 
 
 # --- operation: qa -------------------------------------------------------------------------
@@ -901,6 +941,11 @@ def run_qa(tmp_path, sha: str, ref: str = "refs/heads/develop", sequence: str = 
     return run(tmp_path, operation="qa", sha=sha, ref=ref, qa_sequence=sequence, source_branch="develop", **inputs)
 
 
+def rolling(repo: Path, tag: str, name: str, code: int, revision: str = "HEAD") -> None:
+    """Move a rolling tag the way the publish job of android-qa.yml does: annotated, naming its build."""
+    git(repo, "tag", "-f", "-a", tag, "-m", f"{name} ({code})", revision)
+
+
 def test_a_qa_build_leads_up_to_the_patch_after_the_last_release(repo, tmp_path, capsys):
     git(repo, "tag", "v1.13.0")
     target = commit(repo, "Fix (#12)")
@@ -909,11 +954,13 @@ def test_a_qa_build_leads_up_to_the_patch_after_the_last_release(repo, tmp_path,
     assert code == 0
     assert out == {
         "version": "1.13.1",
-        "version-name": "1.13.1-develop.57",
+        "version-name": "1.13.1-qa.57",
         # The block of 1.13, below its previews and releases.
         "version-code": "101300057",
-        "sequence": "57",
+        "kind": "qa",
+        "number": "57",
         "line": "develop",
+        "major": "",
         "release-tag": "qa-develop",
         "previous-tag": "v1.13.0",
         "branch": "develop",
@@ -921,17 +968,17 @@ def test_a_qa_build_leads_up_to_the_patch_after_the_last_release(repo, tmp_path,
     }
     log = capsys.readouterr().out
     assert "Version: 1.13.1 (the patch after v1.13.0)" in log
-    assert "Version name: 1.13.1-develop.57 (versionCode 101300057, QA build 57)" in log
+    assert "Version name: 1.13.1-qa.57 (versionCode 101300057, QA build 57)" in log
 
 
 def test_a_qa_build_before_any_release(repo, tmp_path):
     target = commit(repo, "Feature (#1)")
     origin(repo, "develop")
     _, out = run_qa(tmp_path, target)
-    assert (out["version-name"], out["version-code"], out["previous-tag"]) == ("0.0.1-develop.57", "57", "")
+    assert (out["version-name"], out["version-code"], out["previous-tag"]) == ("0.0.1-qa.57", "57", "")
     # One calling repository's first release is 2.0.0, and its QA builds are named after it.
     _, out = run_qa(tmp_path, target, next_version="2.0.0")
-    assert (out["version"], out["version-name"], out["version-code"]) == ("2.0.0", "2.0.0-develop.57", "200000057")
+    assert (out["version"], out["version-name"], out["version-code"]) == ("2.0.0", "2.0.0-qa.57", "200000057")
 
 
 def test_next_version_is_used_until_that_version_is_released(repo, tmp_path, capsys):
@@ -939,37 +986,44 @@ def test_next_version_is_used_until_that_version_is_released(repo, tmp_path, cap
     target = commit(repo, "Redesign (#30)")
     origin(repo, "develop")
     _, out = run_qa(tmp_path, target, next_version="v2.0.0")
-    assert (out["version-name"], out["version-code"]) == ("2.0.0-develop.57", "200000057")
+    assert (out["version-name"], out["version-code"], out["release-tag"]) == ("2.0.0-qa.57", "200000057", "qa-develop")
     _, out = run_qa(tmp_path, target, next_version="1.14.0")
-    assert (out["version-name"], out["version-code"]) == ("1.14.0-develop.57", "101400057")
+    assert (out["version-name"], out["version-code"]) == ("1.14.0-qa.57", "101400057")
+    # A line reaches its next major version at most: a value above it is a slip of the pen, and
+    # builds of it would lock every device out of the versions in between.
+    capsys.readouterr()
+    code, out = run_qa(tmp_path, target, next_version="3.0.0")
+    assert (code, out["version-name"]) == (0, "1.13.1-qa.57")
+    assert "next-version 3.0.0 is not used: it is above 2.0.0, the next major version after v1.13.0" in capsys.readouterr().out
     # The file still says 2.0.0 after 2.0.0 was released: the builds go on to the patch after it,
     # in the same block of codes, instead of failing on every push.
     git(repo, "tag", "v2.0.0")
     after = commit(repo, "Fix after the release (#31)")
     origin(repo, "develop")
-    capsys.readouterr()
     code, out = run_qa(tmp_path, after, next_version="2.0.0", sequence="58")
-    assert (code, out["version-name"], out["version-code"]) == (0, "2.0.1-develop.58", "200000058")
+    assert (code, out["version-name"], out["version-code"]) == (0, "2.0.1-qa.58", "200000058")
     assert "next-version 2.0.0 is not used: v2.0.0 is released already" in capsys.readouterr().out
     # A value below the last release is not used either.
     _, out = run_qa(tmp_path, after, next_version="1.99.0", sequence="59")
-    assert out["version-name"] == "2.0.1-develop.59"
+    assert out["version-name"] == "2.0.1-qa.59"
 
 
 def test_each_line_builds_its_own_version_and_rolling_tag(lines, tmp_path):
     #   develop:      base(v1.13.0) ── a ── b(v2.0.0) ── c
     #   release/1.x:    └── h1(v1.13.1) ── h2
     _, out = run_qa(tmp_path, lines["c"])
-    assert (out["version-name"], out["version-code"], out["release-tag"]) == ("2.0.1-develop.57", "200000057", "qa-develop")
+    assert (out["version-name"], out["version-code"], out["release-tag"]) == ("2.0.1-qa.57", "200000057", "qa-develop")
     code, out = run_qa(tmp_path, lines["h2"], ref="refs/heads/release/1.x", sequence="58")
     assert code == 0
     assert out == {
         "version": "1.13.2",
-        # The branch is in the name, so a build of the maintenance line is told from one of develop.
-        "version-name": "1.13.2-release-1.x.58",
+        # No branch in the name: the version tells a build of the maintenance line from one of develop.
+        "version-name": "1.13.2-qa.58",
         "version-code": "101300058",
-        "sequence": "58",
+        "kind": "qa",
+        "number": "58",
         "line": "release-1.x",
+        "major": "1",
         # Not a tag that starts with v: the release tags stay vX.Y.Z only.
         "release-tag": "qa-release-1.x",
         "previous-tag": "v1.13.1",
@@ -986,31 +1040,43 @@ def test_the_source_branch_builds_the_next_major_once_its_last_major_has_a_maint
     target = commit(repo, "Redesign (#30)")
     origin(repo, "develop")
     code, out = run_qa(tmp_path, target)
-    assert (code, out["version-name"], out["version-code"]) == (0, "2.0.0-develop.57", "200000057")
+    assert (code, out["version-name"], out["version-code"], out["major"]) == (0, "2.0.0-qa.57", "200000057", "")
     assert "the next major: v1.13.0 is the last release, and release/1.x has its line" in capsys.readouterr().out
     # A version of the maintained major is not built here, as a hint or for one build.
     _, out = run_qa(tmp_path, target, next_version="1.14.0")
-    assert out["version-name"] == "2.0.0-develop.57"
+    assert out["version-name"] == "2.0.0-qa.57"
     code, _ = run_qa(tmp_path, target, version="1.14.0")
     assert code == 1
     assert "version 1.14.0 was given for this QA build, and major 1 is built from release/1.x" in error_of(capsys)
+    # Its line, major 2, has no release yet: there is nothing a label build could sit above.
+    code, _ = run_qa(tmp_path, target, label="ble-test")
+    assert code == 1
+    assert "contains no release of major 2, the line develop builds" in error_of(capsys)
 
 
 def test_a_maintenance_branch_builds_its_own_major_only(lines, repo, tmp_path, capsys):
     ref = "refs/heads/release/1.x"
     _, out = run_qa(tmp_path, lines["h2"], ref=ref, next_version="2.0.0")
-    assert out["version-name"] == "1.13.2-release-1.x.57"
+    assert out["version-name"] == "1.13.2-qa.57"
     _, out = run_qa(tmp_path, lines["h2"], ref=ref, next_version="1.14.0")
-    assert out["version-name"] == "1.14.0-release-1.x.57"
+    assert out["version-name"] == "1.14.0-qa.57"
+    code, _ = run_qa(tmp_path, lines["h2"], ref=ref, version="2.0.0")
+    assert code == 1
+    assert "version 2.0.0 was given for this QA build, and v2.0.0 is released already" in error_of(capsys)
     code, _ = run_qa(tmp_path, lines["h2"], ref=ref, version="2.1.0")
     assert code == 1
     assert "version 2.1.0 was given for this QA build, and release/1.x builds major 1 only" in error_of(capsys)
+    code, out = run_qa(tmp_path, lines["h2"], ref=ref, version="1.14.0")
+    assert (code, out["version-name"], out["release-tag"]) == (0, "1.14.0-qa.57", "qa-release-1.x-1.14.0")
     # A maintenance branch that was cut before its major had a release.
     git(repo, "checkout", "-q", "-b", "release/3.x", lines["c"])
     target = commit(repo, "First change of 3.x (#40)")
     origin(repo, "release/3.x", "release/3.x")
     code, out = run_qa(tmp_path, target, ref="refs/heads/release/3.x")
-    assert (code, out["version-name"]) == (0, "3.0.0-release-3.x.57")
+    assert (code, out["version-name"], out["major"]) == (0, "3.0.0-qa.57", "3")
+    code, _ = run_qa(tmp_path, target, ref="refs/heads/release/3.x", label="ble-test")
+    assert code == 1
+    assert "contains no release of major 3, the line release/3.x builds" in error_of(capsys)
     # And one that holds a release of a later major is not that major's branch.
     git(repo, "checkout", "-q", "-b", "release/0.x", lines["c"])
     origin(repo, "release/0.x", "release/0.x")
@@ -1019,40 +1085,157 @@ def test_a_maintenance_branch_builds_its_own_major_only(lines, repo, tmp_path, c
     assert "release/0.x contains v2.0.0, a release of a later major version" in error_of(capsys)
 
 
-def test_a_version_for_one_build(repo, tmp_path, capsys):
-    # A branch that is becoming the next major is not shown as the old version, and a build that has
-    # to install over the release takes the block of the next minor version.
+def test_a_version_for_one_build_is_the_next_minor_or_major_and_is_published_apart(repo, tmp_path, capsys):
+    # A build that has to install over the release that is out takes the block of the next minor
+    # or major version. It does not replace the rolling build of the branch, whose devices could
+    # not take the builds that follow it.
     git(repo, "tag", "v1.13.0")
     target = commit(repo, "Fix (#12)")
     origin(repo, "develop")
-    for version, name, code in (
-        ("2.0.0", "2.0.0-develop.57", "200000057"),
-        ("v1.14.0", "1.14.0-develop.57", "101400057"),
-        ("1.13.1", "1.13.1-develop.57", "101300057"),
+    for version, name, code, tag in (
+        ("2.0.0", "2.0.0-qa.57", "200000057", "qa-develop-2.0.0"),
+        ("v1.14.0", "1.14.0-qa.57", "101400057", "qa-develop-1.14.0"),
     ):
-        status, out = run_qa(tmp_path, target, version=version, next_version="9.9.9")
-        assert (status, out["version-name"], out["version-code"]) == (0, name, code)
-    assert int(out["version-code"]) < 101_350_000 < 101_400_057
+        status, out = run_qa(tmp_path, target, version=version, next_version="1.14.0")
+        assert (status, out["version-name"], out["version-code"], out["release-tag"]) == (0, name, code, tag)
+        assert (out["kind"], out["line"]) == ("qa", "develop")
+    assert 101_350_000 < 101_400_057
+    neither = "it is neither 1.14.0 nor 2.0.0, the next minor and the next major version after v1.13.0"
     for version, message in (
+        # A typing error is not a version the line can reach: 11.3.1 for 1.13.1, 3.0.0 for 2.0.0.
+        ("11.3.1", neither),
+        ("3.0.0", neither),
+        ("1.15.0", neither),
+        ("2.1.0", neither),
+        # The next patch is what the build is without version.
+        ("1.13.1", neither + ". Without version, the build is one of 1.13.1"),
         ("1.13.0", "version 1.13.0 was given for this QA build, and v1.13.0 is released already"),
         ("1.12.9", "it is not higher than v1.13.0, the last release the commit contains"),
         ("2.0", "'2.0' is not a version of the form X.Y.Z"),
-        ("2.0.0-develop.1", "is not a version of the form X.Y.Z"),
+        ("2.0.0-qa.1", "is not a version of the form X.Y.Z"),
     ):
         status, out = run_qa(tmp_path, target, version=version)
         assert (status, out) == (1, {})
         assert message in error_of(capsys)
 
 
-def test_a_label_names_the_build_and_its_own_rolling_tag(lines, tmp_path):
-    _, out = run_qa(tmp_path, lines["c"], label="ble-test")
-    assert (out["version-name"], out["release-tag"], out["line"]) == ("2.0.1-ble-test.57", "qa-develop-ble-test", "develop")
+def test_a_version_before_the_first_release_is_no_higher_than_where_the_branch_is_heading(repo, tmp_path, capsys):
+    target = commit(repo, "Feature (#1)")
+    origin(repo, "develop")
+    for version, tag in (("2.0.0", "qa-develop-2.0.0"), ("1.0.0", "qa-develop-1.0.0")):
+        code, out = run_qa(tmp_path, target, version=version, next_version="2.0.0")
+        assert (code, out["version-name"], out["release-tag"]) == (0, f"{version}-qa.57", tag)
+    for version, hint, ceiling in (("2.1.0", "2.0.0", "2.0.0"), ("3.0.0", "2.0.0", "2.0.0"), ("0.1.0", "", "0.0.1")):
+        code, out = run_qa(tmp_path, target, version=version, next_version=hint)
+        assert (code, out) == (1, {})
+        message = error_of(capsys)
+        assert f"version {version} was given for this QA build, and it is above {ceiling}" in message
+        assert "A later version is named in next-version" in message
+
+
+def test_a_label_build_is_numbered_right_after_the_last_release_of_its_line(lines, repo, tmp_path, capsys):
+    #   develop:      base(v1.13.0) ── a ── b(v2.0.0) ── c
+    #   release/1.x:    └── h1(v1.13.1) ── h2
+    code, out = run_qa(tmp_path, lines["c"], label="ble-test")
+    assert code == 0
+    assert out == {
+        # Named after the patch it leads up to, numbered after the release it was made after:
+        # 2.0.0 (200050000) < 2.0.1-ble-test.1 < 2.0.1 (200050100).
+        "version": "2.0.1",
+        "version-name": "2.0.1-ble-test.1",
+        "version-code": "200050001",
+        "kind": "label",
+        "number": "1",
+        "line": "develop",
+        "major": "",
+        "release-tag": "qa-develop-ble-test",
+        "previous-tag": "v2.0.0",
+        "branch": "develop",
+        "target-sha": lines["c"],
+    }
+    log = capsys.readouterr().out
+    assert "Version: 2.0.1 (label build 1 after v2.0.0)" in log
+    assert "Version name: 2.0.1-ble-test.1 (versionCode 200050001, label build 1)" in log
     _, out = run_qa(tmp_path, lines["h2"], ref="refs/heads/release/1.x", label="sweetsleep")
-    assert (out["version-name"], out["release-tag"]) == ("1.13.2-sweetsleep.57", "qa-release-1.x-sweetsleep")
+    assert (out["version-name"], out["version-code"], out["release-tag"], out["major"]) == (
+        "1.13.2-sweetsleep.1", "101350101", "qa-release-1.x-sweetsleep", "1",
+    )
+    # The run number is not part of a label build.
+    code, out = run_qa(tmp_path, lines["c"], label="ble-test", sequence="")
+    assert (code, out["version-name"]) == (0, "2.0.1-ble-test.1")
+
+
+def test_label_builds_after_one_release_are_counted_from_the_rolling_tags(lines, repo, tmp_path, capsys):
+    # What was published says which numbers are taken: each rolling tag names the build it holds.
+    rolling(repo, "qa-develop-ble-test", "2.0.1-ble-test.1", 200_050_001, lines["c"])
+    _, out = run_qa(tmp_path, lines["c"], label="ble-test")
+    assert (out["version-name"], out["version-code"]) == ("2.0.1-ble-test.2", "200050002")
+    # One count for every label after the release: a later build installs over an earlier one,
+    # whatever the two are called.
+    rolling(repo, "qa-develop-knox", "2.0.1-knox.5", 200_050_005, lines["c"])
+    _, out = run_qa(tmp_path, lines["c"], label="ble-test")
+    assert (out["version-name"], out["version-code"]) == ("2.0.1-ble-test.6", "200050006")
+    _, out = run_qa(tmp_path, lines["c"], label="third")
+    assert out["version-name"] == "2.0.1-third.6"
+    # Not counted: the rolling QA build, a build given a version, a tag without a message (it names
+    # no build), and the label builds after another release.
+    rolling(repo, "qa-develop", "2.0.1-qa.57", 200_000_057, lines["c"])
+    rolling(repo, "qa-develop-2.1.0", "2.1.0-qa.58", 200_100_058, lines["c"])
+    git(repo, "tag", "qa-develop-plain", lines["c"])
+    rolling(repo, "qa-release-1.x-sweetsleep", "1.13.2-sweetsleep.3", 101_350_103, lines["h2"])
+    _, out = run_qa(tmp_path, lines["c"], label="ble-test")
+    assert out["version-name"] == "2.0.1-ble-test.6"
+    _, out = run_qa(tmp_path, lines["h2"], ref="refs/heads/release/1.x", label="ble-test")
+    assert (out["version-name"], out["version-code"]) == ("1.13.2-ble-test.4", "101350104")
+    # After the next patch release the count starts again, above that release.
+    git(repo, "checkout", "-q", "develop")
+    git(repo, "tag", "v2.0.1")
+    after = commit(repo, "Fix after 2.0.1 (#33)")
+    origin(repo, "develop")
+    _, out = run_qa(tmp_path, after, label="ble-test")
+    assert (out["version-name"], out["version-code"]) == ("2.0.2-ble-test.1", "200050101")
+    # Ninety-nine codes lie between a release and its next patch.
+    rolling(repo, "qa-develop-knox", "2.0.2-knox.99", 200_050_199, after)
+    code, out = run_qa(tmp_path, after, label="ble-test")
+    assert (code, out) == (1, {})
+    message = error_of(capsys)
+    assert "99 label builds were published after v2.0.1" in message
+    assert "Release 2.0.2: the label builds after it are counted from 1 again" in message
+
+
+def test_a_label_build_needs_a_release_to_sit_above(repo, tmp_path, capsys):
+    target = commit(repo, "Feature (#1)")
+    origin(repo, "develop")
+    for hint, major in (("", "0"), ("2.0.0", "2")):
+        code, out = run_qa(tmp_path, target, label="ble-test", next_version=hint)
+        assert (code, out) == (1, {})
+        message = error_of(capsys)
+        assert f"label 'ble-test' was given, and the commit ({target[:7]}) contains no release of major {major}" in message
+        assert "Before the first release, test with the QA builds of develop or with a preview" in message
+    # An earlier commit of the branch, from before a release that is out: the build would be named
+    # after a version that exists.
+    git(repo, "tag", "v1.13.0")
+    older = commit(repo, "Fix (#12)")
+    commit(repo, "Released as 1.13.1 (#13)")
+    git(repo, "tag", "v1.13.1")
+    origin(repo, "develop")
+    code, _ = run_qa(tmp_path, older, label="ble-test")
+    assert code == 1
+    message = error_of(capsys)
+    assert f"v1.13.1 is released already, and the commit ({older[:7]}) does not contain it: its last release is v1.13.0" in message
+    # A label build takes no version: its place is right after the release.
+    code, _ = run_qa(tmp_path, git(repo, "rev-parse", "HEAD"), label="ble-test", version="1.14.0")
+    assert code == 1
+    assert "version (1.14.0) and label (ble-test) were both given" in error_of(capsys)
 
 
 @pytest.mark.parametrize(
-    "label", ["BLE", "ble_test", "ble--test", "-ble", "ble-", "ble test", "v1", "a" * 41, "preview", "develop", "ble\ntest"]
+    "label",
+    [
+        "BLE", "ble_test", "ble--test", "-ble", "ble-", "ble test", "v1", "a" * 41, "ble\ntest", "1.14.0",
+        # The names of the other kinds of build, and of the branch.
+        "qa", "preview", "release", "develop",
+    ],
 )
 def test_a_label_that_cannot_be_part_of_a_name_is_refused(repo, tmp_path, capsys, label):
     git(repo, "tag", "v1.13.0")
@@ -1061,7 +1244,7 @@ def test_a_label_that_cannot_be_part_of_a_name_is_refused(repo, tmp_path, capsys
     code, out = run_qa(tmp_path, target, label=label)
     if label == "v1":
         # Letters and digits: a label may look like anything but another kind of build.
-        assert (code, out["release-tag"]) == (0, "qa-develop-v1")
+        assert (code, out["release-tag"], out["version-name"]) == (0, "qa-develop-v1", "1.13.1-v1.1")
         return
     assert (code, out) == (1, {})
     message = error_of(capsys)
@@ -1123,14 +1306,14 @@ def test_the_number_of_a_qa_build_is_the_sequence_plus_the_offset(repo, tmp_path
     target = commit(repo, "Feature (#1)")
     origin(repo, "develop")
     _, out = run_qa(tmp_path, target, sequence="3", qa_sequence_offset="1000", next_version="2.0.0")
-    assert (out["sequence"], out["version-name"], out["version-code"]) == ("1003", "2.0.0-develop.1003", "200001003")
+    assert (out["number"], out["version-name"], out["version-code"]) == ("1003", "2.0.0-qa.1003", "200001003")
     _, out = run_qa(tmp_path, target, sequence="45000", qa_sequence_offset="-44000")
-    assert out["sequence"] == "1000"
+    assert out["number"] == "1000"
     for sequence, offset, message in (
-        # 40000 would be the code of a preview.
-        ("39990", "10", "QA sequence number 40000 is outside 1..39999"),
-        ("40000", "", "QA sequence number 40000 is outside 1..39999"),
-        ("5", "-5", "QA sequence number 0 is outside 1..39999"),
+        # 49000 would be the code of a preview.
+        ("48990", "10", "QA sequence number 49000 is outside 1..48999"),
+        ("49000", "", "QA sequence number 49000 is outside 1..48999"),
+        ("5", "-5", "QA sequence number 0 is outside 1..48999"),
         ("", "", "qa-sequence must be a whole number"),
         ("5", "1.5", "qa-sequence-offset must be a whole number"),
         ("5", "+5", "qa-sequence-offset must be a whole number"),
@@ -1138,24 +1321,23 @@ def test_the_number_of_a_qa_build_is_the_sequence_plus_the_offset(repo, tmp_path
         code, out = run_qa(tmp_path, target, sequence=sequence, qa_sequence_offset=offset)
         assert (code, out) == (1, {})
         assert message in error_of(capsys)
-    _, out = run_qa(tmp_path, target, sequence="39999")
-    assert out["version-code"] == "39999"
+    _, out = run_qa(tmp_path, target, sequence="48999")
+    assert out["version-code"] == "48999"
 
 
-def test_an_older_build_does_not_replace_a_newer_one(repo, tmp_path, capsys):
+def test_a_commit_before_the_published_build_is_still_planned(repo, tmp_path):
+    # Every pushed commit is built: the check of its build is what a release of that commit
+    # requires. Whether the build is published is the publish job's decision (operation changes
+    # says that the rolling tag is ahead), not a reason to refuse the build.
     git(repo, "tag", "v1.13.0")
     older = commit(repo, "Older (#12)")
     newer = commit(repo, "Newer (#13)")
     origin(repo, "develop")
-    git(repo, "tag", "qa-develop", newer)
-    # A run for the older commit that was started again after the newer one was published.
-    code, _ = run_qa(tmp_path, older)
-    assert code == 1
-    message = error_of(capsys)
-    assert f"qa-develop is at {newer[:7]} already, a later commit of develop that contains {older[:7]}" in message
-    # The same commit again, and a build with a label of its own, are not older builds.
-    assert run_qa(tmp_path, newer)[0] == 0
-    assert run_qa(tmp_path, older, label="ble-test")[0] == 0
+    rolling(repo, "qa-develop", "1.13.1-qa.58", 101_300_058, newer)
+    code, out = run_qa(tmp_path, older)
+    assert (code, out["version-name"], out["release-tag"]) == (0, "1.13.1-qa.57", "qa-develop")
+    _, changes = run(tmp_path, operation="changes", sha=older, since="qa-develop")
+    assert changes["stale"] == "true"
 
 
 def test_qa_and_preview_tags_are_not_releases(repo, tmp_path):
@@ -1166,7 +1348,7 @@ def test_qa_and_preview_tags_are_not_releases(repo, tmp_path):
     target = commit(repo, "Another fix (#13)")
     origin(repo, "develop")
     _, out = run_qa(tmp_path, target)
-    assert (out["version-name"], out["previous-tag"]) == ("1.13.1-develop.57", "v1.13.0")
+    assert (out["version-name"], out["previous-tag"]) == ("1.13.1-qa.57", "v1.13.0")
     _, out = run(tmp_path, sha=target, source_branch="develop")
     assert (out["tag"], out["previous-tag"]) == ("v1.13.1", "v1.13.0")
 
@@ -1200,10 +1382,28 @@ def test_changes_since_the_build_before(repo, tmp_path):
     assert out == {
         "target-sha": target,
         "since": earlier,
+        # A tag without a message names the commit itself.
+        "since-object": earlier,
         "prs": "- #13 fix: Close the session\n- `" + target[:7] + "` Hotfix pushed directly",
         "stale": "false",
         "unchanged": "false",
     }
+
+
+def test_changes_name_the_object_of_an_annotated_rolling_tag(repo, tmp_path):
+    # The publish job moves an annotated tag. The list starts at its commit, and since-object is
+    # the tag object: what the ref of the tag holds, which the job compares before it moves the tag.
+    git(repo, "tag", "v1.13.0")
+    earlier = commit(repo, "In the build before (#12)")
+    rolling(repo, "qa-develop", "1.13.1-qa.57", 101_300_057)
+    target = commit(repo, "Fix (#13)")
+    _, out = run_changes(tmp_path, target)
+    tag_object = git(repo, "rev-parse", "refs/tags/qa-develop")
+    assert tag_object != earlier
+    assert (out["since"], out["since-object"], out["prs"]) == (earlier, tag_object, "- #13 Fix")
+    # No tag, no object.
+    _, out = run_changes(tmp_path, target, since="qa-develop-ble-test")
+    assert (out["since"], out["since-object"]) == ("v1.13.0", "")
 
 
 def test_changes_of_the_first_build_start_at_the_last_release(repo, tmp_path):

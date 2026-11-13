@@ -7,9 +7,9 @@ name: Android release
 # otherwise, and a self-hosted build that fails for an infrastructure reason
 # runs again on a GitHub-hosted runner.
 #
-# A tag vX.Y.Z-preview.N is built the same way, as a preview of the version
-# X.Y.Z: the same key and checks, a versionCode below the release's, and a
-# GitHub pre-release that is never the latest release.
+# A tag vX.Y.0-preview.N is built the same way, as a preview of the new minor
+# or major version X.Y.0: the same key and checks, a versionCode below the
+# release's, and a GitHub pre-release that is never the latest release.
 #
 # The caller's contract, every input and the secrets are in
 # android-ci/README.md.
@@ -18,7 +18,7 @@ on:
     inputs:
       tag:
         description: >-
-          The tag to build: vX.Y.Z, or vX.Y.Z-preview.N for a preview. Empty
+          The tag to build: vX.Y.Z, or vX.Y.0-preview.N for a preview. Empty
           means the ref the workflow run started for, which is the tag on a
           tag push and on a manual run started for a tag.
         required: false
@@ -86,6 +86,8 @@ on:
       gradle-args:
         description: >-
           Extra Gradle arguments for ./gradlew ciRelease, split on whitespace.
+          The build already gets -PciVersionName, -PciVersionCode and
+          -PciBuildKind (release, or preview for a preview tag).
         required: false
         type: string
         default: ''
@@ -126,10 +128,15 @@ on:
         description: >-
           Names of the checks that must have succeeded on the tagged commit,
           one per line, as the commit's checks list shows them. They are
-          checked for every tag, whoever pushed it. Empty requires none.
+          checked for every tag, whoever pushed it. Empty requires none. The
+          default is the pull request check and the QA build of the push
+          (android-qa.yml, called by a job named qa): android-pr-check.yml
+          leaves the release variant of a pushed commit to that build.
         required: false
         type: string
-        default: pr-check / result
+        default: |
+          pr-check / result
+          qa / built
       release-notes-prompt:
         description: >-
           System prompt for release-notes, replacing its built-in one.
@@ -236,11 +243,14 @@ jobs:
     permissions:
       contents: read
       checks: read
+    # Whether the tag is a preview is passed as true or false, not as the
+    # name of the kind: the runner drops a job output that contains the value
+    # of a secret, and "release" is a likely key alias.
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       sha: ${{ steps.tag.outputs.sha }}
       latest: ${{ steps.tag.outputs.latest }}
-      kind: ${{ steps.tag.outputs.kind }}
+      preview: ${{ steps.tag.outputs.kind == 'preview' }}
       version: ${{ steps.code.outputs.version }}
       version-code: ${{ steps.code.outputs.version-code }}
       runs-on: ${{ steps.pick.outputs.runs-on }}
@@ -254,19 +264,25 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          # vX.Y.Z is a release, and vX.Y.Z-preview.N a preview of the version
-          # X.Y.Z. A tag with any other suffix, a branch, or a number with a
-          # leading zero is neither.
+          # vX.Y.Z is a release, and vX.Y.0-preview.N a preview of the new
+          # minor or major version X.Y.0. A tag with any other suffix, a
+          # branch, or a number with a leading zero is neither. A patch
+          # release has no preview: its codes would be below the release that
+          # is out.
           pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-          preview_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-preview\.[1-9][0-9]*$'
+          preview_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0-preview\.[1-9][0-9]*$'
+          patch_preview_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.[1-9][0-9]*-preview\.[1-9][0-9]*$'
           if [[ "$TAG" =~ $pattern ]]; then
             kind=release
             base="$TAG"
           elif [[ "$TAG" =~ $preview_pattern ]]; then
             kind=preview
             base="${TAG%-preview.*}"
+          elif [[ "$TAG" =~ $patch_preview_pattern ]]; then
+            echo "::error::'$TAG' is a preview of a patch release, and only a new minor or major version has previews (vX.Y.0-preview.N): within a minor version every preview is numbered below every release. Nothing is built."
+            exit 1
           else
-            echo "::error::'$TAG' is not a release tag. Start the release for a tag of the form vX.Y.Z, or vX.Y.Z-preview.N for a preview."
+            echo "::error::'$TAG' is not a release tag. Start the release for a tag of the form vX.Y.Z, or vX.Y.0-preview.N for a preview."
             exit 1
           fi
 
@@ -433,6 +449,14 @@ jobs:
           deadline = time.monotonic() + wait_minutes * 60
 
 
+          class Unreadable(Exception):
+              """The checks could not be read. `again` says whether another request may succeed."""
+
+              def __init__(self, reason, again):
+                  super().__init__(reason)
+                  self.again = again
+
+
           def check_runs(name):
               query = urllib.parse.urlencode({"check_name": name, "filter": "latest", "per_page": 100})
               request = urllib.request.Request(
@@ -449,12 +473,13 @@ jobs:
                       document = json.load(response)
               except urllib.error.HTTPError as error:
                   detail = error.read(300).decode(errors="replace").strip()
-                  sys.exit(f"::error::Cannot read the checks of {sha}: HTTP {error.code}: {detail}")
+                  # A server error and a rate limit pass; a token that may not read the checks does not.
+                  raise Unreadable(f"HTTP {error.code}: {detail}", error.code >= 500 or error.code == 429) from None
               except (OSError, ValueError) as error:
-                  sys.exit(f"::error::Cannot read the checks of {sha}: {error}")
+                  raise Unreadable(str(error) or type(error).__name__, True) from None
               runs = document.get("check_runs") if isinstance(document, dict) else None
               if not isinstance(runs, list):
-                  sys.exit(f"::error::Cannot read the checks of {sha}: the response has no check_runs list")
+                  raise Unreadable("the response has no check_runs list", True)
               return [run for run in runs if isinstance(run, dict) and run.get("name") == name]
 
 
@@ -463,21 +488,31 @@ jobs:
               refused = []
               # Checks that may still succeed: not started on the commit yet, or not finished.
               unfinished = []
-              for name in required:
-                  runs = check_runs(name)
-                  if not runs:
-                      rows.append((name, "not run", ""))
-                      refused.append(f"'{name}' did not run on the commit")
-                      unfinished.append(name)
-                      continue
-                  newest = max(runs, key=lambda run: (str(run.get("started_at") or ""), run.get("id") or 0))
-                  state = newest.get("conclusion") or newest.get("status") or "unknown"
-                  rows.append((name, state, newest.get("html_url") or ""))
-                  if newest.get("status") != "completed":
-                      refused.append(f"'{name}' is {state}")
-                      unfinished.append(name)
-                  elif newest.get("conclusion") != "success":
-                      refused.append(f"'{name}' is {state}")
+              try:
+                  for name in required:
+                      runs = check_runs(name)
+                      if not runs:
+                          rows.append((name, "not run", ""))
+                          refused.append(f"'{name}' did not run on the commit")
+                          unfinished.append(name)
+                          continue
+                      newest = max(runs, key=lambda run: (str(run.get("started_at") or ""), run.get("id") or 0))
+                      state = newest.get("conclusion") or newest.get("status") or "unknown"
+                      rows.append((name, state, newest.get("html_url") or ""))
+                      if newest.get("status") != "completed":
+                          refused.append(f"'{name}' is {state}")
+                          unfinished.append(name)
+                      elif newest.get("conclusion") != "success":
+                          refused.append(f"'{name}' is {state}")
+              except Unreadable as error:
+                  # Not an answer of the checks. Where the step waits, it asks many times, and one request
+                  # that failed is asked again until the wait is over. Without a wait it fails at once.
+                  remaining = deadline - time.monotonic()
+                  if not error.again or remaining <= 0:
+                      sys.exit(f"::error::Cannot read the checks of {sha}: {error}")
+                  print(f"Cannot read the checks of {sha} ({error}). Asking again.", flush=True)
+                  time.sleep(min(poll_seconds, remaining))
+                  continue
               # A check that finished without success is final: waiting for the others changes nothing.
               remaining = deadline - time.monotonic()
               if not unfinished or len(refused) > len(unfinished) or remaining <= 0:
@@ -500,6 +535,11 @@ jobs:
           for name, state, _ in rows:
               print(f"{name}: {state}")
           if refused:
+              # The checks answered, and the answer is no. A step that could not read them never gets
+              # here, so the output tells the two apart for the steps that follow.
+              if os.environ.get("GITHUB_OUTPUT"):
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("refused=true\n")
               # Only when the wait ran out: a check that failed ended it early.
               waited = f" after waiting {wait_minutes:g} minutes" if wait_minutes and len(refused) == len(unfinished) else ""
               print(f"::error title=The commit has not passed its checks::{sha[:7]}: {'; '.join(refused)}{waited}. "
@@ -507,8 +547,8 @@ jobs:
               sys.exit(1)
           CHECKS
 
-      # The version is the tag without its v: X.Y.Z, or X.Y.Z-preview.N with
-      # the code of a preview, below the release of X.Y.Z.
+      # The version is the tag without its v: X.Y.Z, or X.Y.0-preview.N with
+      # the code of a preview, below the release of X.Y.0.
       - name: Compute the versionCode
         id: code
         uses: asleep-ai/actions/release-version@android-ci/v1
@@ -532,7 +572,7 @@ jobs:
     with:
       runs-on: ${{ needs.plan.outputs.runs-on || (startsWith(inputs.fallback-runs-on, '[') && inputs.fallback-runs-on) || toJSON(inputs.fallback-runs-on || 'ubuntu-latest') }}
       attempt: primary
-      kind: release
+      kind: ${{ needs.plan.outputs.preview == 'true' && 'preview' || 'release' }}
       environment: ${{ inputs.environment }}
       ref: refs/tags/${{ needs.plan.outputs.tag }}
       sha: ${{ needs.plan.outputs.sha }}
@@ -571,7 +611,7 @@ jobs:
     with:
       runs-on: ${{ (startsWith(inputs.fallback-runs-on, '[') && inputs.fallback-runs-on) || toJSON(inputs.fallback-runs-on || 'ubuntu-latest') }}
       attempt: fallback
-      kind: release
+      kind: ${{ needs.plan.outputs.preview == 'true' && 'preview' || 'release' }}
       environment: ${{ inputs.environment }}
       ref: refs/tags/${{ needs.plan.outputs.tag }}
       sha: ${{ needs.plan.outputs.sha }}
@@ -728,7 +768,7 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
           VERSION_CODE: ${{ needs.plan.outputs.version-code }}
           LATEST: ${{ needs.plan.outputs.latest }}
-          KIND: ${{ needs.plan.outputs.kind }}
+          KIND: ${{ needs.plan.outputs.preview == 'true' && 'preview' || 'release' }}
           EXISTS: ${{ steps.release.outputs.exists }}
           APK_DIRECTORY: ${{ runner.temp }}/android-release-apk
           NOTES_FILE: ${{ runner.temp }}/android-release-notes.md

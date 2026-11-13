@@ -4,11 +4,12 @@ name: Release
 # version-bump.yml starts this workflow for the tag it pushed; a tag pushed by
 # a person starts it through the push trigger. Either way the tag is built
 # only when its commit is on a release branch and passed the pull request
-# check.
+# check and the QA build of its push (`pr-check / result`, `qa / built`).
 #
-# A tag vX.Y.Z-preview.N is a preview of the version X.Y.Z: the same build,
-# published as a GitHub pre-release. No other tag starts this workflow, the
-# rolling tags of the QA builds (qa-...) included.
+# A tag vX.Y.0-preview.N is a preview of the new minor or major version
+# X.Y.0: the same build, published as a GitHub pre-release. A preview tag of
+# a patch release starts a run that refuses it with the reason. No other tag
+# starts this workflow, the rolling tags of the QA builds (qa-...) included.
 on:
   push:
     tags:

@@ -42,7 +42,10 @@ on:
         required: false
         type: string
         default: ''
-      release-build-skip-push-branches:
+      release-build-on-push:
+        required: true
+        type: boolean
+      source-branch:
         required: false
         type: string
         default: ''
@@ -224,13 +227,20 @@ jobs:
       # was built and tested. A build skipped for a documentation-only push
       # would pass a commit whose predecessor failed, was cancelled or never
       # ran.
+      #
+      # One build of a push is left to another workflow: the release build of
+      # a push to the source branch or to release/<major>.x, which
+      # android-qa.yml makes of the same commit, cold and signed, and reports
+      # as a check of its own that a release requires as well
+      # (QA_SOURCE_BRANCH, set in the release-build job only). The verify job
+      # builds every push.
       - name: Decide whether to build
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           PATHS_IGNORE: ${{ inputs.paths-ignore }}
-          SKIP_PUSH_BRANCHES: ''
+          QA_SOURCE_BRANCH: ''
         run: |
           set -euo pipefail
           python3 - <<'PLAN'
@@ -241,7 +251,9 @@ jobs:
           event = os.environ["EVENT_NAME"]
           ref = os.environ["REF"]
           ignored = [line.strip() for line in os.environ.get("PATHS_IGNORE", "").splitlines() if line.strip()]
-          skipped_branches = os.environ.get("SKIP_PUSH_BRANCHES", "").replace(",", " ").split()
+          # The source branch, when the pushes to it and to the maintenance branches are built by
+          # android-qa.yml instead of by this job; empty when this job builds every push.
+          qa_source_branch = os.environ.get("QA_SOURCE_BRANCH", "").strip()
 
 
           def git(*args):
@@ -281,10 +293,13 @@ jobs:
 
 
           build, reason = decide()
-          if build and event == "push":
-              for branch in skipped_branches:
-                  if ref == "refs/heads/" + branch:
-                      build, reason = False, f"this build is skipped on a push to {branch}"
+          if build and event == "push" and qa_source_branch and ref.startswith("refs/heads/"):
+              # The branches android-qa.yml builds: the source branch and release/<major>.x, nothing else.
+              branch = ref[len("refs/heads/"):]
+              if branch == qa_source_branch or re.fullmatch(r"release/(0|[1-9][0-9]*)\.x", branch):
+                  build = False
+                  reason = (f"the release variant of a push to {branch} is built by the QA build of the same push "
+                            "(android-qa.yml), and a release requires the check of that build next to this one")
           print(f"build={str(build).lower()}: {reason}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"build={str(build).lower()}\n")
@@ -448,6 +463,13 @@ jobs:
   # Builds the release variant so R8, resource shrinking and keep-rule
   # breakage surface on the pull request. The APK is signed with the throwaway
   # key and discarded.
+  #
+  # On a push to the source branch or to a maintenance branch the build is
+  # skipped unless release-build-on-push is set: android-qa.yml builds the
+  # release variant of that very commit with the release key, and its check
+  # ("qa / built") is required by a release next to the check of this
+  # workflow. The job still runs and reports pass, as for a pull request that
+  # changed documentation only.
   release-build:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: ${{ inputs.release-build-timeout-minutes }}
@@ -479,7 +501,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           PATHS_IGNORE: ${{ inputs.paths-ignore }}
-          SKIP_PUSH_BRANCHES: ${{ inputs.release-build-skip-push-branches }}
+          QA_SOURCE_BRANCH: ${{ !inputs.release-build-on-push && (inputs.source-branch || github.event.repository.default_branch) || '' }}
         run: |
           set -euo pipefail
           python3 - <<'PLAN'
@@ -490,7 +512,9 @@ jobs:
           event = os.environ["EVENT_NAME"]
           ref = os.environ["REF"]
           ignored = [line.strip() for line in os.environ.get("PATHS_IGNORE", "").splitlines() if line.strip()]
-          skipped_branches = os.environ.get("SKIP_PUSH_BRANCHES", "").replace(",", " ").split()
+          # The source branch, when the pushes to it and to the maintenance branches are built by
+          # android-qa.yml instead of by this job; empty when this job builds every push.
+          qa_source_branch = os.environ.get("QA_SOURCE_BRANCH", "").strip()
 
 
           def git(*args):
@@ -530,10 +554,13 @@ jobs:
 
 
           build, reason = decide()
-          if build and event == "push":
-              for branch in skipped_branches:
-                  if ref == "refs/heads/" + branch:
-                      build, reason = False, f"this build is skipped on a push to {branch}"
+          if build and event == "push" and qa_source_branch and ref.startswith("refs/heads/"):
+              # The branches android-qa.yml builds: the source branch and release/<major>.x, nothing else.
+              branch = ref[len("refs/heads/"):]
+              if branch == qa_source_branch or re.fullmatch(r"release/(0|[1-9][0-9]*)\.x", branch):
+                  build = False
+                  reason = (f"the release variant of a push to {branch} is built by the QA build of the same push "
+                            "(android-qa.yml), and a release requires the check of that build next to this one")
           print(f"build={str(build).lower()}: {reason}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"build={str(build).lower()}\n")
