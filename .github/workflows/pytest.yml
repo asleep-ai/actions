@@ -3,10 +3,14 @@ name: pytest
 on:
   pull_request:
     paths:
+      - '.github/workflows/pytest.yml'
+      - 'android-signing/**'
       - 'release-notes/**'
   push:
     branches: [main]
     paths:
+      - '.github/workflows/pytest.yml'
+      - 'android-signing/**'
       - 'release-notes/**'
 
 permissions:
@@ -27,3 +31,46 @@ jobs:
       # tests stub the network and never call OpenAI, so the version is unpinned.
       - name: Run tests
         run: uv run --with pytest --with openai python -m pytest release-notes -q
+
+      # The runner image has an Android SDK and a JDK, so the test that signs
+      # and verifies a real APK must run here, not skip.
+      - name: Run android-signing tests
+        env:
+          ANDROID_SIGNING_INTEGRATION: '1'
+        run: uv run --with pytest python -m pytest android-signing -q
+
+      # Load the action the way a caller does: an action.yml GitHub cannot load
+      # passes actionlint and the unit tests. The value is not a keystore; decode
+      # only writes the bytes it is given.
+      - name: Run android-signing decode
+        id: decode
+        uses: ./android-signing
+        with:
+          operation: decode
+          keystore-base64: bm90IGEga2V5c3RvcmU=
+
+      - name: Check the decoded file
+        env:
+          KEYSTORE_FILE: ${{ steps.decode.outputs.keystore-file }}
+        run: |
+          set -euo pipefail
+          echo "keystore-file=$KEYSTORE_FILE"
+          [[ "$KEYSTORE_FILE" == "$RUNNER_TEMP/release.jks" ]]
+          [[ "$(cat "$KEYSTORE_FILE")" == "not a keystore" ]]
+          echo "KEY_PASSWORD=not-a-secret" > "$RUNNER_TEMP/local.properties"
+
+      - name: Run android-signing cleanup
+        if: ${{ always() }}
+        uses: ./android-signing
+        with:
+          operation: cleanup
+          keystore-file: ${{ steps.decode.outputs.keystore-file }}
+          paths: |
+            ${{ runner.temp }}/local.properties
+            ${{ runner.temp }}/no-such-file
+
+      - name: Check the files are gone
+        run: |
+          set -euo pipefail
+          [[ ! -e "$RUNNER_TEMP/release.jks" ]]
+          [[ ! -e "$RUNNER_TEMP/local.properties" ]]

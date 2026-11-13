@@ -1,0 +1,63 @@
+name: android-signing
+description: >-
+  Keystore and signature steps of a signed Android build: decode the keystore
+  into the runner's temp directory, verify a signed APK with apksigner, and
+  delete the keystore and other secret files afterwards.
+
+inputs:
+  operation:
+    description: 'What to do: decode, verify or cleanup.'
+    required: true
+  keystore-base64:
+    description: >-
+      For decode. The keystore, base64-encoded; line breaks are ignored. An
+      empty value fails the step.
+    required: false
+    default: ''
+  apk-file:
+    description: For verify. Path of the signed APK.
+    required: false
+    default: ''
+  expected-cert-sha256:
+    description: >-
+      For verify, optional. SHA-256 digest of the expected signer certificate,
+      as hex with or without colons, in any case. Several digests may be
+      given, separated by whitespace or commas; every signer certificate of
+      the APK must then be one of them. When empty, only the validity of the
+      signature is checked.
+    required: false
+    default: ''
+  keystore-file:
+    description: >-
+      For cleanup. The keystore to delete, normally the keystore-file output
+      of the decode step. When empty, the path decode writes to is used.
+    required: false
+    default: ''
+  paths:
+    description: >-
+      For cleanup. Newline-separated files to delete besides the keystore,
+      such as local.properties. Relative paths are resolved against the step's
+      working directory. Files that do not exist are ignored; directories are
+      refused.
+    required: false
+    default: ''
+
+outputs:
+  keystore-file:
+    description: For decode. Absolute path of the decoded keystore.
+    value: ${{ steps.signing.outputs.keystore-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Run the signing operation
+      id: signing
+      shell: bash
+      env:
+        OPERATION: ${{ inputs.operation }}
+        KEYSTORE_BASE64: ${{ inputs.keystore-base64 }}
+        APK_FILE: ${{ inputs.apk-file }}
+        EXPECTED_CERT_SHA256: ${{ inputs.expected-cert-sha256 }}
+        KEYSTORE_FILE: ${{ inputs.keystore-file }}
+        CLEANUP_PATHS: ${{ inputs.paths }}
+      run: python3 "$GITHUB_ACTION_PATH/signing.py"
