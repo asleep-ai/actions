@@ -4,10 +4,12 @@ Composite action for repositories whose versions are git tags. One input, `opera
 
 | operation | what it does |
 |-----------|--------------|
-| `next` (default) | Resolves the commit to release, finds the last release it builds on, computes the next version, checks that it can be released and lists the pull requests it adds. |
-| `code` | Computes the Android versionCode of a release or of a QA build. |
+| `next` (default) | Resolves the commit to release, finds the last release it builds on, computes the next version, checks that it can be released and lists the pull requests it adds. With `prerelease`, plans a preview of that version instead. |
+| `code` | Computes the Android versionCode of a release, of a preview or of a QA build. |
+| `qa` | Plans a QA build of a branch head: the version it leads up to, its version name and versionCode, and the tag of the rolling pre-release it is published as. |
+| `changes` | Lists what a commit adds to the commit a tag names, such as the QA build before it. |
 
-The action reads and computes. It creates no tag and pushes nothing; [`android-version-bump.yml`](../android-ci/README.md#android-version-bumpyml) is the workflow that does, with this action's outputs.
+The action reads and computes. It creates no tag and pushes nothing; [`android-version-bump.yml`](../android-ci/README.md#android-version-bumpyml) and [`android-qa.yml`](../android-ci/README.md#android-qayml) are the workflows that do, with this action's outputs.
 
 ## Usage
 
@@ -53,16 +55,22 @@ The `release-version/v1` tag does not exist until the first release; pin a full 
 
 | name | used by | default | description |
 |------|---------|---------|-------------|
-| `operation` | all | `next` | `next` or `code`. |
+| `operation` | all | `next` | `next`, `code`, `qa` or `changes`. |
 | `pr` | `next` | `''` | Number of a merged pull request; its merge commit is released. Exactly one of `pr` and `sha` is given. |
-| `sha` | `next` | `''` | The exception to `pr`: id of the commit to release, 7 or more hex digits. |
+| `sha` | `next`, `qa`, `changes` | `''` | For `next`, the exception to `pr`: id of the commit to release, 7 or more hex digits. For `qa` and `changes`: id of the commit that is built. |
 | `bump` | `next` | `patch` | Which part of the last version to raise: `patch`, `minor` or `major`. The parts below it become 0. Not read when `version` is given. |
-| `source-branch` | `next` | `''` | Optional. The branch releases are normally cut from. When given, the commit has to be on the branch of its release line. See [Release lines](#release-lines). |
+| `prerelease` | `next` | `''` | Optional. Empty plans the release. `preview` plans a preview of the same version. See [A preview](#a-preview). |
+| `source-branch` | `next`, `qa` | `''` | For `next`, optional: the branch releases are normally cut from. When given, the commit has to be on the branch of its release line. See [Release lines](#release-lines). For `qa`, required. |
 | `tag-prefix` | all | `v` | What a release tag starts with, before `X.Y.Z`. Letters, digits and `. _ / -`, not starting with `-`; may be empty. |
 | `token` | `next` with `pr` | `github.token` | Token that can read the pull request (`pull-requests: read`). |
-| `version` | `code`, `next` | `''` | For `code`: the version, as `X.Y.Z` or as its tag. For `next`, optional: the exact version to release instead of a bump. See [An exact version](#an-exact-version). |
-| `kind` | `code` | `release` | `release`, or `qa` for a QA build made after the release named by `version`. |
-| `qa-sequence` | `code` with `qa` | `''` | Number of the QA build, 1 or higher. A later build has a higher number. |
+| `version` | `code`, `next`, `qa` | `''` | For `code`: the version, as `X.Y.Z` or as its tag; with `kind: preview`, as `X.Y.Z-preview.N`. For `next`, optional: the exact version to release instead of a bump. See [An exact version](#an-exact-version). For `qa`, optional: the version of this one build. |
+| `kind` | `code` | `release` | `release`, `preview`, or `qa` for a QA build of the minor version of `version`. |
+| `qa-sequence` | `code` with `qa`, `qa` | `''` | Number of the QA build, 1 or higher. A later build has a higher number. |
+| `qa-sequence-offset` | `qa` | `''` | Optional whole number added to `qa-sequence`; may be negative. |
+| `ref` | `qa` | `''` | The full ref the build was started for, `refs/heads/<branch>`. |
+| `next-version` | `qa` | `''` | Optional. The version the branch is heading for, used while it is higher than the last release and not released. |
+| `label` | `qa` | `''` | Optional. Names a build apart from the rolling build of its branch. |
+| `since` | `changes` | `''` | Name of the tag that marks the earlier build. It need not exist. |
 
 Inputs reach the script as environment variables, never through shell interpolation.
 
@@ -70,20 +78,29 @@ Inputs reach the script as environment variables, never through shell interpolat
 
 | name | set by | description |
 |------|--------|-------------|
-| `version` | all | The version as `X.Y.Z`. For `next`, the next version. |
-| `tag` | `next` | The tag of the next version, `<tag-prefix>X.Y.Z`. |
-| `previous-tag` | `next` | The last release the commit contains. Empty when the repository has no release tag. |
-| `target-sha` | `next` | Full id of the commit to release. |
-| `branch` | `next` with `source-branch` | The branch of the release line: the source branch or `release/<major>.x`. |
-| `prs` | `next` | Markdown list of what the release adds, oldest first. |
-| `version-code` | all | The Android versionCode of `version`. |
+| `version` | `next`, `code`, `qa` | The version as `X.Y.Z`. For `next`, the next version, or `X.Y.Z-preview.N` with `prerelease`. For `qa`, the version the build leads up to. |
+| `tag` | `next` | The tag of the next version, `<tag-prefix>X.Y.Z`, or of the preview, `<tag-prefix>X.Y.Z-preview.N`. |
+| `previous-tag` | `next`, `qa` | The last release the commit contains. Empty when it contains none. |
+| `previous-prerelease-tag` | `next` with `prerelease` | The preview of the same version before this one. Empty for the first. |
+| `notice` | `next` | A sentence for the person who releases, when the plan is allowed and has a consequence. Empty otherwise. |
+| `target-sha` | `next`, `qa`, `changes` | Full id of the commit. |
+| `branch` | `next` with `source-branch`, `qa` | The branch of the release line: the source branch or `release/<major>.x`. |
+| `prs` | `next`, `changes` | Markdown list of what the commit adds, oldest first. |
+| `version-code` | `next`, `code`, `qa` | The Android versionCode of the version or build. |
+| `version-name` | `qa` | The versionName of the build, `<version>-<line or label>.<N>`. |
+| `sequence` | `qa` | `N`: `qa-sequence` plus `qa-sequence-offset`. |
+| `line` | `qa` | The branch as it appears in names, slashes as hyphens. |
+| `release-tag` | `qa` | The tag of the rolling pre-release, `qa-<line>` or `qa-<line>-<label>`. |
+| `since` | `changes` | What the list starts at: a commit id, a release tag, or empty for the whole history. |
+| `stale` | `changes` | `true` when the `since` tag names a later commit that contains this one. |
+| `unchanged` | `changes` | `true` when the `since` tag names this very commit. |
 
 ## next
 
 ### The last release
 
 - The last release is the highest `<tag-prefix>X.Y.Z` among the tags **the commit contains**, compared as numbers: `v1.10.0` is above `v1.9.3`. It is not the newest tag, not the nearest one in the history, and not the highest tag of the repository: a commit on a maintenance branch does not contain the releases the main line made after the two parted.
-- Only tags of exactly that form are releases. A tag with a suffix (`v1.2.3-rc.1`, `v1.11.2-test.84`), a floating tag (`v1`), a number with a leading zero and a tag with another prefix are ignored.
+- Only tags of exactly that form are releases. A tag with a suffix (`v1.2.3-preview.1`, `v1.11.2-test.84`), a floating tag (`v1`), the rolling tag of a QA build (`qa-develop`), a number with a leading zero and a tag with another prefix are ignored. Previews and QA builds therefore never change which version comes next.
 - A repository without any release tag counts from `0.0.0`: `patch` gives `0.0.1`, `minor` `0.1.0`, `major` `1.0.0`.
 
 ### The commit to release
@@ -98,6 +115,18 @@ Inputs reach the script as environment variables, never through shell interpolat
 
 - The version has to be higher than the last release the commit contains, and its tag must not exist.
 - Every other rule applies as to a computed version: the release line, the branch, the commit that has to add something, and the versionCode limits. On `release/1.x` only a 1.x version passes.
+
+### A preview
+
+`prerelease: preview` plans a preview of the next version instead of its release. The version is computed and checked exactly as without it, by `bump` or `version` and under every rule below. Then:
+
+- The tag is `<tag-prefix>X.Y.Z-preview.N`, and `version` is `X.Y.Z-preview.N`. `N` is one above the highest preview tag of `X.Y.Z` in the repository, and 1 for the first.
+- The commit has to contain the last preview of that version and must not be its commit: a preview builds on the one before it. `previous-prerelease-tag` names it, and `prs` then lists what the commit adds to it. `previous-tag` stays the last release.
+- `version-code` is the code of a preview, between the QA builds and the releases of the minor version ([code](#code)).
+- When the minor version already has a release (a preview of a patch release), the code is below that release. The plan is allowed, and `notice` says that the preview does not install over it; the action also prints the sentence as a warning.
+- `preview` is the only value. Any other is refused.
+
+The release of the version is planned without `prerelease`, as if its previews did not exist.
 
 ### Release lines
 
@@ -130,7 +159,8 @@ The step fails, with an `::error::` annotation that names the rule, when:
 - `version` is not of the form `X.Y.Z`, is tagged already, or is not higher than the last release the commit contains;
 - with `source-branch`: the commit is not in the first-parent history of the branch of its release line, or that branch has released a higher version after the commit;
 - the checkout is shallow, so tags or history may be missing;
-- the next version has no versionCode under the formula below.
+- the next version has no versionCode under the formula below;
+- with `prerelease`: the value is not `preview`, the commit is the commit of the last preview of the version, or it does not contain that preview.
 
 ### The pull request list
 
@@ -147,29 +177,65 @@ The list is read from git alone. It is what the history says, not what the GitHu
 
 The formula lives in [`version_code.py`](./version_code.py), and nothing else computes a versionCode:
 
-| build | versionCode |
-|-------|-------------|
-| release `X.Y.Z` | `X × 100000000 + Y × 100000 + 50000 + Z` |
-| QA build `N` after a release of `X.Y` | `X × 100000000 + Y × 100000 + N` |
+| build | `kind` | versionCode |
+|-------|--------|-------------|
+| release `X.Y.Z` | `release` | `X × 100000000 + Y × 100000 + 50000 + Z` |
+| preview `N` of `X.Y.Z` | `preview`, with `version: X.Y.Z-preview.N` | `X × 100000000 + Y × 100000 + 40000 + N` |
+| QA build `N` of the minor version `X.Y` | `qa`, with `qa-sequence: N` | `X × 100000000 + Y × 100000 + N` |
 
 Android installs an APK over an installed one only when its versionCode is not lower. Within one minor version the formula gives this order:
 
 - a release is higher than every earlier release;
-- every QA build is lower than every release, so a release installs over a QA build and a QA build never installs over a release;
-- a later QA build is higher than an earlier one.
+- every QA build is lower than every preview, and every preview lower than every release. A preview installs over a QA build and a release over both, never the other way round;
+- a later QA build is higher than an earlier one, and a later preview of a version higher than an earlier one.
 
-A QA build is numbered from the last release tag. After `X.Y.0` is released, QA builds are in the block of `X.Y` and above the releases of the minor version before it.
+A QA build is numbered in the block of the version it leads up to, the next release of its line. The number of a preview counts within its version `X.Y.Z` and the code within the minor version, so a preview of a patch release is below the releases that minor version already has.
 
-Across [release lines](#release-lines), each major version has a block of 100000000 codes. A release is higher than the earlier releases of its own line, and every code of a line, QA builds included, is below every code of the next major. A maintenance release made after the next major exists has a lower code than that major, so it never installs over it.
+Across [release lines](#release-lines), each major version has a block of 100000000 codes. A release is higher than the earlier releases of its own line, and every code of a line, QA builds and previews included, is below every code of the next major. A maintenance release made after the next major exists has a lower code than that major, so it never installs over it.
 
-Limits: `X` up to 20, `Y` up to 999, `Z` and `N` up to 49999, so that no code exceeds 2100000000. A value outside them fails the step.
+Limits: `X` up to 20, `Y` up to 999, `Z` up to 49999, the `N` of a QA build up to 39999 and the `N` of a preview up to 9999, so that no code exceeds 2100000000 and no kind reaches the range of the next. A value outside them fails the step.
 
 To change the formula, change `version_code.py` and `test_version_code.py`. The tests state the order the codes have to keep and the codes the calling apps have already shipped.
+
+## qa
+
+Plans a QA build for [`android-qa.yml`](../android-ci/README.md#android-qayml), whose README describes the rules from the caller's side.
+
+```yaml
+      - id: qa
+        uses: asleep-ai/actions/release-version@release-version/v1
+        with:
+          operation: qa
+          ref: ${{ github.ref }}
+          sha: ${{ github.sha }}
+          source-branch: develop
+          qa-sequence: ${{ github.run_number }}
+```
+
+- **The branch.** `ref` has to be `refs/heads/<source-branch>` or `refs/heads/release/<major>.x`. Any other ref, a tag or a pull request ref included, is refused with an error that names it. The commit has to be in the first-parent history of that branch.
+- **The version** is the next release of the branch's line:
+  - on the source branch, the last release the commit contains raised by patch, or the next major once `release/<major>.x` exists for the major of that release;
+  - on `release/<major>.x`, the last release of that major raised by patch, or `<major>.0.0` when the commit contains none;
+  - `0.0.1` when the commit contains no release at all.
+- **`next-version`** replaces that version while it can be the next release of the branch: higher than the last release the commit contains, not tagged, and of the branch's line. Otherwise it is not used, and the log says why. It never fails the step, so a value that a release has overtaken can stay in the calling file.
+- **`version`** replaces it for one build, under the same three conditions, and is refused when one does not hold.
+- **The number** is `qa-sequence` plus `qa-sequence-offset`, 1 to 39999.
+- **The outputs**: `version-name` is `<version>-<line>.<N>`, or `<version>-<label>.<N>` with `label`; `version-code` is the code of QA build `N` of the version's minor version; `release-tag` is `qa-<line>`, or `qa-<line>-<label>`. A `label` is lowercase letters, digits and single hyphens, at most 40 characters, and not the name of the line or of a prerelease kind.
+- **An older build is refused**: when the tag `release-tag` names a later commit of the branch that contains this one.
+
+## changes
+
+Lists what the commit `sha` adds to the commit the tag `since` names, in the form of [the pull request list](#the-pull-request-list).
+
+- When the tag exists and its commit is in the history of `sha`, the list starts there, and `since` is that commit's id.
+- When the tag names `sha` itself, `unchanged` is `true` and the list is empty.
+- When the tag names a later commit that contains `sha`, `stale` is `true` and the list is empty: the caller decides what an older build means.
+- Otherwise (no such tag, or a tag on a history the commit does not have) the list starts at the last release the commit contains, and `since` is that tag, or empty when there is none and the list covers the whole history.
 
 ## Requirements
 
 - `python3` 3.9 or newer and `git` on `PATH`. GitHub-hosted runners provide both.
-- For `next`: a checkout with `fetch-depth: 0`.
+- For `next`, `qa` and `changes`: a checkout with `fetch-depth: 0`.
 
 ## Development
 

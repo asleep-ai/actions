@@ -28,7 +28,32 @@ next  Resolve the commit to release, find the last release it builds on,
       The pull requests between the two are listed from the first-parent
       history, read from the commit subjects.
 
-code  The versionCode of a release or of a QA build, from version_code.py.
+      With prerelease (preview), the same version is planned and checked, and
+      the tag is <prefix>X.Y.Z-preview.N instead, N being one above the
+      previews of X.Y.Z that are tagged already. The commit has to contain
+      the last of them and add something to it.
+
+code  The versionCode of a release, of a preview or of a QA build, from
+      version_code.py.
+
+qa    Plan a QA build of a branch head: the version it leads up to, its
+      version name <version>-<line or label>.<number> and its versionCode.
+      - Only the source branch and the maintenance branches release/<major>.x
+        are built, and only a commit in their first-parent history.
+      - The version is the next release of the line: the last release the
+        commit contains, raised by patch. On the source branch it is the next
+        major instead once the last release has a maintenance branch, and on
+        a maintenance branch without a release of its major, <major>.0.0.
+        next-version names a later version the branch is heading for; it is
+        used while it is higher than the last release. version names the
+        version of this one build and is refused when it cannot be.
+      - The number is qa-sequence plus qa-sequence-offset.
+
+changes
+      What a commit adds to the commit a tag names (the previous build of a
+      rolling QA release), as the pull request list of next. When the tag
+      does not exist or is not part of the commit's history, the list starts
+      at the last release the commit contains.
 
 Anything that cannot be decided fails the step: a release is not planned on a
 guess.
@@ -48,13 +73,22 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional
 
-from version_code import VersionCodeError, qa_code, release_code
+from version_code import VersionCodeError, preview_code, qa_code, release_code
 
 BUMPS = ("patch", "minor", "major")
-KINDS = ("release", "qa")
+KINDS = ("release", "preview", "qa")
+# The kinds of prerelease a version can be tagged as before it is released. Each needs a range of
+# versionCodes in version_code.py; preview is the only one that has one.
+PRERELEASES = ("preview",)
 # A leading zero is not a version number: v01.2.3 and v1.2.3 would be the same release.
 NUMBER = r"(0|[1-9][0-9]*)"
 VERSION = re.compile(rf"{NUMBER}\.{NUMBER}\.{NUMBER}")
+# X.Y.Z-preview.N. The number starts at 1.
+PRERELEASE = re.compile(rf"(?P<version>{NUMBER}\.{NUMBER}\.{NUMBER})-(?P<kind>[a-z]+)\.(?P<number>[1-9][0-9]*)")
+# What a QA build can be labelled with: it becomes part of a version name and of a tag name.
+LABEL = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
+MAX_LABEL = 40
+MAINTENANCE = re.compile(r"release/(?P<major>0|[1-9][0-9]*)\.x")
 # Characters git allows in a ref name and that need no quoting anywhere a tag is used. Not a leading
 # hyphen: git would read such a tag as an option.
 TAG_PREFIX = re.compile(r"([A-Za-z0-9._/][A-Za-z0-9._/-]*)?")
@@ -76,13 +110,37 @@ class Failure(Exception):
 
 @dataclass(frozen=True)
 class Plan:
-    version: str
+    version: str  # X.Y.Z, or X.Y.Z-preview.N for a prerelease
     tag: str
     previous_tag: str  # empty when the repository has no release tag
     target_sha: str
     prs: str  # markdown list
     version_code: int
     branch: str  # the branch of the release line; empty when no source branch was given
+    previous_prerelease_tag: str = ""  # the prerelease of the same version before this one, when there is one
+    notice: str = ""  # something the person who releases should read; not a refusal
+
+
+@dataclass(frozen=True)
+class QaPlan:
+    version: str  # the version the build leads up to, X.Y.Z
+    version_name: str
+    version_code: int
+    sequence: int
+    line: str  # the branch as it appears in names: develop, release-1.x
+    release_tag: str  # the tag of the rolling pre-release the build is published as
+    previous_tag: str  # the last release the commit contains
+    branch: str
+    target_sha: str
+    why: str  # where the version comes from, for the log
+
+
+@dataclass(frozen=True)
+class Changes:
+    since: str  # what the list starts at: a commit id, a release tag, or empty for the whole history
+    prs: str
+    stale: bool  # the tag names a later commit that contains this one
+    unchanged: bool  # the tag names this very commit
 
 
 def escape(text: str) -> str:
@@ -127,6 +185,21 @@ def release_versions(prefix: str, merged_into: Optional[str] = None) -> list:
             if match:
                 versions.append(tuple(int(part) for part in match.groups()))
     return versions
+
+
+def prerelease_numbers(prefix: str, version: tuple, kind: str) -> list:
+    """The numbers N of the tags <prefix>X.Y.Z-<kind>.N of one version, anywhere in the repository."""
+    numbers = []
+    for name in git("tag", "--list").stdout.splitlines():
+        match = PRERELEASE.fullmatch(name[len(prefix):]) if name.startswith(prefix) else None
+        if match and match["kind"] == kind and parse_version(match["version"]) == version:
+            numbers.append(int(match["number"]))
+    return numbers
+
+
+def contains(commit: str, ancestor: str) -> bool:
+    """Whether `ancestor` is in the history of `commit`, or is that commit."""
+    return git("merge-base", "--is-ancestor", ancestor, commit, check=False).returncode == 0
 
 
 def is_on(commit: str, tip: str) -> bool:
@@ -322,6 +395,10 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
         raise Failure("give exactly one of pr and sha")
     if not exact and bump not in BUMPS:
         raise Failure(f"bump must be one of {', '.join(BUMPS)}, got {bump!r}")
+    # A prerelease of the version instead of its release: the same plan, another tag.
+    prerelease = env.get("PRERELEASE", "").strip()
+    if prerelease and prerelease not in PRERELEASES:
+        raise Failure(f"prerelease must be empty or one of {', '.join(PRERELEASES)}, got {prerelease!r}")
     if not TAG_PREFIX.fullmatch(prefix):
         raise Failure(f"tag-prefix may hold only letters, digits and . _ / -, and not start with -, got {prefix!r}")
 
@@ -396,14 +473,229 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
                 f"{branch} has released {newer} after {what} ({target[:7]}), which builds on "
                 f"{previous_tag or 'no release'}. Release a commit that contains {newer}"
             )
+    if not prerelease:
+        return Plan(
+            version=format_version(version),
+            tag=tag,
+            previous_tag=previous_tag,
+            target_sha=target,
+            prs=pull_requests(previous_commit, target),
+            version_code=code,
+            branch=branch,
+        )
+
+    # The version passed every rule of a release. Its prerelease is numbered after the ones of the
+    # same version, and builds on the last of them the way a release builds on the one before it.
+    existing = prerelease_numbers(prefix, version, prerelease)
+    number = max(existing, default=0) + 1
+    name = f"{format_version(version)}-{prerelease}.{number}"
+    try:
+        code = preview_code(version[0], version[1], number)
+    except VersionCodeError as exc:
+        raise Failure(str(exc)) from None
+    since = previous_commit
+    last_tag = ""
+    if existing:
+        last_tag = f"{prefix}{format_version(version)}-{prerelease}.{max(existing)}"
+        last_commit = commit_of(last_tag)
+        if last_commit is None:
+            raise Failure(f"tag {last_tag} does not name a commit")
+        if last_commit == target:
+            raise Failure(f"{what} ({target[:7]}) is the commit of {last_tag}: there is nothing new to {prerelease}")
+        if not contains(target, last_commit):
+            raise Failure(
+                f"{what} ({target[:7]}) does not contain {last_tag}, the last {prerelease} of "
+                f"{format_version(version)}. A {prerelease} builds on the one before it: choose a commit that contains it"
+            )
+        since = last_commit
+    notice = ""
+    if previous and previous[:2] == version[:2]:
+        # The codes of a minor version: QA builds, then previews, then releases. A preview of a
+        # patch release is therefore below the release that is installed.
+        notice = (
+            f"{prefix}{name} (versionCode {code}) does not install over {previous_tag} (versionCode "
+            f"{release_code(*previous)}): within a minor version every preview is below every release. A device "
+            f"with {previous_tag} takes this preview only after an uninstall. Preview the next minor version "
+            "instead when it has to install over the release"
+        )
     return Plan(
-        version=format_version(version),
-        tag=tag,
+        version=name,
+        tag=prefix + name,
         previous_tag=previous_tag,
         target_sha=target,
-        prs=pull_requests(previous_commit, target),
+        prs=pull_requests(since, target),
         version_code=code,
         branch=branch,
+        previous_prerelease_tag=last_tag,
+        notice=notice,
+    )
+
+
+def qa_base(
+    branch: str, major: Optional[int], contained: list, everything: list, exact: str, hint: str, prefix: str
+) -> tuple:
+    """The version a QA build of `branch` leads up to, and where it comes from.
+
+    `major` is the major version of a maintenance branch, None on the source
+    branch. The source branch builds every major that has no maintenance
+    branch; a maintenance branch builds its own.
+    """
+    if major is None:
+        last = max(contained) if contained else None
+        moved_on = last is not None and commit_of(f"refs/remotes/origin/release/{last[0]}.x") is not None
+        if moved_on:
+            default = (last[0] + 1, 0, 0)
+            why = f"the next major: {prefix}{format_version(last)} is the last release, and release/{last[0]}.x has its line"
+        else:
+            default = bump_version(last or ZERO, "patch")
+            why = f"the patch after {prefix}{format_version(last)}" if last else "no release yet"
+
+        def refusal(version: tuple) -> str:
+            if commit_of(f"refs/remotes/origin/release/{version[0]}.x") is not None:
+                return f"major {version[0]} is built from release/{version[0]}.x"
+            return ""
+    else:
+        if contained and max(contained)[0] > major:
+            raise Failure(
+                f"{branch} contains {prefix}{format_version(max(contained))}, a release of a later major version. "
+                f"A maintenance branch holds the releases of major {major} and of the ones before it"
+            )
+        own = [version for version in contained if version[0] == major]
+        last = max(own) if own else None
+        default = bump_version(last, "patch") if last else (major, 0, 0)
+        why = f"the patch after {prefix}{format_version(last)}" if last else f"the first release of major {major}"
+
+        def refusal(version: tuple) -> str:
+            return "" if version[0] == major else f"{branch} builds major {major} only"
+
+    def usable(version: tuple) -> str:
+        """Why the version cannot be the next release of this branch; empty when it can."""
+        if version in everything:
+            return f"{prefix}{format_version(version)} is released already"
+        if last and version <= last:
+            return f"it is not higher than {prefix}{format_version(last)}, the last release the commit contains"
+        return refusal(version)
+
+    if exact:
+        version = parse_version(exact[len(prefix):] if prefix and exact.startswith(prefix) else exact)
+        problem = usable(version)
+        if problem:
+            raise Failure(f"version {format_version(version)} was given for this QA build, and {problem}")
+        return version, last, "given as version"
+    if hint:
+        version = parse_version(hint[len(prefix):] if prefix and hint.startswith(prefix) else hint)
+        problem = usable(version)
+        if not problem:
+            return version, last, "next-version"
+        why = f"{why}; next-version {format_version(version)} is not used: {problem}"
+    return default, last, why
+
+
+def changes_since(target: str, since_tag: str, prefix: str) -> Changes:
+    """What `target` adds to the commit `since_tag` names, or to its last release."""
+    earlier = commit_of(f"refs/tags/{since_tag}") if since_tag else None
+    if earlier == target:
+        return Changes(since=earlier, prs="", stale=False, unchanged=True)
+    if earlier and contains(target, earlier):
+        return Changes(since=earlier, prs=pull_requests(earlier, target), stale=False, unchanged=False)
+    if earlier and contains(earlier, target):
+        return Changes(since=earlier, prs="", stale=True, unchanged=False)
+    # No build before this one, or one of a history the branch no longer has.
+    contained = release_versions(prefix, merged_into=target)
+    if contained:
+        release = prefix + format_version(max(contained))
+        release_commit = commit_of(release)
+        if release_commit is None:
+            raise Failure(f"tag {release} does not name a commit")
+        return Changes(since=release, prs=pull_requests(release_commit, target), stale=False, unchanged=False)
+    return Changes(since="", prs=pull_requests(None, target), stale=False, unchanged=False)
+
+
+def whole_number(text: str, name: str, signed: bool = False) -> int:
+    if not re.fullmatch(r"-?[0-9]+" if signed else r"[0-9]+", text):
+        raise Failure(f"{name} must be a whole number, got {text!r}")
+    return int(text)
+
+
+def plan_qa(env: Mapping[str, str]) -> QaPlan:
+    ref = env.get("REF", "").strip()
+    sha = env.get("SHA", "").strip()
+    prefix = env.get("TAG_PREFIX", "")
+    source_branch = env.get("SOURCE_BRANCH", "").strip()
+    label = env.get("LABEL", "").strip()
+    if not TAG_PREFIX.fullmatch(prefix):
+        raise Failure(f"tag-prefix may hold only letters, digits and . _ / -, and not start with -, got {prefix!r}")
+    if not BRANCH.fullmatch(source_branch):
+        raise Failure(f"source-branch is not a branch name: {source_branch!r}")
+
+    # Only what was merged is built: the source branch and the maintenance branches.
+    branch = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ""
+    maintenance = MAINTENANCE.fullmatch(branch)
+    if not branch or (branch != source_branch and not maintenance):
+        raise Failure(
+            f"a QA build is built from {source_branch} or from a maintenance branch release/<major>.x, and this "
+            f"run was started for {ref or 'no ref'}. A QA build is signed with the release key, so it is built "
+            f"from code that was merged: merge the change into {source_branch} or the maintenance branch (the "
+            "push builds it), or start the run on one of them"
+        )
+    major = int(maintenance["major"]) if maintenance and branch != source_branch else None
+
+    if label:
+        if not LABEL.fullmatch(label) or len(label) > MAX_LABEL:
+            raise Failure(
+                f"label must be lowercase letters and digits in segments joined by single hyphens, at most "
+                f"{MAX_LABEL} characters (ble-test), got {label!r}"
+            )
+        line_name = branch.replace("/", "-")
+        if label in PRERELEASES or label == line_name:
+            raise Failure(f"label {label!r} is the name of another kind of build; choose another one")
+
+    if git("rev-parse", "--is-shallow-repository").stdout.strip() == "true":
+        raise Failure("the checkout is shallow, so tags and history are incomplete; check out with fetch-depth: 0")
+    target = named_commit(sha)
+    tip = commit_of(f"refs/remotes/origin/{branch}")
+    if tip is None:
+        raise Failure(f"branch {branch} is not in this checkout")
+    if not is_on(target, tip):
+        raise Failure(
+            f"the commit ({target[:7]}) is not a commit {branch} itself pointed at: the branch was moved since this "
+            "run started, or the commit came in through a merge. Start the run again for the branch as it is now"
+        )
+
+    everything = release_versions(prefix)
+    contained = release_versions(prefix, merged_into=target)
+    version, last, why = qa_base(
+        branch, major, contained, everything, env.get("VERSION", "").strip(), env.get("NEXT_VERSION", "").strip(), prefix
+    )
+
+    sequence = whole_number(env.get("QA_SEQUENCE", "").strip(), "qa-sequence")
+    sequence += whole_number(env.get("QA_SEQUENCE_OFFSET", "").strip() or "0", "qa-sequence-offset", signed=True)
+    try:
+        code = qa_code(version[0], version[1], sequence)
+    except VersionCodeError as exc:
+        raise Failure(str(exc)) from None
+
+    line = branch.replace("/", "-")
+    release_tag = f"qa-{line}" + (f"-{label}" if label else "")
+    # An older build does not replace a newer one: a run that was started again after a later commit
+    # of the branch was published.
+    published = commit_of(f"refs/tags/{release_tag}")
+    if published and published != target and contains(published, target):
+        raise Failure(
+            f"{release_tag} is at {published[:7]} already, a later commit of {branch} that contains {target[:7]}. "
+            "An older build does not replace a newer one"
+        )
+    return QaPlan(
+        version=format_version(version),
+        version_name=f"{format_version(version)}-{label or line}.{sequence}",
+        version_code=code,
+        sequence=sequence,
+        line=line,
+        release_tag=release_tag,
+        previous_tag=prefix + format_version(last) if last else "",
+        branch=branch,
+        target_sha=target,
+        why=why,
     )
 
 
@@ -426,18 +718,25 @@ def run_next(env: Mapping[str, str], fetch: Fetch) -> None:
     if env.get("VERSION", "").strip():
         print(f"version {plan.version} was given: bump ({env.get('BUMP', '').strip() or 'none'}) is ignored.")
     print(f"Last release the commit contains: {plan.previous_tag or 'none'}")
-    print(f"Next release: {plan.tag} (versionCode {plan.version_code}) at {plan.target_sha}")
+    if plan.previous_prerelease_tag:
+        print(f"Prerelease before this one: {plan.previous_prerelease_tag}")
+    kind = "prerelease" if env.get("PRERELEASE", "").strip() else "release"
+    print(f"Next {kind}: {plan.tag} (versionCode {plan.version_code}) at {plan.target_sha}")
     if plan.branch:
         print(f"Release line: {plan.branch}")
+    if plan.notice:
+        print(f"::warning title=release-version::{escape(plan.notice)}")
     print(plan.prs or "No commits listed.")
     write_outputs(env, {
         "version": plan.version,
         "tag": plan.tag,
         "previous-tag": plan.previous_tag,
+        "previous-prerelease-tag": plan.previous_prerelease_tag,
         "target-sha": plan.target_sha,
         "prs": plan.prs,
         "version-code": str(plan.version_code),
         "branch": plan.branch,
+        "notice": plan.notice,
     })
 
 
@@ -450,19 +749,77 @@ def run_code(env: Mapping[str, str]) -> None:
     # The version may be given as its tag.
     if prefix and text.startswith(prefix):
         text = text[len(prefix):]
-    version = parse_version(text)
     try:
-        if kind == "release":
-            code = release_code(*version)
+        if kind == "preview":
+            # The whole name, X.Y.Z-preview.N: the number is part of it.
+            match = PRERELEASE.fullmatch(text)
+            if not match or match["kind"] not in PRERELEASES:
+                raise Failure(f"{text!r} is not a prerelease of the form X.Y.Z-{PRERELEASES[0]}.N")
+            version = parse_version(match["version"])
+            name = text
+            code = preview_code(version[0], version[1], int(match["number"]))
         else:
-            sequence = env.get("QA_SEQUENCE", "").strip()
-            if not re.fullmatch(r"[0-9]+", sequence):
-                raise Failure(f"qa-sequence must be a whole number, got {sequence!r}")
-            code = qa_code(version[0], version[1], int(sequence))
+            version = parse_version(text)
+            name = format_version(version)
+            if kind == "release":
+                code = release_code(*version)
+            else:
+                sequence = whole_number(env.get("QA_SEQUENCE", "").strip(), "qa-sequence")
+                code = qa_code(version[0], version[1], sequence)
     except VersionCodeError as exc:
         raise Failure(str(exc)) from None
-    print(f"versionCode of {kind} {format_version(version)}: {code}")
-    write_outputs(env, {"version": format_version(version), "version-code": str(code)})
+    print(f"versionCode of {kind} {name}: {code}")
+    write_outputs(env, {"version": name, "version-code": str(code)})
+
+
+def run_qa(env: Mapping[str, str]) -> None:
+    plan = plan_qa(env)
+    print(f"Last release the commit contains: {plan.previous_tag or 'none'}")
+    print(f"QA build of {plan.branch} at {plan.target_sha}")
+    print(f"Version: {plan.version} ({plan.why})")
+    print(f"Version name: {plan.version_name} (versionCode {plan.version_code}, QA build {plan.sequence})")
+    print(f"Published as: {plan.release_tag}")
+    write_outputs(env, {
+        "version": plan.version,
+        "version-name": plan.version_name,
+        "version-code": str(plan.version_code),
+        "sequence": str(plan.sequence),
+        "line": plan.line,
+        "release-tag": plan.release_tag,
+        "previous-tag": plan.previous_tag,
+        "branch": plan.branch,
+        "target-sha": plan.target_sha,
+    })
+
+
+def run_changes(env: Mapping[str, str]) -> None:
+    prefix = env.get("TAG_PREFIX", "")
+    since_tag = env.get("SINCE", "").strip()
+    if not TAG_PREFIX.fullmatch(prefix):
+        raise Failure(f"tag-prefix may hold only letters, digits and . _ / -, and not start with -, got {prefix!r}")
+    if since_tag and not BRANCH.fullmatch(since_tag):
+        raise Failure(f"since is not a tag name: {since_tag!r}")
+    if git("rev-parse", "--is-shallow-repository").stdout.strip() == "true":
+        raise Failure("the checkout is shallow, so tags and history are incomplete; check out with fetch-depth: 0")
+    target = named_commit(env.get("SHA", "").strip())
+    changes = changes_since(target, since_tag, prefix)
+    if changes.stale:
+        print(f"{since_tag} is at {changes.since[:7]}, a later commit that contains {target[:7]}.")
+    elif changes.unchanged:
+        print(f"{since_tag} is at {target[:7]} already.")
+    else:
+        print(f"Changes of {target[:7]} since {changes.since or 'the first commit'}:")
+        print(changes.prs or "No commits listed.")
+    write_outputs(env, {
+        "target-sha": target,
+        "since": changes.since,
+        "prs": changes.prs,
+        "stale": "true" if changes.stale else "false",
+        "unchanged": "true" if changes.unchanged else "false",
+    })
+
+
+OPERATIONS = ("next", "code", "qa", "changes")
 
 
 def main(env: Mapping[str, str] = os.environ, fetch: Fetch = http_get) -> int:
@@ -472,8 +829,12 @@ def main(env: Mapping[str, str] = os.environ, fetch: Fetch = http_get) -> int:
             run_next(env, fetch)
         elif operation == "code":
             run_code(env)
+        elif operation == "qa":
+            run_qa(env)
+        elif operation == "changes":
+            run_changes(env)
         else:
-            raise Failure(f"operation must be next or code, got {operation!r}")
+            raise Failure(f"operation must be one of {', '.join(OPERATIONS)}, got {operation!r}")
     except Failure as exc:
         print(f"::error title=release-version::{escape(str(exc))}")
         return 1
