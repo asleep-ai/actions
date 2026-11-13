@@ -1,0 +1,43 @@
+name: gradle-log-verdict
+description: >-
+  Report how a Gradle job ended: pass, code (a failure of the change itself)
+  or infra (a failure of the environment), decided from step outcomes and the
+  Gradle log.
+
+inputs:
+  log-file:
+    description: >-
+      Path of the file the Gradle output was copied to, for example with tee
+      into the runner's temp directory. It is read only when the build step
+      failed; a missing file then gives infra, because the job failed before
+      Gradle wrote anything.
+    required: true
+  setup-outcome:
+    description: >-
+      Outcome of the steps that prepare the build (checkout, toolchain setup),
+      taken from the steps context. Several outcomes may be given, separated
+      by whitespace or commas. Any outcome other than success gives infra.
+    required: true
+  build-outcome:
+    description: >-
+      Outcome of the step that ran Gradle, taken from the steps context.
+      success and skipped give pass; failure and cancelled are decided from
+      the log.
+    required: true
+
+outputs:
+  verdict:
+    description: pass, code or infra.
+    value: ${{ steps.verdict.outputs.verdict }}
+
+runs:
+  using: composite
+  steps:
+    - name: Report the verdict
+      id: verdict
+      shell: bash
+      env:
+        LOG_FILE: ${{ inputs.log-file }}
+        SETUP_OUTCOME: ${{ inputs.setup-outcome }}
+        BUILD_OUTCOME: ${{ inputs.build-outcome }}
+      run: python3 "$GITHUB_ACTION_PATH/verdict.py"
