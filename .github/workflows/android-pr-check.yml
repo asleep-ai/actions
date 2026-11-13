@@ -51,9 +51,10 @@ on:
         description: >-
           Glob patterns, one per line. A change to a matching path makes the
           code-style job run pre-commit on every file instead of on the changed
-          files. The default is the list pre-commit-changed uses. Empty never
-          runs on every file, for a repository whose untouched files do not
-          pass its hooks yet.
+          files. The default is the list pre-commit-changed uses. Empty: a changed
+          path never switches to every file, for a repository whose untouched
+          files do not pass its hooks yet. A push whose previous commit cannot
+          be found is still checked on every file.
         required: false
         type: string
         default: |

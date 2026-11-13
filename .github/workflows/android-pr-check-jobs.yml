@@ -148,7 +148,7 @@ jobs:
 
       - name: Run pre-commit on the changed files
         id: pre-commit
-        uses: asleep-ai/actions/pre-commit-changed@android-ci/stage-2
+        uses: asleep-ai/actions/pre-commit-changed@android-ci/v1
         with:
           event-name: ${{ github.event_name }}
           base-sha: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -448,7 +448,7 @@ jobs:
       - name: Report the verdict
         id: verdict
         if: ${{ always() }}
-        uses: asleep-ai/actions/gradle-log-verdict@android-ci/stage-2
+        uses: asleep-ai/actions/gradle-log-verdict@android-ci/v1
         with:
           log-file: ${{ runner.temp }}/gradle.log
           setup-outcome: ${{ steps.checkout.outcome }}
@@ -694,7 +694,7 @@ jobs:
       - name: Report the verdict
         id: verdict
         if: ${{ always() }}
-        uses: asleep-ai/actions/gradle-log-verdict@android-ci/stage-2
+        uses: asleep-ai/actions/gradle-log-verdict@android-ci/v1
         with:
           log-file: ${{ runner.temp }}/gradle.log
           setup-outcome: ${{ steps.checkout.outcome }}

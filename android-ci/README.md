@@ -34,7 +34,7 @@ jobs:
       GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
 ```
 
-[`pr-check.yml.example`](./pr-check.yml.example) is a complete file. The `android-ci/v1` tag does not exist until the first release.
+[`pr-check.yml.example`](./pr-check.yml.example) is a complete file.
 
 - `permissions` must grant at least the two scopes above. A called workflow cannot be given more than its caller has, and GitHub refuses to start the run when one is missing.
 - Pass the two secrets by name. `secrets: inherit` works too, but it hands every secret of the calling repository to this workflow, signing keys included, when two are needed.
@@ -88,7 +88,7 @@ pick-runner ─▶ primary ─────────▶ fallback ────�
 | `java-version` | `17` | JDK version for the Gradle jobs. |
 | `java-distribution` | `temurin` | JDK distribution for `actions/setup-java`. |
 | `mise-version` | `2026.9.2` | Version of mise in the `code-style` job. |
-| `full-scan-paths` | the list of [`pre-commit-changed`](../pre-commit-changed/) | Glob patterns, one per line. A change to a matching path makes `code-style` run pre-commit on every file. Empty never does. See [Code style](#code-style). |
+| `full-scan-paths` | the list of [`pre-commit-changed`](../pre-commit-changed/) | Glob patterns, one per line. A change to a matching path makes `code-style` run pre-commit on every file. Empty: a changed path never switches the job to every file. pre-commit-changed still checks every file on a push whose previous commit it cannot find (a new branch, a force push). |
 | `verify-args` | `''` | Extra Gradle arguments for the `verify` job. |
 | `verify-signing-key` | `true` | Whether `verify` gets the throwaway signing key. See [local.properties](#localproperties). |
 | `release-build-args` | `''` | Extra Gradle arguments for the `release-build` job. |
@@ -184,10 +184,10 @@ What a self-hosted host carries from one job to the next is outside this workflo
 The same timeout applies on both kinds of runner, and the two differ widely: a self-hosted runner with a warm Gradle user home, and a GitHub-hosted runner that starts without one. The fallback run is close to a cold build, because the self-hosted runs save nothing to the Actions cache.
 
 - A job that hits its timeout on a self-hosted runner is re-run on the GitHub-hosted one.
-- A job that hits its timeout on the GitHub-hosted runner fails `result`. Size the two build timeouts for that run: about twice what a build without any cache takes there.
+- A job that hits its timeout on the GitHub-hosted runner fails `result`. Size the two build timeouts for that run: at least one and a half times what a build without any cache takes there.
 - The cost of a generous timeout is that a hung self-hosted job is noticed that much later.
 
-Measured cold builds on the GitHub-hosted runner (runs with `runner-labels` left out, November 2026): one calling repository took 40 minutes for `verify` and 28 for `release-build`, the other 6 and 19. The defaults are 60 minutes for `verify` and 45 for `release-build`. Measure again with your own repository before relying on them.
+Measured cold builds on the GitHub-hosted runner (runs with `runner-labels` left out, November 2026): one calling repository took 40 minutes for `verify` and 28 for `release-build`, the other 16 and 21 (dependencies refreshed and the build cache off). The defaults are 60 minutes for `verify` and 45 for `release-build`. Measure again with your own repository before relying on them.
 
 ### Skipped builds
 
