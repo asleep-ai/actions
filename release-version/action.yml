@@ -1,0 +1,96 @@
+name: release-version
+description: >-
+  Plan the next release of a repository whose versions are git tags: find the
+  last release tag, compute the next version, check the commit to release and
+  list the pull requests it adds. Also computes the versionCode of an Android
+  build.
+
+inputs:
+  operation:
+    description: >-
+      What to do: next (plan the next release) or code (compute a
+      versionCode).
+    required: false
+    default: next
+  pr:
+    description: >-
+      For next. Number of a merged pull request; its merge commit is released.
+      Exactly one of pr and sha is given.
+    required: false
+    default: ''
+  sha:
+    description: >-
+      For next, the exception to pr. Id of the commit to release, 7 or more
+      hex digits.
+    required: false
+    default: ''
+  bump:
+    description: 'For next. Which part of the last version to raise: patch, minor or major.'
+    required: false
+    default: patch
+  tag-prefix:
+    description: >-
+      What a release tag starts with, before X.Y.Z. Only tags of exactly
+      <prefix>X.Y.Z are release tags.
+    required: false
+    default: v
+  token:
+    description: >-
+      For next with pr. Token that can read the pull request (pull-requests:
+      read).
+    required: false
+    default: ${{ github.token }}
+  version:
+    description: 'For code. The version, as X.Y.Z or as its tag.'
+    required: false
+    default: ''
+  kind:
+    description: 'For code. release, or qa for a QA build made after the release named by version.'
+    required: false
+    default: release
+  qa-sequence:
+    description: >-
+      For code with kind qa. Number of the QA build, 1 or higher; a later
+      build has a higher number.
+    required: false
+    default: ''
+
+outputs:
+  version:
+    description: The version as X.Y.Z. For next, the next version.
+    value: ${{ steps.version.outputs.version }}
+  tag:
+    description: For next. The tag of the next version.
+    value: ${{ steps.version.outputs.tag }}
+  previous-tag:
+    description: For next. The last release tag; empty when the repository has none.
+    value: ${{ steps.version.outputs.previous-tag }}
+  target-sha:
+    description: For next. Full id of the commit to release.
+    value: ${{ steps.version.outputs.target-sha }}
+  prs:
+    description: >-
+      For next. Markdown list of the pull requests (number and title) between
+      the last release and the commit to release, oldest first.
+    value: ${{ steps.version.outputs.prs }}
+  version-code:
+    description: The Android versionCode of the version.
+    value: ${{ steps.version.outputs.version-code }}
+
+runs:
+  using: composite
+  steps:
+    - name: Run the version operation
+      id: version
+      shell: bash
+      env:
+        OPERATION: ${{ inputs.operation }}
+        PR: ${{ inputs.pr }}
+        SHA: ${{ inputs.sha }}
+        BUMP: ${{ inputs.bump }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
+        TOKEN: ${{ inputs.token }}
+        VERSION: ${{ inputs.version }}
+        KIND: ${{ inputs.kind }}
+        QA_SEQUENCE: ${{ inputs.qa-sequence }}
+      run: python3 "$GITHUB_ACTION_PATH/release_version.py"

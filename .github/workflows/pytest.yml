@@ -4,8 +4,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/pytest.yml'
-      - '.github/workflows/android-pr-check.yml'
-      - '.github/workflows/android-pr-check-jobs.yml'
+      - '.github/workflows/android-*.yml'
       - 'android-ci/**'
       - 'android-signing/**'
       - 'gradle-log-verdict/**'
@@ -13,18 +12,19 @@ on:
       # The android-ci tests compare a default with pre-commit-changed/action.yml.
       - 'pre-commit-changed/action.yml'
       - 'release-notes/**'
+      - 'release-version/**'
   push:
     branches: [main]
     paths:
       - '.github/workflows/pytest.yml'
-      - '.github/workflows/android-pr-check.yml'
-      - '.github/workflows/android-pr-check-jobs.yml'
+      - '.github/workflows/android-*.yml'
       - 'android-ci/**'
       - 'android-signing/**'
       - 'gradle-log-verdict/**'
       - 'pick-runner/**'
       - 'pre-commit-changed/action.yml'
       - 'release-notes/**'
+      - 'release-version/**'
   # The android-signing job verifies real APKs with every build-tools version
   # on the runner image. The image gains versions without a change here, and a
   # new apksigner can print certificates differently, so that job also runs
@@ -184,6 +184,67 @@ jobs:
           echo "failed=$FAILED skipped=$SKIPPED"
           [[ "$FAILED" == infra ]]
           [[ "$SKIPPED" == pass ]]
+
+  release-version:
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Full history: the action is run on this repository below, and it
+      # refuses a shallow checkout.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Validate composite action metadata
+        run: uvx check-jsonschema --schemafile https://json.schemastore.org/github-action.json release-version/action.yml
+
+      - name: Run tests
+        run: uv run --with pytest python -m pytest release-version -q
+
+      # Load the action the way a caller does: an action.yml GitHub cannot load
+      # passes actionlint and the unit tests. The prefix matches no tag of
+      # this repository, so the commit is planned as a first release.
+      - name: Run the action on this commit
+        id: next
+        uses: ./release-version
+        with:
+          sha: ${{ github.sha }}
+          bump: minor
+          tag-prefix: release-version-ci/v
+
+      - name: Run the action for a versionCode
+        id: code
+        uses: ./release-version
+        with:
+          operation: code
+          version: v1.13.1
+
+      - name: Check the outputs
+        env:
+          TAG: ${{ steps.next.outputs.tag }}
+          PREVIOUS_TAG: ${{ steps.next.outputs.previous-tag }}
+          TARGET_SHA: ${{ steps.next.outputs.target-sha }}
+          PRS: ${{ steps.next.outputs.prs }}
+          NEXT_CODE: ${{ steps.next.outputs.version-code }}
+          VERSION: ${{ steps.code.outputs.version }}
+          VERSION_CODE: ${{ steps.code.outputs.version-code }}
+        run: |
+          set -euo pipefail
+          echo "tag=$TAG previous-tag=$PREVIOUS_TAG target-sha=$TARGET_SHA version-code=$NEXT_CODE"
+          [[ "$TAG" == release-version-ci/v0.1.0 ]]
+          [[ -z "$PREVIOUS_TAG" ]]
+          [[ "$TARGET_SHA" == "$GITHUB_SHA" ]]
+          [[ "$NEXT_CODE" == 150000 ]]
+          # A value of several lines arrives whole.
+          [[ "$(wc -l <<< "$PRS")" -gt 1 ]]
+          [[ "$VERSION" == 1.13.1 && "$VERSION_CODE" == 101350001 ]]
 
   pick-runner:
     if: ${{ github.event_name != 'schedule' }}
