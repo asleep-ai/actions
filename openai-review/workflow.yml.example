@@ -1,0 +1,39 @@
+name: Advisory OpenAI PR review
+on:
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        description: Open PR number to review
+        required: true
+        type: string
+      model:
+        description: Exact API model ID available to the approved project
+        required: true
+        type: string
+permissions:
+  contents: read
+  pull-requests: read
+concurrency:
+  group: advisory-review-${{ github.event.inputs.pr-number }}
+  cancel-in-progress: false
+jobs:
+  review:
+    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Pin a reviewed immutable revision; no checkout of the PR is necessary.
+      - uses: asleep-ai/actions/openai-review@REVIEWED_FULL_COMMIT_SHA
+        id: review
+        with:
+          pr-number: ${{ inputs.pr-number }}
+          model: ${{ inputs.model }}
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          github-token: ${{ github.token }}
+          max-output-tokens: '4000'
+      # Pin the artifact uploader to an approved full SHA before adoption too.
+      - uses: actions/upload-artifact@REVIEWED_UPLOAD_ARTIFACT_SHA
+        with:
+          name: advisory-review-${{ steps.review.outputs.head-sha }}
+          path: ${{ steps.review.outputs.path }}
+          retention-days: 7

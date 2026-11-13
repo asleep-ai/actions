@@ -6,6 +6,7 @@ Shared GitHub Actions, local lint hooks, and adoption templates for `asleep-ai` 
 
 | path | description |
 |------|-------------|
+| [`openai-review/`](./openai-review/) | Manual API-key PR review without checking out or executing PR code; bounded advisory output. |
 | [`release-notes/`](./release-notes/) | AI-drafted markdown release notes from a git tag range, with a deterministic commit-list fallback. |
 | [`pre-commit-changed/`](./pre-commit-changed/) | Run the caller's pre-commit hooks against event-specific changes, with full scans for lint configuration changes. |
 
@@ -35,7 +36,7 @@ release-notes/v1.1.0
 <future-action>/v1.0.0
 ```
 
-Consumers pin to the major (`@release-notes/v1`) for floating bug-fix updates, or to a full version (`@release-notes/v1.0.0`) for reproducibility. The repo-level tag (`v1`) is intentionally unused — actions are versioned individually.
+Security-sensitive consumers should pin to a reviewed full commit SHA. Major (`@release-notes/v1`) and version (`@release-notes/v1.0.0`) tags can move; use them only when accepting the trusted publisher’s updates. The repo-level tag (`v1`) is intentionally unused — actions are versioned individually.
 
 ## Adding a new action
 
@@ -47,4 +48,4 @@ Consumers pin to the major (`@release-notes/v1`) for floating bug-fix updates, o
 
 ## Visibility
 
-This repo is **public**. The actions have no proprietary content and the OPENAI_API_KEY (or equivalent) is always caller-injected, so making them inspectable carries no real cost. External adoption is not a goal -- issues filed by non-org users may not get prompt triage.
+This repo is **public**. Visibility does not grant outsiders execution or secret access. Nevertheless, action code runs with the calling job’s available credentials and files: keep keys out of source, pin reviewed revisions, isolate PR and release jobs, and never expose internal runner inventory or infrastructure credentials. External adoption is not a goal -- issues filed by non-org users may not get prompt triage.
