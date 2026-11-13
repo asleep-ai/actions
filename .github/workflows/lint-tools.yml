@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/lint-tools.yml'
       - '.pre-commit-hooks.yaml'
+      - 'detekt/**'
       - 'ktfmt/**'
       - 'pre-commit-changed/**'
       - 'ruff/**'
@@ -13,6 +14,7 @@ on:
     paths:
       - '.github/workflows/lint-tools.yml'
       - '.pre-commit-hooks.yaml'
+      - 'detekt/**'
       - 'ktfmt/**'
       - 'pre-commit-changed/**'
       - 'ruff/**'
@@ -43,10 +45,16 @@ jobs:
       - name: Validate composite action metadata
         run: uvx check-jsonschema --schemafile https://json.schemastore.org/github-action.json pre-commit-changed/action.yml
 
-      - name: Test lint execution and real ktfmt integration
+      # With the integration variables, the ktfmt and detekt tests also run the
+      # hooks through the real mise: each throwaway caller repository declares
+      # java and the tool in its mise.toml, and `mise exec` installs them. The
+      # detekt tests take that mise.toml from detekt/README.md, so this step is
+      # what verifies the example there.
+      - name: Test lint execution and real ktfmt and detekt integration
         env:
           KTFMT_INTEGRATION: '1'
-        run: uv run --with pytest --with pre-commit python -m pytest ktfmt pre-commit-changed -q
+          DETEKT_INTEGRATION: '1'
+        run: uv run --with pytest --with pre-commit python -m pytest ktfmt detekt pre-commit-changed -q
 
   examples:
     runs-on: ubuntu-latest
