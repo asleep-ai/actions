@@ -57,6 +57,9 @@ INFRA_PATTERNS = [
     r"finished with non-zero exit value 137",
     # Disk
     r"No space left on device",
+    # Build cache. Runners on one host share the local build cache, and a build can find an entry gone by the time
+    # it opens it. The task fails, yet nothing of the change has run.
+    r"Failed to load cache entry",
     # Host SDK
     r"SDK location not found",
     r"Failed to find (target with hash string|Build Tools revision)",

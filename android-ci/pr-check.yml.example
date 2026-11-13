@@ -1,0 +1,35 @@
+name: PR Check
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# The called workflow can use no more than what is granted here, and it fails
+# to start when one of these is missing.
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  # The check to require is `pr-check / result`.
+  pr-check:
+    uses: asleep-ai/actions/.github/workflows/android-pr-check.yml@android-ci/v1
+    with:
+      # Leave runner-labels out to run on GitHub-hosted runners only.
+      runner-labels: '["self-hosted","Linux","X64"]'
+      # Placeholders that let a pull request build configure. Never secrets.
+      local-properties: |
+        EXAMPLE_API_KEY=ci-placeholder
+        EXAMPLE_BASE_URL=https://ci.placeholder.invalid
+    # By name: `secrets: inherit` would hand over every secret of this
+    # repository. Both are optional.
+    secrets:
+      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
+      GIT_TOKEN: ${{ secrets.GIT_TOKEN }}

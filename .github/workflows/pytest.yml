@@ -4,17 +4,26 @@ on:
   pull_request:
     paths:
       - '.github/workflows/pytest.yml'
+      - '.github/workflows/android-pr-check.yml'
+      - '.github/workflows/android-pr-check-jobs.yml'
+      - 'android-ci/**'
       - 'android-signing/**'
       - 'gradle-log-verdict/**'
       - 'pick-runner/**'
+      # The android-ci tests compare a default with pre-commit-changed/action.yml.
+      - 'pre-commit-changed/action.yml'
       - 'release-notes/**'
   push:
     branches: [main]
     paths:
       - '.github/workflows/pytest.yml'
+      - '.github/workflows/android-pr-check.yml'
+      - '.github/workflows/android-pr-check-jobs.yml'
+      - 'android-ci/**'
       - 'android-signing/**'
       - 'gradle-log-verdict/**'
       - 'pick-runner/**'
+      - 'pre-commit-changed/action.yml'
       - 'release-notes/**'
   # The android-signing job verifies real APKs with every build-tools version
   # on the runner image. The image gains versions without a change here, and a
@@ -44,6 +53,28 @@ jobs:
         run: uv run --with pytest --with openai python -m pytest release-notes -q
 
   # One job per component: a failure in one does not hide the others.
+  android-ci:
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      # The tests run the shell of the reusable workflows' steps. The runner
+      # image has a JDK, so the test that generates a key with the real keytool
+      # must run here, not skip.
+      - name: Run tests
+        env:
+          ANDROID_CI_KEYTOOL: '1'
+        run: uv run --with pytest --with pyyaml python -m pytest android-ci -q
+
   android-signing:
     runs-on: ubuntu-latest
     timeout-minutes: 15

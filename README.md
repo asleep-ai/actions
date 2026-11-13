@@ -1,6 +1,6 @@
 # asleep-ai/actions
 
-Shared GitHub Actions, local lint hooks, and adoption templates for `asleep-ai` org repositories. Composite actions and hook scripts are versioned independently via path-prefixed tags; templates are copied into the consuming repository.
+Shared GitHub Actions, reusable workflows, local lint hooks, and adoption templates for `asleep-ai` org repositories. Composite actions and hook scripts are versioned independently via path-prefixed tags, the reusable workflows as one set; templates are copied into the consuming repository.
 
 ## Actions
 
@@ -11,6 +11,14 @@ Shared GitHub Actions, local lint hooks, and adoption templates for `asleep-ai` 
 | [`android-signing/`](./android-signing/) | Keystore and signature steps of a signed Android build: decode the keystore, verify the APK with `apksigner`, delete the keystore and secret files. |
 | [`gradle-log-verdict/`](./gradle-log-verdict/) | Report how a Gradle job ended (`pass`, `code` or `infra`) from step outcomes and the Gradle log, so only infrastructure failures are re-run elsewhere. |
 | [`pick-runner/`](./pick-runner/) | Decide `runs-on` before jobs are queued: self-hosted labels when a matching runner is online, else a GitHub-hosted fallback. |
+
+## Reusable workflows
+
+| path | description |
+|------|-------------|
+| [`android-pr-check.yml`](./.github/workflows/android-pr-check.yml) | Pull request check for Android app repositories: code style, a verification build and a release build on self-hosted runners, re-run on a GitHub-hosted runner only after an infrastructure failure, with one aggregate check. Documented in [`android-ci/`](./android-ci/). |
+
+The calling repository keeps a short workflow file and the Gradle tasks the workflow runs (`ciVerify`, `ciReleaseBuild`). The workflows are released together under `android-ci/vX.Y.Z`.
 
 ## Local hooks
 
