@@ -63,7 +63,7 @@ The `release-version/v1` tag does not exist until the first release; pin a full 
 | `source-branch` | `next`, `qa` | `''` | For `next`, optional: the branch releases are normally cut from. When given, the commit has to be on the branch of its release line. See [Release lines](#release-lines). For `qa`, required. |
 | `tag-prefix` | all | `v` | What a release tag starts with, before `X.Y.Z`. Letters, digits and `. _ / -`, not starting with `-`; may be empty. |
 | `token` | `next` with `pr` | `github.token` | Token that can read the pull request (`pull-requests: read`). |
-| `version` | `code`, `next`, `qa` | `''` | For `code`: the version, as `X.Y.Z` or as its tag; with `kind: preview`, as `X.Y.0-preview.N`. For `next`, optional: the exact version to release instead of a bump. See [An exact version](#an-exact-version). For `qa`, optional: the version of this one build, the next minor or the next major version; not with `label`. See [qa](#qa). |
+| `version` | `code`, `next`, `qa` | `''` | For `code`: the version, as `X.Y.Z` or as its tag; with `kind: preview`, as `X.Y.0-preview.N`. For `next`, optional: the exact version to release instead of a bump. See [An exact version](#an-exact-version). For `qa`, optional: the version of this one build, the next minor or the next major version and later than the version the build has without it; not with `label`. See [qa](#qa). |
 | `kind` | `code` | `release` | `release`, `preview`, or `qa` for a QA build of the minor version of `version`. |
 | `qa-sequence` | `code` with `qa`, `qa` | `''` | Number of the QA build, 1 or higher. A later build has a higher number. Not read for a label build. |
 | `qa-sequence-offset` | `qa` | `''` | Optional whole number added to `qa-sequence`; may be negative. |
@@ -71,6 +71,7 @@ The `release-version/v1` tag does not exist until the first release; pin a full 
 | `next-version` | `qa` | `''` | Optional. The version the branch is heading for, used while it is higher than the last release, no higher than the next major version after it, and not released. |
 | `label` | `qa` | `''` | Optional. Makes the build a label build: a named test build numbered right after the last release of its line. |
 | `since` | `changes` | `''` | Name of the tag that marks the earlier build. It need not exist. |
+| `version-code` | `changes` | `''` | Optional. The versionCode of the build that is about to be published as the `since` tag; `code-taken-by` then says whether another rolling tag holds it. |
 
 Inputs reach the script as environment variables, never through shell interpolation.
 
@@ -97,6 +98,7 @@ Inputs reach the script as environment variables, never through shell interpolat
 | `since-object` | `changes` | The id of the object the `since` tag names in the checkout: the tag object of an annotated tag. Empty when the tag does not exist. A caller that moves the tag afterwards compares it with the tag as it is then. |
 | `stale` | `changes` | `true` when the `since` tag names a later commit that contains this one. |
 | `unchanged` | `changes` | `true` when the `since` tag names this very commit. |
+| `code-taken-by` | `changes` with `version-code` | The rolling tag, other than `since`, that holds a build of that versionCode. Empty when there is none. |
 
 ## next
 
@@ -229,16 +231,17 @@ Plans a QA build for [`android-qa.yml`](../android-ci/README.md#android-qayml), 
   - on `release/<major>.x`, the last release of that major raised by patch, or `<major>.0.0` when the commit contains none;
   - `0.0.1` when the commit contains no release at all.
 - **`next-version`** replaces that version while it can be the next release of the branch: higher than the last release the commit contains, no higher than the next major version after it, not tagged, and of the branch's line. Otherwise it is not used, and the log says why. It never fails the step, so a value that a release has overtaken can stay in the calling file.
-- **`version`** replaces it for one build, and is refused when it cannot be. It is typed into a form, and a build of it is signed with the release key, so it has an upper bound:
-  - with a release in the line, it is the next minor or the next major version after that release, and nothing else (`1.14.0` or `2.0.0` after `v1.13.0`);
-  - before the first release, it is no higher than the version the branch is heading for (`next-version`, or `0.0.1`);
+- **`version`** replaces it for one build, and is refused when it cannot be. It is typed into a form, and a build of it is signed with the release key, so it is bounded on both sides:
+  - it is the next minor or the next major version after the last release of the line, and nothing else (`1.14.0` or `2.0.0` after `v1.13.0`);
+  - it is later than the version the build has without it, `next-version` included. That version itself would be a second build under the name and the versionCode of the rolling one; the error says to run without `version`;
+  - before the first release, none passes: the branch builds the version it is heading for (`next-version`, or `0.0.1`), and anything above it is refused as well;
   - it is not tagged, and it is a version of the branch's line.
   The build is then published apart from the rolling build of the branch: `release-tag` ends in the version.
 - **The number** of a QA build is `qa-sequence` plus `qa-sequence-offset`, 1 to 48999.
 - **A label build.** With `label`, the build is a named test build made after the last release of its line:
   - the version is the patch after that release, and `version-name` is `<version>-<label>.<k>`;
   - `version-code` is the release's code plus `k`: above the release, below its next patch;
-  - `k` is one above the label builds that were published after the same release, whatever their label and branch. They are read from the rolling tags: each `qa-*` tag is an annotated tag whose message names the build it holds, `<version name> (<versionCode>)`, as the publish job of `android-qa.yml` writes it. A build that was planned and not published took no number. After 99 the step fails: the next code is the next patch release's;
+  - `k` is one above the label builds that were published after the same release, whatever their label and branch. They are read from the rolling tags: each `qa-*` tag is an annotated tag whose message names the build it holds, `<version name> (<versionCode>)`, as the publish job of `android-qa.yml` writes it. A build that was planned and not published took no number, so two builds that are planned before either is published get the same one: the caller asks [`changes`](#changes) with `version-code` when it is about to publish. After 99 the step fails: the next code is the next patch release's;
   - the step fails when the commit contains no release of the line (there is nothing to sit above), when the next patch is tagged already on a commit this one does not contain, and when `version` is given too;
   - a `label` is lowercase letters, digits and single hyphens, at most 40 characters, and not the name of the line or of another kind of build (`qa`, `preview`, `release`).
 - **The outputs**: `version-name` is `<version>-qa.<n>`, or `<version>-<label>.<k>`; `kind` is `qa` or `label`, and `number` the `n` or `k`; `release-tag` is `qa-<line>`, `qa-<line>-<label>` for a label build, or `qa-<line>-<version>` when `version` was given; `major` is the major version of a maintenance branch, and empty on the source branch.
@@ -252,6 +255,7 @@ Lists what the commit `sha` adds to the commit the tag `since` names, in the for
 - When the tag names `sha` itself, `unchanged` is `true` and the list is empty.
 - When the tag names a later commit that contains `sha`, `stale` is `true` and the list is empty: the caller decides what an older build means.
 - Otherwise (no such tag, or a tag on a history the commit does not have) the list starts at the last release the commit contains, and `since` is that tag, or empty when there is none and the list covers the whole history.
+- With `version-code`, the versionCode of the build that is about to be published as `since`: `code-taken-by` is the name of another rolling tag (`qa-*`) whose message names a build of that versionCode, and empty when there is none. A versionCode is published once; the number of a label build was read from the same tags when it was planned, and may have been taken since.
 
 ## Requirements
 

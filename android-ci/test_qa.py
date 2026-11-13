@@ -45,6 +45,11 @@ def publish(entry) -> dict:
     return entry["jobs"]["publish"]
 
 
+@pytest.fixture(scope="module")
+def checks(entry) -> dict:
+    return entry["jobs"]["checks"]
+
+
 # --- plan --------------------------------------------------------------------------------------
 
 
@@ -124,8 +129,8 @@ def test_every_output_the_plan_reads_is_one_the_action_has(entry):
     ("minutes", "passes"),
     [("0", True), ("60", True), ("100", True), ("101", False), ("1000", False), ("60.5", False), ("", False), ("soon", False), ("-1", False)],
 )
-def test_a_wait_the_publish_job_has_no_room_for_is_refused_by_the_plan(entry, tmp_path, minutes, passes):
-    # The publish job ends after 120 minutes. A longer wait would end in a cancelled job, which
+def test_a_wait_the_job_has_no_room_for_is_refused_by_the_plan(entry, tmp_path, minutes, passes):
+    # The job that waits ends after 120 minutes. A longer wait would end in a cancelled job, which
     # deletes no artifact and names no reason.
     check = step(entry["jobs"]["plan"], "Check the wait for the checks")
     assert check["env"] == {"CHECKS_WAIT_MINUTES": "${{ inputs.checks-timeout-minutes }}"}
@@ -134,7 +139,7 @@ def test_a_wait_the_publish_job_has_no_room_for_is_refused_by_the_plan(entry, tm
     if not passes:
         assert f"::error title=Invalid input::checks-timeout-minutes is {minutes}. It is a whole number of minutes from 0 to 100" in result.stdout
     assert entry["jobs"]["plan"]["steps"][0] is check
-    assert entry["jobs"]["publish"]["timeout-minutes"] == 120
+    assert entry["jobs"]["checks"]["timeout-minutes"] == 120
 
 
 def plan_summary(entry, tmp_path, **overrides) -> str:
@@ -340,7 +345,7 @@ def test_the_jobs_name_a_build_as_the_plan_does(entry, publish, lines, tmp_path,
 
 
 @pytest.mark.parametrize("empty", ["SHA", "VERSION", "NUMBER", "VERSION_CODE"])
-def test_an_output_the_runner_dropped_ends_the_publish_job_with_the_reason(publish, tmp_path, empty):
+def test_an_output_the_runner_dropped_ends_the_publish_job_with_the_reason(publish, checks, tmp_path, empty):
     # A secret whose value is a word of the plan (a version, a number) empties the output without
     # failing the plan. The first step of the job that publishes says so.
     result, names = name_build(publish, tmp_path, **{empty: ""})
@@ -348,6 +353,9 @@ def test_an_output_the_runner_dropped_ends_the_publish_job_with_the_reason(publi
     assert f"::error title=The plan is incomplete::Empty: {empty}. The plan job passed, so the runner dropped the output" in result.stdout
     assert names == {}
     assert publish["steps"][0] is step(publish, "Name the build")
+    # The job that waits for the checks names the build the same way, to know the tag of the
+    # pre-release: a name does not cross from one job to the other.
+    assert checks["steps"][0] == publish["steps"][0]
     env = step(publish, "Name the build")["env"]
     assert env["SOURCE_BRANCH"] == "${{ inputs.source-branch || github.event.repository.default_branch }}"
     assert env["LABEL"] == "${{ inputs.label }}" and env["VERSION_GIVEN"] == "${{ inputs.version }}"
@@ -419,31 +427,58 @@ def test_built_is_the_check_of_a_push_and_states_the_build_whatever_publish_does
 # --- publish: the checks of the commit ------------------------------------------------------------
 
 
-def test_publish_follows_the_build_that_passed_and_is_the_only_job_that_writes(entry, publish):
-    release = load(RELEASE)["jobs"]["publish"]
-    assert publish["needs"] == ["plan", "primary", "fallback"]
-    assert publish["if"] == release["if"]
+def test_the_checks_are_waited_for_after_the_build_and_outside_the_queue_of_the_pre_release(entry, checks):
+    # The job starts for the build that passed, as the publish job of a release does.
+    assert checks["needs"] == ["plan", "primary", "fallback"]
+    assert checks["if"] == load(RELEASE)["jobs"]["publish"]["if"]
+    assert checks["runs-on"] == "ubuntu-latest"
+    # The wait of one commit holds up no other: a commit whose pull request check was replaced
+    # while it waited never gets the check, and inside the group of the pre-release its wait
+    # would keep every later build from being published for as long as it lasts.
+    assert "concurrency" not in checks
+    # It reads the checks and how the tag compares with the commit, and deletes the artifact of a
+    # build that is not published. It cannot write a release or a tag.
+    assert checks["permissions"] == {"contents": "read", "checks": "read", "actions": "write"}
+    assert [item["name"] for item in checks["steps"]] == [
+        "Name the build", "Check the commit's checks", "Delete the build artifact",
+    ]
+    assert "if" not in checks["steps"][0] and "if" not in checks["steps"][1]
+    # The job waits, so its own timeout has to leave room for the longest wait.
+    assert checks["timeout-minutes"] == 120
+    assert "At most 100" in trigger(entry)["inputs"]["checks-timeout-minutes"]["description"]
+    # One word crosses to the publish job, and it is not a name: the runner would drop an output
+    # that held the value of a secret.
+    assert checks["outputs"] == {"superseded": "${{ steps.checks.outputs.superseded }}"}
+    assert 'output.write("superseded=true\\n")' in step(checks, "Check the commit's checks")["run"]
+
+
+def test_publish_follows_the_checks_and_is_the_only_job_that_writes(entry, publish, checks):
+    assert publish["needs"] == ["plan", "primary", "fallback", "checks"]
+    # Only for a commit whose checks passed. A commit that failed them and one the job could not
+    # read them for end `checks` in a failure; one that a newer build overtook ends it in success
+    # with `superseded`, and is not published either.
+    assert publish["if"] == "${{ !cancelled() && needs.checks.result == 'success' && needs.checks.outputs.superseded != 'true' }}"
     assert publish["runs-on"] == "ubuntu-latest"
-    # The release, the checks of the commit, and the artifact it deletes.
-    assert publish["permissions"] == {"contents": "write", "checks": "read", "actions": "write"}
+    # The release and its tag, and the artifact it deletes.
+    assert publish["permissions"] == {"contents": "write", "actions": "write"}
     assert entry["permissions"] == {"contents": "read", "packages": "read"}
     for name, job in entry["jobs"].items():
-        if name != "publish" and "permissions" in job:
-            assert "write" not in job["permissions"].values(), name
+        if name != "publish":
+            assert job.get("permissions", {}).get("contents", "read") == "read", name
     names = [item.get("name") or item.get("uses") for item in publish["steps"]]
     assert names == [
         "Name the build",
-        "Check the commit's checks",
+        "Download the signed APKs",
         "actions/checkout@v7",
         "List the changes since the build before",
-        "Download the signed APKs",
         "Publish the rolling pre-release",
         "Delete the build artifact",
     ]
-    # Nothing is downloaded or published for a commit whose checks did not pass: no step after the
-    # first runs with always() but the one that deletes the artifact.
-    for item in publish["steps"][:6]:
+    # No step runs with always() but the one that deletes the artifact.
+    for item in publish["steps"][:5]:
         assert "if" not in item, item
+    # The tags are read after the download, right before the tag is moved: what they say about the
+    # other pre-releases is then as fresh as it can be.
     assert publish["steps"][2]["with"] == {
         "ref": "${{ needs.plan.outputs.sha }}", "fetch-depth": 0, "persist-credentials": False,
     }
@@ -457,10 +492,13 @@ def test_publish_follows_the_build_that_passed_and_is_the_only_job_that_writes(e
         "operation": "changes",
         "sha": "${{ needs.plan.outputs.sha }}",
         "since": "${{ steps.names.outputs.tag }}",
+        "version-code": "${{ needs.plan.outputs.version-code }}",
     }
-    # The job waits for the checks, so its own timeout has to leave room for the longest wait.
-    assert publish["timeout-minutes"] == 120
-    assert "At most 100" in trigger(entry)["inputs"]["checks-timeout-minutes"]["description"]
+    # Nothing in the job waits for anything but its own uploads.
+    assert "Check the commit's checks" not in names
+    assert publish["timeout-minutes"] == 30
+    # Both jobs name the build, each for itself, with one script.
+    assert step(checks, "Name the build") == step(publish, "Name the build")
 
 
 def test_one_publish_job_at_a_time_per_pre_release_and_none_is_cancelled(entry, publish):
@@ -472,17 +510,18 @@ def test_one_publish_job_at_a_time_per_pre_release_and_none_is_cancelled(entry, 
         "cancel-in-progress": False,
     }
     # Nothing else is serialized, and no run is cancelled for a later one: every pushed commit is
-    # built, because a release of it requires the check of that build.
+    # built, because a release of it requires the check of that build. The wait for the checks in
+    # particular is in no group.
     assert "concurrency" not in entry
     for name, job in entry["jobs"].items():
         if name != "publish":
             assert "concurrency" not in job, name
 
 
-def test_the_checks_are_decided_by_the_script_of_the_version_bump(entry, publish):
+def test_the_checks_are_decided_by_the_script_of_the_version_bump(entry, checks):
     # One rule in three workflows: an APK is handed out for a commit that passed what a pull
-    # request has to pass. Only the wait is this workflow's.
-    ours = step(publish, "Check the commit's checks")
+    # request has to pass. Only the wait is this workflow's, and what ends it early.
+    ours = step(checks, "Check the commit's checks")
     bump = step(load("android-version-bump.yml")["jobs"]["plan"], "Check the commit's checks")
     release = step(load(RELEASE)["jobs"]["plan"], "Check the commit's checks")
     assert ours["run"] == bump["run"] == release["run"]
@@ -493,9 +532,12 @@ def test_the_checks_are_decided_by_the_script_of_the_version_bump(entry, publish
         "TARGET_SHA": "${{ needs.plan.outputs.sha }}",
         "REQUIRED_CHECKS": "${{ inputs.required-checks }}",
         "CHECKS_WAIT_MINUTES": "${{ inputs.checks-timeout-minutes }}",
+        # The tag of the pre-release the build would be published as.
+        "ROLLING_TAG": "${{ steps.names.outputs.tag }}",
     }
-    # A release is decided from the checks as they are.
-    assert "CHECKS_WAIT_MINUTES" not in bump["env"] and "CHECKS_WAIT_MINUTES" not in release["env"]
+    # A release is decided from the checks as they are, and no tag is a reason to pass over them.
+    for other in (bump, release):
+        assert "CHECKS_WAIT_MINUTES" not in other["env"] and "ROLLING_TAG" not in other["env"]
     inputs = trigger(entry)["inputs"]
     # The APK waits for the pull request check alone: the other check a release requires is this
     # very workflow's.
@@ -516,7 +558,8 @@ class Answers:
         return iter(answer)
 
 
-def wait_for_checks(publish, tmp_path, api, minutes="1", required="pr-check / result"):
+def wait_for_checks(checks, tmp_path, api, minutes="1", required="pr-check / result", tag=""):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     summary, output = tmp_path / "summary", tmp_path / "checks-output"
     summary.write_text("")
     output.write_text("")
@@ -526,17 +569,152 @@ def wait_for_checks(publish, tmp_path, api, minutes="1", required="pr-check / re
         "REQUIRED_CHECKS": required,
         "CHECKS_WAIT_MINUTES": minutes,
         "CHECKS_POLL_SECONDS": "0.01",
+        "ROLLING_TAG": tag,
         "GITHUB_API_URL": f"http://127.0.0.1:{api.server_port}",
         "GITHUB_REPOSITORY": "acme/app",
         "GITHUB_STEP_SUMMARY": str(summary),
         "GITHUB_OUTPUT": str(output),
     }
-    result = run_script(step(publish, "Check the commit's checks")["run"], env, tmp_path)
+    result = run_script(step(checks, "Check the commit's checks")["run"], env, tmp_path)
+    # What the step tells the steps and the job after it: refused=true, superseded=true or nothing.
     result.refused = output.read_text()
     return result, summary.read_text()
 
 
-def test_publish_waits_for_a_check_that_has_not_finished(publish, tmp_path):
+def compared(requests: list) -> list:
+    """The requests that asked how the tag compares with the commit."""
+    return [path for path, _ in requests if "/compare/" in path]
+
+
+# How GitHub compares base...head, the commit with the tag of the pre-release.
+BEHIND = {"status": "behind", "ahead_by": 0, "behind_by": 1}
+PAST = {"status": "ahead", "ahead_by": 1, "behind_by": 0}
+
+
+def test_a_commit_whose_check_never_comes_does_not_hold_up_the_build_after_it(checks, publish, tmp_path):
+    # Three merges in a row, A, B and C, while a pull request check is running. That workflow
+    # keeps one waiting run per branch, so the run of B is replaced by the run of C: B never gets
+    # `pr-check / result`. All three are built here, because a release requires the build of each.
+    #
+    # Were the wait part of the job that publishes, B would hold the turn of the pre-release for
+    # the whole of checks-timeout-minutes, and C behind it. It is a job of its own instead.
+    assert "concurrency" not in checks and "concurrency" in publish
+    assert "checks" in publish["needs"] and "Check the commit's checks" not in [item.get("name") for item in publish["steps"]]
+
+    # C: its check passes while B still waits. Nothing about B is asked, and C goes on to publish.
+    with check_runs_api() as api:
+        api.runs = Answers([check_run(conclusion=None, status="in_progress")], [check_run()])
+        api.compare = [BEHIND]
+        result, _ = wait_for_checks(checks, tmp_path / "c", api, minutes="100", tag="qa-develop")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.refused == ""
+        assert len(compared(api.requests)) == 1, "asked once, before the one wait"
+
+    # B: no check. The pre-release is at A while C is being built and checked, and B waits. Then C
+    # is published, the tag is one commit past B, and B stops at once: it would not be published
+    # even if its check came.
+    with check_runs_api() as api:
+        api.runs = []
+        api.compare = [BEHIND, BEHIND, PAST]
+        result, summary = wait_for_checks(checks, tmp_path / "b", api, minutes="100", tag="qa-develop")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert [path.split("?")[0] for path, _ in api.requests] == [
+            f"/repos/acme/app/commits/{SHA}/check-runs", f"/repos/acme/app/compare/{SHA}...qa-develop",
+        ] * 3
+        assert all(authorization == "Bearer job-token" for _, authorization in api.requests)
+    assert result.stdout.count("Waiting for pr-check / result") == 2
+    assert (
+        f"::notice title=A newer build is published::qa-develop is 1 commit past {SHA[:7]}. This build is not "
+        "published, so its checks are not waited for ('pr-check / result' did not run on the commit)."
+    ) in result.stdout
+    # Not a failure, and not the checks' refusal: nothing is wrong with a commit that was overtaken.
+    assert "::error" not in result.stdout + result.stderr
+    assert result.refused == "superseded=true\n"
+    assert "| pr-check / result | not run |" in summary
+    assert f"qa-develop is 1 commit past {SHA[:7]}: a newer build is published." in summary
+    # The publish job does not start for B, and the job that waited deletes the artifact.
+    assert "needs.checks.outputs.superseded != 'true'" in publish["if"]
+    assert "steps.checks.outputs.superseded == 'true'" in step(checks, "Delete the build artifact")["if"]
+
+
+@pytest.mark.parametrize("minutes", ["100", "0"])
+@pytest.mark.parametrize("runs", [[], [check_run(conclusion=None, status="queued")], [check_run(conclusion=None, status="in_progress")]])
+def test_a_build_that_was_overtaken_is_not_waited_for_whatever_its_check_is_doing(checks, tmp_path, runs, minutes):
+    # A run that was started again long after, or a build that took longer than the one after it.
+    with check_runs_api() as api:
+        api.runs = runs
+        api.compare = [{"status": "ahead", "ahead_by": 3, "behind_by": 0}]
+        result, _ = wait_for_checks(checks, tmp_path, api, minutes=minutes, tag="qa-release-1.x-ble-test")
+        assert len(api.requests) == 2, "the checks once, the tag once"
+        assert compared(api.requests) == [f"/repos/acme/app/compare/{SHA}...qa-release-1.x-ble-test?per_page=1"]
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"qa-release-1.x-ble-test is 3 commits past {SHA[:7]}." in result.stdout
+    assert result.refused == "superseded=true\n"
+
+
+def test_a_check_that_failed_is_the_answer_even_when_a_newer_build_is_published(checks, tmp_path):
+    # The checks answered. That is reported as it is, and the tag is not asked.
+    with check_runs_api() as api:
+        api.runs = [check_run(conclusion="failure")]
+        api.compare = [PAST]
+        result, _ = wait_for_checks(checks, tmp_path, api, minutes="100", tag="qa-develop")
+        assert compared(api.requests) == []
+    assert result.returncode == 1
+    assert result.refused == "refused=true\n"
+    # And a commit whose checks passed goes on to the publish job, which decides about its build.
+    with check_runs_api() as api:
+        api.runs = [check_run()]
+        api.compare = [PAST]
+        result, _ = wait_for_checks(checks, tmp_path, api, minutes="100", tag="qa-develop")
+        assert compared(api.requests) == []
+    assert (result.returncode, result.refused) == (0, "")
+
+
+@pytest.mark.parametrize(
+    "answers",
+    [
+        # No such tag: the first build of the line.
+        [],
+        # The tag is where the build before left it, or at this very commit (the same run again).
+        [BEHIND],
+        [{"status": "identical", "ahead_by": 0, "behind_by": 0}],
+        # The branch was rewritten: the tag is on a history the commit does not have.
+        [{"status": "diverged", "ahead_by": 2, "behind_by": 1}],
+        # Not an answer.
+        [{"message": "no status here"}],
+        [{"status": "ahead"}],
+        [["a list"]],
+    ],
+)
+def test_only_a_tag_that_is_past_the_commit_ends_the_wait(checks, tmp_path, answers):
+    with check_runs_api() as api:
+        api.runs = []
+        api.compare = answers
+        result, _ = wait_for_checks(checks, tmp_path, api, minutes="0.002", tag="qa-develop")
+        assert len(compared(api.requests)) >= 2, "asked before each wait"
+    assert result.returncode == 1
+    assert f"::error title=The commit has not passed its checks::{SHA[:7]}: 'pr-check / result' did not run on the commit after waiting 0.002 minutes. " in result.stdout
+    assert result.refused == "refused=true\n"
+
+
+def test_a_tag_that_cannot_be_compared_is_no_reason_to_stop_waiting_and_none_to_fail(checks, tmp_path):
+    # The question is an extra one. When it meets a server error, or a token that may not ask it,
+    # the step waits for the checks as if it had not asked, and publishes when they pass.
+    with check_runs_api() as api:
+        # The answers in order: the checks, the tag, the checks, the tag, and so on.
+        api.statuses = [200, 502, 200, 403, 200, 404]
+        api.runs = Answers(
+            [], [check_run(conclusion=None, status="queued")], [check_run(conclusion=None, status="in_progress")], [check_run()],
+        )
+        api.compare = [PAST]
+        result, _ = wait_for_checks(checks, tmp_path, api, tag="qa-develop")
+        assert len(api.requests) == 7 and len(compared(api.requests)) == 3
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Cannot read the checks" not in result.stdout + result.stderr
+    assert result.refused == ""
+
+
+def test_publish_waits_for_a_check_that_has_not_finished(checks, tmp_path):
     # The push started the checks and this build together. First the check does not exist on the
     # commit, then it is queued, then it runs, then it has passed.
     with check_runs_api() as api:
@@ -546,7 +724,7 @@ def test_publish_waits_for_a_check_that_has_not_finished(publish, tmp_path):
             [check_run(conclusion=None, status="in_progress")],
             [check_run()],
         )
-        result, summary = wait_for_checks(publish, tmp_path, api)
+        result, summary = wait_for_checks(checks, tmp_path, api)
         assert result.returncode == 0, result.stdout + result.stderr
         assert len(api.requests) == 4
     assert "Waiting for pr-check / result ('pr-check / result' did not run on the commit)." in result.stdout
@@ -557,10 +735,10 @@ def test_publish_waits_for_a_check_that_has_not_finished(publish, tmp_path):
 
 
 @pytest.mark.parametrize("conclusion", ["failure", "cancelled", "skipped"])
-def test_a_check_that_fails_ends_the_wait_and_nothing_is_published(publish, tmp_path, conclusion):
+def test_a_check_that_fails_ends_the_wait_and_nothing_is_published(checks, tmp_path, conclusion):
     with check_runs_api() as api:
         api.runs = Answers([check_run(conclusion=None, status="in_progress")], [check_run(conclusion=conclusion)])
-        result, summary = wait_for_checks(publish, tmp_path, api, minutes="100")
+        result, summary = wait_for_checks(checks,tmp_path, api, minutes="100")
         assert len(api.requests) == 2, "the wait ends with the first answer that is final"
     assert result.returncode == 1
     assert f"::error title=The commit has not passed its checks::{SHA[:7]}: 'pr-check / result' is {conclusion}. " in result.stdout
@@ -570,10 +748,10 @@ def test_a_check_that_fails_ends_the_wait_and_nothing_is_published(publish, tmp_
     assert result.refused == "refused=true\n"
 
 
-def test_one_failed_check_is_final_while_another_still_runs(publish, tmp_path):
+def test_one_failed_check_is_final_while_another_still_runs(checks, tmp_path):
     with check_runs_api() as api:
         api.runs = [check_run(conclusion="failure"), check_run(name="lint", conclusion=None, status="in_progress")]
-        result, _ = wait_for_checks(publish, tmp_path, api, minutes="100", required="pr-check / result\nlint")
+        result, _ = wait_for_checks(checks,tmp_path, api, minutes="100", required="pr-check / result\nlint")
         assert len(api.requests) == 2, "one request for each check, and no second round"
     assert result.returncode == 1
     assert "'pr-check / result' is failure; 'lint' is in_progress." in result.stdout
@@ -586,32 +764,32 @@ def test_one_failed_check_is_final_while_another_still_runs(publish, tmp_path):
         ([check_run(conclusion=None, status="in_progress")], "'pr-check / result' is in_progress"),
     ],
 )
-def test_a_check_that_never_finishes_fails_the_job_after_the_wait(publish, tmp_path, runs, state):
+def test_a_check_that_never_finishes_fails_the_job_after_the_wait(checks, tmp_path, runs, state):
     with check_runs_api() as api:
         api.runs = runs
         # A fraction of a minute, so that the test does not take one.
-        result, _ = wait_for_checks(publish, tmp_path, api, minutes="0.002")
+        result, _ = wait_for_checks(checks,tmp_path, api, minutes="0.002")
         assert len(api.requests) >= 2
     assert result.returncode == 1
     assert f"::error title=The commit has not passed its checks::{SHA[:7]}: {state} after waiting 0.002 minutes. " in result.stdout
     assert result.refused == "refused=true\n"
 
 
-def test_a_check_that_already_passed_is_not_waited_for(publish, tmp_path):
+def test_a_check_that_already_passed_is_not_waited_for(checks, tmp_path):
     with check_runs_api() as api:
         api.runs = [check_run()]
-        result, _ = wait_for_checks(publish, tmp_path, api)
+        result, _ = wait_for_checks(checks,tmp_path, api)
         assert (result.returncode, len(api.requests)) == (0, 1)
     assert "Waiting" not in result.stdout
 
 
-def test_a_request_that_fails_during_the_wait_is_made_again(publish, tmp_path):
+def test_a_request_that_fails_during_the_wait_is_made_again(checks, tmp_path):
     # An hour of waiting is some 120 requests. One that meets a server error or a rate limit is
     # not the checks' answer: the step asks again, and the build is published when they pass.
     with check_runs_api() as api:
         api.statuses = [502, 429, 503]
         api.runs = Answers([check_run(conclusion=None, status="in_progress")], [check_run()])
-        result, summary = wait_for_checks(publish, tmp_path, api)
+        result, summary = wait_for_checks(checks,tmp_path, api)
         assert result.returncode == 0, result.stdout + result.stderr
         assert len(api.requests) == 5
     assert result.stdout.count(f"Cannot read the checks of {SHA} (HTTP 50") == 2
@@ -620,12 +798,12 @@ def test_a_request_that_fails_during_the_wait_is_made_again(publish, tmp_path):
     assert "[success]" in summary and "::error" not in result.stdout + result.stderr
 
 
-def test_checks_that_cannot_be_read_fail_the_job_without_being_a_refusal(publish, tmp_path):
+def test_checks_that_cannot_be_read_fail_the_job_without_being_a_refusal(checks, tmp_path):
     # The server never answers: the job fails when the wait is over. That is not the checks
     # refusing the commit, so the artifact stays and the job can be run again.
     with check_runs_api() as api:
         api.status = 503
-        result, _ = wait_for_checks(publish, tmp_path, api, minutes="0.002")
+        result, _ = wait_for_checks(checks,tmp_path, api, minutes="0.002")
         assert len(api.requests) >= 2
     assert result.returncode == 1
     assert f"::error::Cannot read the checks of {SHA}: HTTP 503" in result.stderr
@@ -633,15 +811,15 @@ def test_checks_that_cannot_be_read_fail_the_job_without_being_a_refusal(publish
     # A token that may not read the checks will not be let in by asking again.
     with check_runs_api() as api:
         api.status = 403
-        result, _ = wait_for_checks(publish, tmp_path, api, minutes="100")
+        result, _ = wait_for_checks(checks,tmp_path, api, minutes="100")
         assert len(api.requests) == 1
     assert result.returncode == 1
     assert "HTTP 403" in result.stderr and result.refused == ""
 
 
-def test_the_wait_has_to_be_a_number(publish, tmp_path):
+def test_the_wait_has_to_be_a_number(checks, tmp_path):
     with check_runs_api() as api:
-        result, _ = wait_for_checks(publish, tmp_path, api, minutes="soon")
+        result, _ = wait_for_checks(checks,tmp_path, api, minutes="soon")
         assert api.requests == []
     assert result.returncode == 1
     assert "The time to wait for the checks is not a number." in result.stderr
@@ -748,7 +926,9 @@ if method == "GET" and route.startswith("releases/tags/"):
     if jq == ".tag_name":
         done(route[len("releases/tags/"):])
     if jq == '.assets[] | "\\(.id) \\(.name)"':
-        if state["fail_assets"]:
+        # fail_assets: true fails every listing, a number the listing of that count.
+        state["listings"] += 1
+        if state["fail_assets"] is True or state["fail_assets"] == state["listings"]:
             fail("gh: Server Error (HTTP 502)")
         done("\n".join(f"{asset['id']} {asset['name']}" for asset in state["assets"]))
 if method == "GET" and route.startswith("git/ref/tags/"):
@@ -787,11 +967,15 @@ if method == "DELETE" and route.startswith("releases/assets/"):
     asset = [asset for asset in state["assets"] if str(asset["id"]) == route.rsplit("/", 1)[1]]
     if not asset:
         fail("gh: Not Found (HTTP 404)")
+    if state["fail_delete"] and state["fail_delete"] in asset[0]["name"]:
+        fail("gh: Server Error (HTTP 502)")
     state["assets"].remove(asset[0])
     seen()
     done()
 if method == "PATCH" and route.startswith("releases/assets/"):
     name = fields("-f")["name"]
+    if state["fail_rename"]:
+        fail("gh: Server Error (HTTP 502)")
     if any(asset["name"] == name for asset in state["assets"]):
         fail("gh: Validation Failed: already_exists (HTTP 422)")
     for asset in state["assets"]:
@@ -835,7 +1019,7 @@ def gh_directory(tmp_path: Path, release=False, tag=None, assets=(), **state) ->
         "release": release, "tag": tag, "assets": held, "next": len(held), "history": [], "objects": 0, "tags": {},
         "drafts": [], "artifacts": None, "undeletable": [], "title": "", "notes": "", "marks": [],
         "release_error": "", "tag_error": "", "refuse_tag": False, "fail_upload": "", "fail_assets": False,
-        "fail_edit": False, "fail_create": False, **state,
+        "listings": 0, "fail_delete": "", "fail_rename": False, "fail_edit": False, "fail_create": False, **state,
     }
     (directory / "state.json").write_text(json.dumps(initial))
     return directory
@@ -876,6 +1060,7 @@ def publish_build(publish, tmp_path, directory: Path, apks=(APK,), **overrides):
         "PRS": "- #340 fix: Close the session\n- #341 -n 100% `code` $(not run) %s",
         "STALE": "false",
         "UNCHANGED": "false",
+        "CODE_TAKEN_BY": "",
         "APK_DIRECTORY": str(apk_directory),
         "STAGING_DIRECTORY": str(temp / "android-qa-upload"),
         "NOTES_FILE": str(temp / "android-qa-notes.md"),
@@ -945,7 +1130,7 @@ def test_every_later_build_moves_the_tag_then_replaces_the_apk(publish, tmp_path
         f"-f object={BUILT} -f type=commit --jq .sha",
         f"api --method PATCH repos/acme/app/git/refs/tags/qa-develop -f sha={FIRST_OBJECT} -F force=true",
         listing,
-        # The new APK is there before anything is removed: a download works at every moment.
+        # The new APK is there before anything is removed: the release is never without an APK.
         f"release upload qa-develop {apk}",
         f"release edit qa-develop --title QA develop: 2.0.0-qa.1057 --notes-file {notes_file} --prerelease --latest=false",
         listing,
@@ -955,7 +1140,7 @@ def test_every_later_build_moves_the_tag_then_replaces_the_apk(publish, tmp_path
     ]
     assert state["tag"] == FIRST_OBJECT
     assert [asset["name"] for asset in state["assets"]] == [APK]
-    assert all(names for names in state["history"]), "the release held an APK at every moment"
+    assert all(names for names in state["history"]), "the release was never without an APK"
     assert f"Replaced the APK of the pre-release with {APK}" in summary
     assert f"Deleted {old[0]} of the build before." in result.stdout
     # The tag is moved with the token for it, everything else with the job token.
@@ -988,6 +1173,8 @@ def test_an_apk_of_a_name_the_release_holds_is_replaced_without_a_gap(publish, t
         f"api --method PATCH repos/acme/app/releases/assets/2 -f name={built}",
         f"release edit qa-develop --title QA develop: 2.0.0-qa.1057 --notes-file {tmp_path / 'temp' / 'android-qa-notes.md'} --prerelease --latest=false",
     ]
+    # Never without an APK. Between the two calls that replace it, the release holds the new APK
+    # under the name it was uploaded with, and none under its own: a moment, not a gap.
     assert state["history"] == [[held, staged], [staged], [built]]
     assert state["assets"] == [{"id": 2, "name": built}]
     assert f"Replaced {built}: uploaded next to the one the release held, which was then deleted." in result.stdout
@@ -1047,6 +1234,111 @@ def test_an_upload_that_fails_puts_the_tag_back(publish, tmp_path):
     assert result.returncode == 1
     assert "::error title=Not published::Cannot list the APKs of the pre-release. qa-develop is back where it was" in result.stdout
     assert state["tag"] == BEFORE_TAG and state["history"] == []
+
+
+def test_what_was_uploaded_before_an_upload_failed_is_removed_again(publish, tmp_path):
+    # Two APKs, and the second upload fails. The first one is in the release by then; left there, the
+    # pre-release would offer an APK of this build next to a tag, a title and an APK of the one
+    # before. Nothing the release held was touched yet, so the step can put everything back.
+    old = ("SleepHub_qa_1.13.1-qa.56_101300056.apk", "SweetSleep_qa_1.13.1-qa.56_101300056.apk")
+    apks = ("sleephub/release/SleepHub_qa_1.13.1-qa.57_101300057.apk", "sweetsleep/release/SweetSleep_qa_1.13.1-qa.57_101300057.apk")
+    directory = gh_directory(tmp_path, release=True, tag=BEFORE_TAG, assets=old, fail_upload="SweetSleep_qa_1.13.1-qa.57")
+    result, calls, state, summary = publish_build(publish, tmp_path, directory, apks=apks)
+    assert result.returncode == 1
+    assert "::error title=Not published::An APK could not be uploaded. qa-develop is back where it was, and the pre-release holds the build before." in result.stdout
+    assert writes(calls)[-2:] == [
+        "api --method DELETE repos/acme/app/releases/assets/3",
+        f"api --method PATCH repos/acme/app/git/refs/tags/qa-develop -f sha={BEFORE_TAG} -F force=true",
+    ]
+    assert state["tag"] == BEFORE_TAG and [asset["name"] for asset in state["assets"]] == list(old)
+    assert state["title"] == "" and summary == ""
+
+
+def test_a_replacement_that_cannot_be_looked_up_is_undone_before_anything_is_deleted(publish, tmp_path):
+    # The APK went up under another name, and the listing that would give its id fails. The APK of
+    # the build before is still there: the upload is removed and the tag goes back.
+    directory = gh_directory(tmp_path, release=True, tag=BEFORE_TAG, assets=("app-release.apk",), fail_assets=2)
+    result, calls, state, _ = publish_build(publish, tmp_path, directory, apks=("app-release.apk",))
+    assert result.returncode == 1
+    assert "::error title=Not published::Cannot list the APKs of the pre-release after the upload. qa-develop is back where it was" in result.stdout
+    assert state["tag"] == BEFORE_TAG and state["assets"] == [{"id": 1, "name": "app-release.apk"}]
+    assert state["history"] == [["app-release.apk", "app-release.run-9001-1.apk"], ["app-release.apk"]]
+
+
+def test_an_apk_that_cannot_take_its_name_stays_published_and_the_tag_stays_with_it(publish, tmp_path):
+    # The old APK is deleted and the rename of the new one fails. The release holds this build,
+    # under the name it was uploaded with. Putting the tag back now would leave a tag and a title
+    # of the build before on a release that holds this one: the tag stays, title and notes follow,
+    # and the job fails with what is left to do.
+    directory = gh_directory(tmp_path, release=True, tag=BEFORE_TAG, assets=("app-release.apk", "leftover.apk"), fail_rename=True)
+    result, calls, state, summary = publish_build(publish, tmp_path, directory, apks=("app-release.apk",))
+    assert result.returncode == 1
+    assert (
+        "::error title=Published, but not completely::qa-develop is at 3ff9b1a and the pre-release holds 2.0.0-qa.1057, but "
+        "app-release.apk is there as app-release.run-9001-1.apk, which could not be given its name. Run this job again, or "
+        "leave it to the next build that is published: either puts it right."
+    ) in result.stdout
+    assert "Not published" not in result.stdout
+    assert state["tag"] == FIRST_OBJECT and state["tags"][FIRST_OBJECT]["object"] == BUILT
+    assert state["title"] == "QA develop: 2.0.0-qa.1057"
+    # The APK of this build is kept under the name it has; what is older goes.
+    assert [asset["name"] for asset in state["assets"]] == ["app-release.run-9001-1.apk"]
+    assert [] not in state["history"]
+    assert summary == ""
+
+    # The job is run again (the artifact is still there after a failure): the name is free now.
+    again = json.loads((directory / "state.json").read_text())
+    again.update(fail_rename=False, history=[])
+    (directory / "state.json").write_text(json.dumps(again))
+    result, _, state, summary = publish_build(publish, tmp_path, directory, apks=("app-release.apk",), GITHUB_RUN_ATTEMPT="2", SINCE=BUILT, UNCHANGED="true")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [asset["name"] for asset in state["assets"]] == ["app-release.apk"]
+    assert [] not in state["history"]
+    assert "Replaced the APK of the pre-release with app-release.apk" in summary
+
+
+def test_an_old_apk_that_cannot_be_deleted_is_named_and_the_rest_is_done(publish, tmp_path):
+    old = ("HeySleep_qa_2.0.0-qa.1056_200001056.apk", "HeySleep_qa_2.0.0-qa.1049_200001049.apk")
+    directory = gh_directory(tmp_path, release=True, tag=BEFORE_TAG, assets=old, fail_delete="qa.1056")
+    result, _, state, summary = publish_build(publish, tmp_path, directory)
+    assert result.returncode == 1
+    assert f"::error title=Published, but not completely::qa-develop is at 3ff9b1a and the pre-release holds 2.0.0-qa.1057, but {old[0]} of the build before could not be deleted. " in result.stdout
+    assert state["tag"] == FIRST_OBJECT and state["title"] == "QA develop: 2.0.0-qa.1057"
+    assert [asset["name"] for asset in state["assets"]] == [old[0], APK]
+    assert f"Deleted {old[1]} of the build before." in result.stdout
+    assert summary == ""
+    # The same APK name, and the one the release holds cannot be deleted: both stay, the new one
+    # under the name it was uploaded with, and the error says which is which.
+    directory = gh_directory(tmp_path / "same", release=True, tag=BEFORE_TAG, assets=("app-release.apk",), fail_delete="app-release.apk")
+    result, _, state, _ = publish_build(publish, tmp_path / "same", directory, apks=("app-release.apk",))
+    assert result.returncode == 1
+    assert "app-release.apk of the build before could not be deleted, and the new one is there as app-release.run-9001-1.apk" in result.stdout
+    assert [asset["name"] for asset in state["assets"]] == ["app-release.apk", "app-release.run-9001-1.apk"]
+    assert state["tag"] == FIRST_OBJECT
+
+
+def test_a_build_whose_versioncode_another_pre_release_holds_is_not_published(publish, tmp_path):
+    # Two label builds were planned while neither was published, and both were numbered 1 after the
+    # release. The other one was published while this one was built. Devices tell builds apart by
+    # the versionCode, so this one is not published under it; a new run takes the next number.
+    labelled = {
+        "TAG": "qa-develop-knox", "KIND": "label", "APART": "knox", "VERSION": "1.13.1", "VERSION_NAME": "1.13.1-knox.1",
+        "VERSION_CODE": "101350001", "PREVIOUS_TAG": "v1.13.0", "SINCE": "v1.13.0",
+    }
+    directory = gh_directory(tmp_path)
+    result, calls, state, summary = publish_build(publish, tmp_path, directory, CODE_TAKEN_BY="qa-develop-ble-test", **labelled)
+    assert result.returncode == 1
+    assert (
+        "::error title=The versionCode is taken::1.13.1-knox.1 has the versionCode 101350001, and the pre-release "
+        "qa-develop-ble-test holds a build of that versionCode: it was published while this one was built. Nothing is published. "
+        "Start the workflow again with the same inputs (a new run, not a re-run of this one): it takes the next number."
+    ) in result.stdout
+    assert calls == [] and state["tag"] is None and summary == ""
+    env = step(publish, "Publish the rolling pre-release")["env"]
+    assert env["CODE_TAKEN_BY"] == "${{ steps.changes.outputs.code-taken-by }}"
+    # Asked with the tags as the checkout of this job has them, which is made after the download.
+    names = [item.get("name") or item.get("uses") for item in publish["steps"]]
+    assert names.index("Download the signed APKs") < names.index("actions/checkout@v7") < names.index("List the changes since the build before")
 
 
 def test_a_pre_release_that_cannot_be_created_leaves_no_tag_behind(publish, tmp_path):
@@ -1208,14 +1500,23 @@ def test_an_api_failure_is_not_read_as_no_release(publish, tmp_path):
     assert len(calls) == 2, "nothing is written"
 
 
-def test_a_failed_edit_fails_the_job(publish, tmp_path):
+def test_a_failed_edit_fails_the_job_after_the_old_apk_is_gone(publish, tmp_path):
     directory = gh_directory(tmp_path, release=True, tag=BEFORE_TAG, assets=("old.apk",), fail_edit=True)
     result, _, state, summary = publish_build(publish, tmp_path, directory)
-    assert result.returncode != 0
+    assert result.returncode == 1
+    assert "::error title=Published, but not completely::qa-develop is at 3ff9b1a and the pre-release holds 2.0.0-qa.1057, but its title and notes are still those of the build before. " in result.stdout
     assert summary == ""
-    # The new APK is there next to the old one, and the tag names its commit: the job can be run again.
-    assert [asset["name"] for asset in state["assets"]] == ["old.apk", APK]
+    # The rest is done all the same: the release holds this build alone, and the tag names its
+    # commit. Only the text is behind, and the job can be run again.
+    assert [asset["name"] for asset in state["assets"]] == [APK]
     assert state["tag"] == FIRST_OBJECT
+    # The APKs of the build before cannot be listed: they stay, and the error says so.
+    directory = gh_directory(tmp_path / "list", release=True, tag=BEFORE_TAG, assets=("old.apk",), fail_assets=2)
+    result, _, state, _ = publish_build(publish, tmp_path / "list", directory)
+    assert result.returncode == 1
+    assert "but the APKs of the build before could not be listed and are still there. " in result.stdout
+    assert [asset["name"] for asset in state["assets"]] == ["old.apk", APK]
+    assert state["tag"] == FIRST_OBJECT and state["title"] == "QA develop: 2.0.0-qa.1057"
 
 
 def test_a_build_on_the_fallback_runner_says_so(publish, tmp_path):
@@ -1284,16 +1585,22 @@ def test_an_artifact_that_cannot_be_deleted_is_a_warning_not_a_failure(publish, 
     assert len(calls) == 1
 
 
-def test_the_artifact_is_kept_only_for_a_run_that_can_be_finished(publish):
+def test_the_artifact_is_kept_only_for_a_run_that_can_be_finished(publish, checks):
+    # Deleted by the job that is done with it. The publish job: the APK is published, or a newer
+    # build is. The job that waits for the checks: they refused the commit, or a newer build
+    # overtook it, and the publish job does not start for either. After any other failure, checks
+    # that could not be read included, the artifact stays for the day GitHub keeps it, so the job
+    # can run again.
     delete = step(publish, "Delete the build artifact")
-    # Deleted when the publish step is done with it (the APK is published, or a newer build is),
-    # and when the checks refused the commit: that APK is kept nowhere. After any other failure,
-    # checks that could not be read included, it stays for the day GitHub keeps it, so the job can
-    # run again.
-    assert delete["if"] == "${{ always() && (steps.publish.outcome == 'success' || steps.checks.outputs.refused == 'true') }}"
+    assert delete["if"] == "${{ always() && steps.publish.outcome == 'success' }}"
     assert step(publish, "Publish the rolling pre-release")["id"] == "publish"
-    assert step(publish, "Check the commit's checks")["id"] == "checks"
-    assert 'output.write("refused=true\\n")' in step(publish, "Check the commit's checks")["run"]
+    early = step(checks, "Delete the build artifact")
+    assert early["if"] == "${{ always() && (steps.checks.outputs.refused == 'true' || steps.checks.outputs.superseded == 'true') }}"
+    assert step(checks, "Check the commit's checks")["id"] == "checks"
+    assert 'output.write("refused=true\\n")' in step(checks, "Check the commit's checks")["run"]
+    # One script and one set of values in both jobs; both may delete an artifact.
+    assert (early["run"], early["env"]) == (delete["run"], delete["env"])
+    assert checks["permissions"]["actions"] == publish["permissions"]["actions"] == "write"
     upload = step(load(BUILD)["jobs"]["build"], "Upload the signed APKs")["with"]
     assert upload["retention-days"] == "${{ (inputs.kind == 'qa' || inputs.kind == 'label') && 1 || 90 }}"
 

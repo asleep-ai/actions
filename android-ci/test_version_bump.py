@@ -375,7 +375,11 @@ def check_run(name="pr-check / result", conclusion="success", status="completed"
 
 @contextlib.contextmanager
 def check_runs_api():
-    """A local GitHub API that answers the check-runs request with the runs set on it."""
+    """A local GitHub API that answers the check-runs request with the runs set on it.
+
+    `compare` holds the answers to "how does a tag compare with the commit", which only the QA
+    build asks: one for each request, the last one from then on. Empty, the tag does not exist.
+    """
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
@@ -384,6 +388,13 @@ def check_runs_api():
             query = urllib.parse.parse_qs(url.query)
             # `statuses` answers the next requests one by one, `status` every request after them.
             status = server.statuses.pop(0) if server.statuses else server.status
+            if status == 200 and url.path.startswith(f"/repos/acme/app/compare/{SHA}...") and server.compare:
+                answer = server.compare.pop(0) if len(server.compare) > 1 else server.compare[0]
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(answer).encode())
+                return
             if status != 200 or url.path != f"/repos/acme/app/commits/{SHA}/check-runs":
                 self.send_response(status if status != 200 else 404)
                 self.end_headers()
@@ -402,6 +413,7 @@ def check_runs_api():
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
     server.runs, server.requests, server.status, server.statuses, server.body = [], [], 200, [], None
+    server.compare = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:

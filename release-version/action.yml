@@ -69,9 +69,10 @@ inputs:
       last release the commit contains and must not be tagged yet. For qa,
       optional: the version this one build leads up to instead of the next
       patch, which has to be the next minor or the next major version after
-      the last release (before a first release, no higher than the version
-      the branch is heading for). The build is then published apart from the
-      rolling build of the branch. Not with label.
+      the last release, and later than the version the builds of the branch
+      lead up to without it (so before a first release none is accepted).
+      The build is then published apart from the rolling build of the
+      branch. Not with label.
     required: false
     default: ''
   kind:
@@ -120,6 +121,13 @@ inputs:
     description: >-
       For changes. Name of the tag that marks the earlier build, such as the
       release-tag of qa. It need not exist.
+    required: false
+    default: ''
+  version-code:
+    description: >-
+      For changes, optional. The versionCode of the build that is about to
+      be published as the since tag. code-taken-by then says whether another
+      rolling tag holds a build of that versionCode.
     required: false
     default: ''
 
@@ -208,6 +216,12 @@ outputs:
   unchanged:
     description: "For changes. 'true' when the since tag names this very commit."
     value: ${{ steps.version.outputs.unchanged }}
+  code-taken-by:
+    description: >-
+      For changes with version-code. The rolling tag (qa-*), other than the
+      since tag, whose message names a build of that versionCode; empty when
+      there is none.
+    value: ${{ steps.version.outputs.code-taken-by }}
 
 runs:
   using: composite
@@ -232,4 +246,5 @@ runs:
         NEXT_VERSION: ${{ inputs.next-version }}
         LABEL: ${{ inputs.label }}
         SINCE: ${{ inputs.since }}
+        VERSION_CODE: ${{ inputs.version-code }}
       run: python3 "$GITHUB_ACTION_PATH/release_version.py"

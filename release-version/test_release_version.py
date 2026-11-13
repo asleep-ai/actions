@@ -1096,7 +1096,7 @@ def test_a_version_for_one_build_is_the_next_minor_or_major_and_is_published_apa
         ("2.0.0", "2.0.0-qa.57", "200000057", "qa-develop-2.0.0"),
         ("v1.14.0", "1.14.0-qa.57", "101400057", "qa-develop-1.14.0"),
     ):
-        status, out = run_qa(tmp_path, target, version=version, next_version="1.14.0")
+        status, out = run_qa(tmp_path, target, version=version)
         assert (status, out["version-name"], out["version-code"], out["release-tag"]) == (0, name, code, tag)
         assert (out["kind"], out["line"]) == ("qa", "develop")
     assert 101_350_000 < 101_400_057
@@ -1105,10 +1105,8 @@ def test_a_version_for_one_build_is_the_next_minor_or_major_and_is_published_apa
         # A typing error is not a version the line can reach: 11.3.1 for 1.13.1, 3.0.0 for 2.0.0.
         ("11.3.1", neither),
         ("3.0.0", neither),
-        ("1.15.0", neither),
+        ("1.15.0", neither + ". Without version, the build is one of 1.13.1"),
         ("2.1.0", neither),
-        # The next patch is what the build is without version.
-        ("1.13.1", neither + ". Without version, the build is one of 1.13.1"),
         ("1.13.0", "version 1.13.0 was given for this QA build, and v1.13.0 is released already"),
         ("1.12.9", "it is not higher than v1.13.0, the last release the commit contains"),
         ("2.0", "'2.0' is not a version of the form X.Y.Z"),
@@ -1119,12 +1117,48 @@ def test_a_version_for_one_build_is_the_next_minor_or_major_and_is_published_apa
         assert message in error_of(capsys)
 
 
-def test_a_version_before_the_first_release_is_no_higher_than_where_the_branch_is_heading(repo, tmp_path, capsys):
+def test_a_version_for_one_build_is_later_than_the_version_the_branch_builds_anyway(repo, tmp_path, capsys):
+    # The same version as the rolling build would be a second build of one name and one
+    # versionCode, in a pre-release of its own (qa-develop-1.13.1 next to qa-develop). A lower one is
+    # in a block of codes below the builds that are installed.
+    git(repo, "tag", "v1.13.0")
+    target = commit(repo, "Fix (#12)")
+    origin(repo, "develop")
+    without = "was given for this QA build, and the QA builds of develop lead up to"
+    for version, hint, message in (
+        # The next patch is what the build is without version.
+        ("1.13.1", "", f"version 1.13.1 {without} that very version without it (the patch after v1.13.0). Run without version"),
+        # The calling file already heads for the next minor, or for the next major.
+        ("1.14.0", "1.14.0", f"version 1.14.0 {without} that very version without it (next-version). Run without version"),
+        ("2.0.0", "2.0.0", f"version 2.0.0 {without} that very version without it (next-version). Run without version"),
+        ("1.14.0", "2.0.0", f"version 1.14.0 {without} 2.0.0, a later version, without it (next-version). Run without version"),
+        ("1.13.1", "1.14.0", f"version 1.13.1 {without} 1.14.0, a later version, without it (next-version). Run without version"),
+    ):
+        status, out = run_qa(tmp_path, target, version=version, next_version=hint)
+        assert (status, out) == (1, {}), version
+        assert message in error_of(capsys)
+    # What is above it and within reach is built, apart.
+    status, out = run_qa(tmp_path, target, version="2.0.0", next_version="1.14.0")
+    assert (status, out["version-name"], out["release-tag"]) == (0, "2.0.0-qa.57", "qa-develop-2.0.0")
+    # Once release/1.x has the line of the last release, the branch builds the next major anyway, and
+    # the next minor is the maintenance branch's: nothing is left for version to name.
+    origin(repo, "release/1.x")
+    status, _ = run_qa(tmp_path, target, version="2.0.0")
+    assert status == 1
+    assert f"version 2.0.0 {without} that very version without it (the next major: " in error_of(capsys)
+
+
+def test_no_version_is_given_before_the_first_release(repo, tmp_path, capsys):
+    # Before a first release the branch has one version to build, the one it is heading for. The
+    # builds are of it without version; a lower one and a higher one are both refused.
     target = commit(repo, "Feature (#1)")
     origin(repo, "develop")
-    for version, tag in (("2.0.0", "qa-develop-2.0.0"), ("1.0.0", "qa-develop-1.0.0")):
-        code, out = run_qa(tmp_path, target, version=version, next_version="2.0.0")
-        assert (code, out["version-name"], out["release-tag"]) == (0, f"{version}-qa.57", tag)
+    for version, hint, heading in (("2.0.0", "2.0.0", "that very version"), ("1.0.0", "2.0.0", "2.0.0, a later version,"), ("0.0.1", "", "that very version")):
+        code, out = run_qa(tmp_path, target, version=version, next_version=hint)
+        assert (code, out) == (1, {})
+        message = error_of(capsys)
+        assert f"version {version} was given for this QA build, and the QA builds of develop lead up to {heading} without it" in message
+        assert message.rstrip().endswith("Run without version")
     for version, hint, ceiling in (("2.1.0", "2.0.0", "2.0.0"), ("3.0.0", "2.0.0", "2.0.0"), ("0.1.0", "", "0.0.1")):
         code, out = run_qa(tmp_path, target, version=version, next_version=hint)
         assert (code, out) == (1, {})
@@ -1387,6 +1421,7 @@ def test_changes_since_the_build_before(repo, tmp_path):
         "prs": "- #13 fix: Close the session\n- `" + target[:7] + "` Hotfix pushed directly",
         "stale": "false",
         "unchanged": "false",
+        "code-taken-by": "",
     }
 
 
@@ -1404,6 +1439,44 @@ def test_changes_name_the_object_of_an_annotated_rolling_tag(repo, tmp_path):
     # No tag, no object.
     _, out = run_changes(tmp_path, target, since="qa-develop-ble-test")
     assert (out["since"], out["since-object"]) == ("v1.13.0", "")
+
+
+def test_changes_say_which_other_pre_release_holds_the_versioncode(lines, repo, tmp_path, capsys):
+    #   develop:      base(v1.13.0) ── a ── b(v2.0.0) ── c
+    #   release/1.x:    └── h1(v1.13.1) ── h2
+    # Two label runs were planned while neither was published: both read the tags, and both got
+    # number 1 after v2.0.0.
+    plans = [run_qa(tmp_path, lines["c"], label=label)[1] for label in ("ble-test", "knox")]
+    assert [plan["version-code"] for plan in plans] == ["200050001", "200050001"]
+    assert [plan["release-tag"] for plan in plans] == ["qa-develop-ble-test", "qa-develop-knox"]
+
+    def taken(since: str, code: str) -> str:
+        return run(tmp_path, operation="changes", sha=lines["c"], since=since, version_code=code)[1]["code-taken-by"]
+
+    # The first to publish finds the code free and moves its tag.
+    assert taken("qa-develop-ble-test", "200050001") == ""
+    rolling(repo, "qa-develop-ble-test", "2.0.1-ble-test.1", 200_050_001, lines["c"])
+    # The second asks again when it is about to publish, and is told who has the code.
+    capsys.readouterr()
+    assert taken("qa-develop-knox", "200050001") == "qa-develop-ble-test"
+    assert "qa-develop-ble-test holds a build of the versionCode 200050001." in capsys.readouterr().out
+    # A new run of it is planned from the tags as they are now, and gets the next number.
+    _, again = run_qa(tmp_path, lines["c"], label="knox")
+    assert (again["version-name"], again["version-code"]) == ("2.0.1-knox.2", "200050002")
+    assert taken("qa-develop-knox", "200050002") == ""
+    # The build's own pre-release is not another one: the same run published again.
+    assert taken("qa-develop-ble-test", "200050001") == ""
+    # Only a tag that names its build counts, and the label builds of another line have other codes.
+    git(repo, "tag", "qa-develop-plain", lines["c"])
+    rolling(repo, "qa-release-1.x-ble-test", "1.13.2-ble-test.1", 101_350_101, lines["h2"])
+    assert taken("qa-develop-knox", "200050002") == ""
+    assert taken("qa-develop-knox", "101350101") == "qa-release-1.x-ble-test"
+    # Without a versionCode nothing is asked.
+    _, out = run_changes(tmp_path, lines["c"], since="qa-develop-knox")
+    assert out["code-taken-by"] == ""
+    code, out = run(tmp_path, operation="changes", sha=lines["c"], since="qa-develop-knox", version_code="1e3")
+    assert (code, out) == (1, {})
+    assert "version-code must be a whole number" in error_of(capsys)
 
 
 def test_changes_of_the_first_build_start_at_the_last_release(repo, tmp_path):

@@ -10,8 +10,10 @@ name: Android QA build
 # an infrastructure failure.
 #
 # The APK is published only when the checks of the same commit succeeded. The
-# publish job waits for them, because the push that starts this workflow
-# starts them too.
+# job `checks` waits for them, because the push that starts this workflow
+# starts them too. It waits outside the queue of the pre-release, so the build
+# of a later commit is published while an earlier one still waits, and it
+# stops waiting once that later build is published.
 #
 # The build of a push is also what a release of that commit requires: the job
 # `built` reports it as the check "<calling job> / built", which
@@ -185,7 +187,7 @@ on:
         default: pr-check / result
       checks-timeout-minutes:
         description: >-
-          How long the publish job waits, after the build, for a required
+          How long the job `checks` waits, after the build, for a required
           check that has not finished, in whole minutes. A check that is
           still missing or running then fails the job. At most 100; the plan
           refuses more.
@@ -305,7 +307,7 @@ jobs:
       runs-on: ${{ steps.pick.outputs.runs-on }}
       self-hosted: ${{ steps.pick.outputs.self-hosted }}
     steps:
-      # The publish job waits this long inside its own timeout of 120 minutes.
+      # The job `checks` waits this long inside its own timeout of 120 minutes.
       # A longer wait would end in a cancelled job, which tells nobody why.
       - name: Check the wait for the checks
         env:
@@ -313,7 +315,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! "$CHECKS_WAIT_MINUTES" =~ ^[0-9]{1,3}$ ]] || (( 10#$CHECKS_WAIT_MINUTES > 100 )); then
-            echo "::error title=Invalid input::checks-timeout-minutes is $CHECKS_WAIT_MINUTES. It is a whole number of minutes from 0 to 100: the publish job, which waits, ends after 120."
+            echo "::error title=Invalid input::checks-timeout-minutes is $CHECKS_WAIT_MINUTES. It is a whole number of minutes from 0 to 100: the job that waits for the checks ends after 120."
             exit 1
           fi
 
@@ -509,35 +511,44 @@ jobs:
           fi
           echo "${SHA:0:7} was built with ciQa on $where: the release variant, cold, signed and verified."
 
-  # Publishes the APKs of the build that passed as the rolling pre-release of
-  # the line, once the checks of the commit have succeeded. It runs on GitHub,
-  # checks out the repository only to read its history, and runs none of its
-  # code: the token that can write releases exists in this job alone.
+  # Whether the commit passed what a pull request has to pass: an APK is handed
+  # to people only then. The push that started this run started the checks
+  # too, so they may still be running when the build is done, and the job
+  # waits for them.
   #
-  # One publish job at a time per pre-release, and none is cancelled half way:
-  # two builds that finish together would otherwise each delete the APK of the
-  # other. GitHub keeps one waiting job per group, the one that arrived last,
-  # and the step below does not publish a commit that the pre-release is
-  # already past.
-  publish:
+  # The wait is a job of its own, in no concurrency group. `publish` below
+  # takes its turn per pre-release, and a wait inside that turn would hold up
+  # every build behind it: a commit whose pull request check was replaced
+  # while it waited never gets the check, and its job would keep the build of
+  # the next commit from being published for the whole of
+  # checks-timeout-minutes. Here each commit waits on its own.
+  #
+  # And it stops waiting when the pre-release is past the commit: the build of
+  # a later commit was published meanwhile, so this one would not be published
+  # whatever its checks say. The job then succeeds with `superseded`, which
+  # keeps `publish` from starting. That is the usual end of the commit whose
+  # check never comes.
+  checks:
     needs: [plan, primary, fallback]
     if: ${{ !cancelled() && (needs.primary.result == 'success' || needs.fallback.result == 'success') }}
     runs-on: ubuntu-latest
     # Room for checks-timeout-minutes, which the plan holds to 100 at most.
     timeout-minutes: 120
-    concurrency:
-      group: android-qa-publish-${{ needs.plan.outputs.major || 'source' }}-${{ inputs.label || (inputs.version != '' && needs.plan.outputs.version) || 'rolling' }}
-      cancel-in-progress: false
     permissions:
-      contents: write
+      contents: read
       checks: read
       actions: write
+    outputs:
+      # 'true' or empty, never a name: the runner drops an output that
+      # contains the value of a secret.
+      superseded: ${{ steps.checks.outputs.superseded }}
     steps:
       # The names of the build, put together from the plan's outputs and the
       # inputs the way release-version does it (android-ci's tests compare the
       # two). An output that arrives empty was dropped by the runner because
-      # it held the value of a secret; the job says so instead of publishing
-      # under half a name.
+      # it held the value of a secret; the job says so instead of going on
+      # with half a name. `publish` has the same step: a name does not cross
+      # from one job to another.
       - name: Name the build
         id: names
         env:
@@ -588,19 +599,20 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "$kind build $version_name ($VERSION_CODE) of $branch, published as $tag."
 
-      # An APK is handed to people only when its commit passed what a pull
-      # request has to pass. The push that started this run started the checks
-      # too, so they may still be running when the build is done: the step
-      # waits for them. A check that failed or was cancelled ends the wait at
-      # once, and one that is still missing or running after
-      # checks-timeout-minutes fails the job. Nothing is published then, and
-      # the build's artifact is deleted below. A request that fails while the
-      # step waits (a server error, a timeout) is made again; it is not the
-      # checks' answer.
+      # A check that failed or was cancelled ends the wait at once, and one
+      # that is still missing or running after checks-timeout-minutes fails
+      # the job. Nothing is published then, and the build's artifact is
+      # deleted below. A request that fails while the step waits (a server
+      # error, a timeout) is made again; it is not the checks' answer.
+      #
+      # Before each wait the step asks whether ROLLING_TAG, the tag of the
+      # pre-release, is at a later commit that contains this one. Then it
+      # stops with the output `superseded` and without an error. A question
+      # that cannot be answered is not a yes: the step goes on waiting.
       #
       # The script is the one android-version-bump.yml and android-release.yml
-      # decide a release with, which do not wait. android-ci's tests fail when
-      # the copies differ.
+      # decide a release with, which neither wait nor name a tag.
+      # android-ci's tests fail when the copies differ.
       #
       # python3 -I: the script comes from standard input, and without -I
       # Python would look for the modules it imports in the work folder first.
@@ -611,6 +623,7 @@ jobs:
           TARGET_SHA: ${{ needs.plan.outputs.sha }}
           REQUIRED_CHECKS: ${{ inputs.required-checks }}
           CHECKS_WAIT_MINUTES: ${{ inputs.checks-timeout-minutes }}
+          ROLLING_TAG: ${{ steps.names.outputs.tag }}
         run: |
           set -euo pipefail
           python3 -I - <<'CHECKS'
@@ -635,6 +648,10 @@ jobs:
           except ValueError:
               sys.exit("::error::The time to wait for the checks is not a number.")
           deadline = time.monotonic() + wait_minutes * 60
+          # And only android-qa.yml names a tag: the one of the pre-release its build is published as. A
+          # build that pre-release is already past is not published whatever its checks say, so the step
+          # does not wait for them.
+          rolling_tag = os.environ.get("ROLLING_TAG", "").strip()
 
 
           class Unreadable(Exception):
@@ -645,10 +662,9 @@ jobs:
                   self.again = again
 
 
-          def check_runs(name):
-              query = urllib.parse.urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+          def read(path):
               request = urllib.request.Request(
-                  f"{api}/repos/{repository}/commits/{sha}/check-runs?{query}",
+                  f"{api}/repos/{repository}/{path}",
                   headers={
                       "Accept": "application/vnd.github+json",
                       "Authorization": f"Bearer {token}",
@@ -658,19 +674,44 @@ jobs:
               )
               try:
                   with urllib.request.urlopen(request, timeout=20) as response:
-                      document = json.load(response)
+                      return json.load(response)
               except urllib.error.HTTPError as error:
                   detail = error.read(300).decode(errors="replace").strip()
                   # A server error and a rate limit pass; a token that may not read the checks does not.
                   raise Unreadable(f"HTTP {error.code}: {detail}", error.code >= 500 or error.code == 429) from None
               except (OSError, ValueError) as error:
                   raise Unreadable(str(error) or type(error).__name__, True) from None
+
+
+          def check_runs(name):
+              query = urllib.parse.urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+              document = read(f"commits/{sha}/check-runs?{query}")
               runs = document.get("check_runs") if isinstance(document, dict) else None
               if not isinstance(runs, list):
                   raise Unreadable("the response has no check_runs list", True)
               return [run for run in runs if isinstance(run, dict) and run.get("name") == name]
 
 
+          def commits_past():
+              """How many commits the rolling tag is past this one: 0 when it is not, or when that cannot be told.
+
+              "ahead" is GitHub's word for a head (the tag) that contains the base (this commit) and more.
+              A tag that does not exist yet, a tag on another history and a request that failed are no
+              reason to stop waiting.
+              """
+              if not rolling_tag:
+                  return 0
+              try:
+                  document = read(f"compare/{sha}...{urllib.parse.quote(rolling_tag, safe='')}?per_page=1")
+              except Unreadable:
+                  return 0
+              if not isinstance(document, dict) or document.get("status") != "ahead":
+                  return 0
+              ahead = document.get("ahead_by")
+              return ahead if isinstance(ahead, int) and ahead > 0 else 0
+
+
+          past = 0
           while True:
               rows = []
               refused = []
@@ -702,12 +743,17 @@ jobs:
                   time.sleep(min(poll_seconds, remaining))
                   continue
               # A check that finished without success is final: waiting for the others changes nothing.
+              if not unfinished or len(refused) > len(unfinished):
+                  break
+              # Nor is anything waited for on behalf of a build that would not be published.
+              past = commits_past()
               remaining = deadline - time.monotonic()
-              if not unfinished or len(refused) > len(unfinished) or remaining <= 0:
+              if past or remaining <= 0:
                   break
               print(f"Waiting for {', '.join(unfinished)} ({'; '.join(refused)}).", flush=True)
               time.sleep(min(poll_seconds, remaining))
 
+          newer = f"{rolling_tag} is {past} commit{'' if past == 1 else 's'} past {sha[:7]}"
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write("#### Checks on the commit\n\n")
               if not rows:
@@ -717,11 +763,22 @@ jobs:
                   for name, state, url in rows:
                       summary.write(f"| {name} | {f'[{state}]({url})' if url else state} |\n")
                   summary.write("\n")
+              if past:
+                  summary.write(f"{newer}: a newer build is published. This build is not, and its checks are not waited for.\n\n")
 
           if not required:
               print("::notice::No check is required: required-checks is empty.")
           for name, state, _ in rows:
               print(f"{name}: {state}")
+          if past:
+              # Neither the checks' answer nor a failure: every pushed commit is built, and the build of
+              # a later one was published first. The output keeps the job that publishes from starting.
+              if os.environ.get("GITHUB_OUTPUT"):
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("superseded=true\n")
+              print(f"::notice title=A newer build is published::{newer}. This build is not published, so its "
+                    f"checks are not waited for ({'; '.join(refused)}).")
+              sys.exit(0)
           if refused:
               # The checks answered, and the answer is no. A step that could not read them never gets
               # here, so the output tells the two apart for the steps that follow.
@@ -735,14 +792,127 @@ jobs:
               sys.exit(1)
           CHECKS
 
+      # The APK of a commit that did not pass is kept nowhere, and neither is
+      # one that a newer build has overtaken: `publish` does not start for
+      # either. After any other failure of this job, checks that could not be
+      # read included, the artifact stays for the day GitHub keeps it, so the
+      # job can be run again. The script is the one `publish` ends with.
+      - name: Delete the build artifact
+        if: ${{ always() && (steps.checks.outputs.refused == 'true' || steps.checks.outputs.superseded == 'true') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if ! ids=$(gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/artifacts" --jq '.artifacts[] | select(.name | startswith("android-qa-apk-")) | .id'); then
+            echo "::warning::Cannot list the artifacts of this run. The QA artifact is kept for one day."
+            exit 0
+          fi
+          for id in $ids; do
+            if gh api --method DELETE "repos/$GH_REPO/actions/artifacts/$id" > /dev/null; then
+              echo "Deleted artifact $id."
+            else
+              echo "::warning::Could not delete artifact $id. It is kept for one day."
+            fi
+          done
+
+  # Publishes the APKs of the build that passed as the rolling pre-release of
+  # the line, once `checks` has passed. It runs on GitHub, checks out the
+  # repository only to read its history, and runs none of its code: the token
+  # that can write releases exists in this job alone.
+  #
+  # One publish job at a time per pre-release, and none is cancelled half way:
+  # two builds that finish together would otherwise each delete the APK of the
+  # other. Nothing in the job waits for anything but its own uploads, so a
+  # turn is short. GitHub keeps one waiting job per group, the one that
+  # arrived last, and the step below does not publish a commit that the
+  # pre-release is already past.
+  publish:
+    needs: [plan, primary, fallback, checks]
+    if: ${{ !cancelled() && needs.checks.result == 'success' && needs.checks.outputs.superseded != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: android-qa-publish-${{ needs.plan.outputs.major || 'source' }}-${{ inputs.label || (inputs.version != '' && needs.plan.outputs.version) || 'rolling' }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      # As in `checks`, word for word.
+      - name: Name the build
+        id: names
+        env:
+          SHA: ${{ needs.plan.outputs.sha }}
+          MAJOR: ${{ needs.plan.outputs.major }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          NUMBER: ${{ needs.plan.outputs.number }}
+          VERSION_CODE: ${{ needs.plan.outputs.version-code }}
+          SOURCE_BRANCH: ${{ inputs.source-branch || github.event.repository.default_branch }}
+          LABEL: ${{ inputs.label }}
+          VERSION_GIVEN: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for name in SHA VERSION NUMBER VERSION_CODE; do
+            if [[ -z "${!name}" ]]; then
+              missing="${missing:+$missing, }$name"
+            fi
+          done
+          if [[ -n "$missing" ]]; then
+            echo "::error title=The plan is incomplete::Empty: $missing. The plan job passed, so the runner dropped the output: it does that to an output that contains the value of a secret. Look for a secret whose value is a short word or number."
+            exit 1
+          fi
+          if [[ -n "$MAJOR" ]]; then
+            branch="release/$MAJOR.x"
+          else
+            branch="$SOURCE_BRANCH"
+          fi
+          line="${branch//\//-}"
+          if [[ -n "$LABEL" ]]; then
+            kind=label
+            apart="$LABEL"
+            version_name="$VERSION-$LABEL.$NUMBER"
+          else
+            kind=qa
+            # A build of a version that was given is kept apart under that version.
+            apart="${VERSION_GIVEN:+$VERSION}"
+            version_name="$VERSION-qa.$NUMBER"
+          fi
+          tag="qa-$line${apart:+-$apart}"
+          {
+            echo "branch=$branch"
+            echo "line=$line"
+            echo "kind=$kind"
+            echo "apart=$apart"
+            echo "version-name=$version_name"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          echo "$kind build $version_name ($VERSION_CODE) of $branch, published as $tag."
+
+      # Before the checkout: what the next steps read from the tags is then as
+      # fresh as it can be when the tag is moved. The name is built here and
+      # not passed as a job output: the runner drops an output that contains
+      # the value of a secret, and "release" is a likely key alias.
+      - name: Download the signed APKs
+        uses: actions/download-artifact@v8
+        with:
+          name: android-qa-apk-${{ needs.primary.result == 'success' && 'primary' || 'fallback' }}
+          path: ${{ runner.temp }}/android-qa-apk
+
       # Full history and every tag: the notes list what the commit adds to the
-      # build before it, which the rolling tag still names.
+      # build before it, which the rolling tag still names, and the other
+      # rolling tags say which versionCodes are published.
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.plan.outputs.sha }}
           fetch-depth: 0
           persist-credentials: false
 
+      # version-code: the plan numbered a label build from the tags as they
+      # were before the build. Another label build may have been published
+      # since, under the same number; code-taken-by then names its tag.
       - name: List the changes since the build before
         id: changes
         uses: asleep-ai/actions/release-version@android-ci/v1
@@ -750,33 +920,32 @@ jobs:
           operation: changes
           sha: ${{ needs.plan.outputs.sha }}
           since: ${{ steps.names.outputs.tag }}
-
-      # The name is built here and not passed as a job output: the runner
-      # drops an output that contains the value of a secret, and "release" is
-      # a likely key alias.
-      - name: Download the signed APKs
-        uses: actions/download-artifact@v8
-        with:
-          name: android-qa-apk-${{ needs.primary.result == 'success' && 'primary' || 'fallback' }}
-          path: ${{ runner.temp }}/android-qa-apk
+          version-code: ${{ needs.plan.outputs.version-code }}
 
       # One pre-release per line, named by a tag that is not a release tag
       # (qa-..., never v...). Every build moves the tag to its commit and
       # replaces the APKs: the release holds the newest build only.
       #
-      # The order keeps the pre-release whole at every moment, and a step that
-      # fails leaves it as it was or is put right by the next run:
+      # The order never leaves the pre-release without an APK, and a step that
+      # fails leaves it as it was or says what is left to do:
       # 1. The tag moves first. When the repository refuses that (a tag
       #    ruleset, or a token that may not move it), nothing has changed yet.
       #    The tag is annotated, and its message names the build it holds:
       #    release-version counts the label builds from these messages.
-      # 2. The new APKs are uploaded next to the old ones. An APK whose name
-      #    the release already holds is uploaded under another name, the old
-      #    one is deleted and the new one takes its name: `gh release upload
-      #    --clobber` would delete first and leave the release without that
-      #    APK for as long as the upload takes, or for good when it fails.
-      #    When an upload fails, the tag goes back where it was.
-      # 3. Title and notes, then the APKs of the build before are deleted.
+      # 2. Every new APK is uploaded next to the old ones. An APK whose name
+      #    the release already holds goes up under another name: `gh release
+      #    upload --clobber` would delete first and leave the release without
+      #    that APK for as long as the upload takes, or for good when it
+      #    fails. When an upload fails, what was uploaded is removed and the
+      #    tag goes back where it was: the pre-release is the build before.
+      # 3. From here on the new build is in the release, and nothing is undone
+      #    any more. An APK that went up under another name replaces the old
+      #    one: the old one is deleted, the new one takes its name. In between
+      #    the release holds the APK under the other name only. Then title and
+      #    notes, then the APKs of the build before are deleted. A call that
+      #    fails here does not stop the rest; the step ends with an error that
+      #    names what is left, and running the job again, or the next build,
+      #    puts it right.
       - name: Publish the rolling pre-release
         id: publish
         env:
@@ -800,6 +969,7 @@ jobs:
           PRS: ${{ steps.changes.outputs.prs }}
           STALE: ${{ steps.changes.outputs.stale }}
           UNCHANGED: ${{ steps.changes.outputs.unchanged }}
+          CODE_TAKEN_BY: ${{ steps.changes.outputs.code-taken-by }}
           APK_DIRECTORY: ${{ runner.temp }}/android-qa-apk
           STAGING_DIRECTORY: ${{ runner.temp }}/android-qa-upload
           NOTES_FILE: ${{ runner.temp }}/android-qa-notes.md
@@ -831,6 +1001,15 @@ jobs:
               echo "The pre-release [\`$TAG\`]($url) holds the build of \`${SINCE:0:7}\`, a later commit that contains \`${SHA:0:7}\`."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
+          fi
+
+          # A versionCode is published once. The plan gave a label build the
+          # number after the label builds that were published then; one that
+          # was built at the same time got the same number and was published
+          # first. Devices tell builds apart by the versionCode.
+          if [[ -n "$CODE_TAKEN_BY" ]]; then
+            echo "::error title=The versionCode is taken::$VERSION_NAME has the versionCode $VERSION_CODE, and the pre-release $CODE_TAKEN_BY holds a build of that versionCode: it was published while this one was built. Nothing is published. Start the workflow again with the same inputs (a new run, not a re-run of this one): it takes the next number."
+            exit 1
           fi
 
           # Two states, each read in a statement of its own: a request that
@@ -932,35 +1111,45 @@ jobs:
           assets_of_release() {
             gh api "repos/$GH_REPO/releases/tags/$TAG" --jq '.assets[] | "\(.id) \(.name)"'
           }
-          # Uploads one APK so that the release holds an APK of its name at
-          # every moment.
-          upload() {
-            local apk="$1" name held staged new
-            name=$(basename "$apk")
-            held=$(awk -v name="$name" '$2 == name { print $1 }' <<< "$assets")
-            if [[ -z "$held" ]]; then
-              gh release upload "$TAG" "$apk" > /dev/null || return 1
-              return 0
-            fi
-            staged="$STAGING_DIRECTORY/${name%.apk}.run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.apk"
-            mkdir -p "$STAGING_DIRECTORY" || return 1
-            cp "$apk" "$staged" || return 1
-            # --clobber: an earlier attempt of this very run may have left the file.
-            gh release upload "$TAG" "$staged" --clobber > /dev/null || return 1
-            new=$(assets_of_release | awk -v name="$(basename "$staged")" '$2 == name { print $1 }') || return 1
-            if [[ -z "$new" ]]; then
-              echo "The release does not list $(basename "$staged") after its upload."
-              return 1
-            fi
-            gh api --method DELETE "repos/$GH_REPO/releases/assets/$held" > /dev/null || return 1
-            gh api --method PATCH "repos/$GH_REPO/releases/assets/$new" -f "name=$name" > /dev/null || return 1
-            echo "Replaced $name: uploaded next to the one the release held, which was then deleted."
+          # The id of the asset named $1 in the listing $2, or nothing.
+          id_of() {
+            awk -v name="$1" '$2 == name { print $1 }' <<< "$2"
           }
+          # Step 2: every APK goes up next to what the release holds, and
+          # nothing the release holds is touched. An APK whose name is taken
+          # goes up under another name; a line of `staged` is that name and
+          # the APK's own. `uploaded` is every name this run adds.
+          uploaded=""
+          staged=""
           upload_all() {
-            local apk
+            local apk name copy
             for apk in "${apks[@]}"; do
-              upload "$apk" || return 1
+              name=$(basename "$apk")
+              if [[ -z "$(id_of "$name" "$assets")" ]]; then
+                uploaded+="$name"$'\n'
+                gh release upload "$TAG" "$apk" > /dev/null || return 1
+                continue
+              fi
+              copy="$STAGING_DIRECTORY/${name%.apk}.run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.apk"
+              mkdir -p "$STAGING_DIRECTORY" || return 1
+              cp "$apk" "$copy" || return 1
+              uploaded+="$(basename "$copy")"$'\n'
+              # --clobber: an earlier attempt of this very run may have left the file.
+              gh release upload "$TAG" "$copy" --clobber > /dev/null || return 1
+              staged+="$(basename "$copy") $name"$'\n'
             done
+          }
+          # After a failure of step 2: what this run added goes again, as far
+          # as that can be done, so the release holds the build before and
+          # nothing else. What stays behind is deleted by the next build.
+          remove_uploaded() {
+            local listing id asset
+            listing=$(assets_of_release) || return 0
+            while read -r id asset; do
+              if [[ -n "$id" ]] && grep -Fxq -- "$asset" <<< "$uploaded"; then
+                gh api --method DELETE "repos/$GH_REPO/releases/assets/$id" > /dev/null || true
+              fi
+            done <<< "$listing"
           }
 
           title="QA $LINE${APART:+ $APART}: $VERSION_NAME"
@@ -968,29 +1157,73 @@ jobs:
             echo "::error title=The tag could not be moved::$TAG was not moved to ${SHA:0:7}; the reason is in the lines above. Nothing is published, and the pre-release is as it was. When the repository's rules keep the job token from moving the tag, pass a token that may as the secret RELEASE_PUSH_TOKEN, or move it by hand: git tag -f -a $TAG -m '$VERSION_NAME ($VERSION_CODE)' ${SHA:0:7} && git push -f origin $TAG, and run this job again."
             exit 1
           fi
+          # What a call of step 3 that failed left to do.
+          left=""
           if [[ "$release_exists" == true ]]; then
             if ! assets=$(assets_of_release); then
               undo "Cannot list the APKs of the pre-release."
             fi
             if ! upload_all; then
+              remove_uploaded
               undo "An APK could not be uploaded."
             fi
-            gh release edit "$TAG" --title "$title" --notes-file "$NOTES_FILE" --prerelease --latest=false > /dev/null
+            # The ids of what went up under another name. Nothing of the build
+            # before is touched yet, so a failure is undone like an upload's.
+            if [[ -n "$staged" ]] && ! assets=$(assets_of_release); then
+              remove_uploaded
+              undo "Cannot list the APKs of the pre-release after the upload."
+            fi
+            while read -r from to; do
+              if [[ -n "$from" && -z "$(id_of "$from" "$assets")" ]]; then
+                remove_uploaded
+                undo "The release does not list $from after its upload."
+              fi
+            done <<< "$staged"
+
+            # Step 3. `kept` is the APKs of this build that still carry the
+            # name they were uploaded under.
+            kept=""
+            while read -r from to; do
+              if [[ -z "$from" ]]; then
+                continue
+              fi
+              if ! gh api --method DELETE "repos/$GH_REPO/releases/assets/$(id_of "$to" "$assets")" > /dev/null; then
+                kept+="$from"$'\n'
+                left="${left:+$left; }$to of the build before could not be deleted, and the new one is there as $from"
+              elif gh api --method PATCH "repos/$GH_REPO/releases/assets/$(id_of "$from" "$assets")" -f "name=$to" > /dev/null; then
+                echo "Replaced $to: uploaded next to the one the release held, which was then deleted."
+              else
+                kept+="$from"$'\n'
+                left="${left:+$left; }$to is there as $from, which could not be given its name"
+              fi
+            done <<< "$staged"
+            if ! gh release edit "$TAG" --title "$title" --notes-file "$NOTES_FILE" --prerelease --latest=false > /dev/null; then
+              left="${left:+$left; }its title and notes are still those of the build before"
+            fi
             # Whatever the release still holds from the builds before, and
             # from an upload that stopped half way.
-            held_now=$(assets_of_release)
-            while read -r id asset; do
-              keep=false
-              for apk in "${apks[@]}"; do
-                if [[ "$(basename "$apk")" == "$asset" ]]; then
+            if held_now=$(assets_of_release); then
+              while read -r id asset; do
+                keep=false
+                for apk in "${apks[@]}"; do
+                  if [[ "$(basename "$apk")" == "$asset" ]]; then
+                    keep=true
+                  fi
+                done
+                if grep -Fxq -- "$asset" <<< "$kept"; then
                   keep=true
                 fi
-              done
-              if [[ -n "$id" && "$keep" == false ]]; then
-                gh api --method DELETE "repos/$GH_REPO/releases/assets/$id" > /dev/null
-                echo "Deleted $asset of the build before."
-              fi
-            done <<< "$held_now"
+                if [[ -n "$id" && "$keep" == false ]]; then
+                  if gh api --method DELETE "repos/$GH_REPO/releases/assets/$id" > /dev/null; then
+                    echo "Deleted $asset of the build before."
+                  else
+                    left="${left:+$left; }$asset of the build before could not be deleted"
+                  fi
+                fi
+              done <<< "$held_now"
+            else
+              left="${left:+$left; }the APKs of the build before could not be listed and are still there"
+            fi
             action="Replaced the APK of the pre-release with $names"
           else
             # A release whose tag was deleted is a draft from then on, and a
@@ -1010,6 +1243,12 @@ jobs:
               undo "The pre-release could not be created."
             fi
             action="Created the pre-release with $names"
+          fi
+          # The tag stays where it is: the release holds this build, and the
+          # tag has to name the build the release holds.
+          if [[ -n "$left" ]]; then
+            echo "::error title=Published, but not completely::$TAG is at ${SHA:0:7} and the pre-release holds $VERSION_NAME, but $left. Run this job again, or leave it to the next build that is published: either puts it right."
+            exit 1
           fi
 
           if [[ "$BUILT_ON" == fallback ]]; then
@@ -1034,13 +1273,12 @@ jobs:
       # The artifact was only the way from the build job to this one. A QA
       # APK is large and built on every push, and artifacts count against the
       # organization's Actions storage, which a GitHub Release does not. It
-      # is deleted once the step above is done with it (the APK is published,
-      # or a newer build is), and when the checks refused the commit, whose
-      # APK is then not kept anywhere. After any other failure it stays, a
-      # check that could not be read included, so this job can be run again;
-      # GitHub removes it after a day.
+      # is deleted once the step above is done with it: the APK is published,
+      # or a newer build is. After a failure it stays, so this job can be run
+      # again; GitHub removes it after a day. (`checks` deletes it for a
+      # commit that this job never starts for.)
       - name: Delete the build artifact
-        if: ${{ always() && (steps.publish.outcome == 'success' || steps.checks.outputs.refused == 'true') }}
+        if: ${{ always() && steps.publish.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

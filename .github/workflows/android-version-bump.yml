@@ -330,6 +330,10 @@ jobs:
           except ValueError:
               sys.exit("::error::The time to wait for the checks is not a number.")
           deadline = time.monotonic() + wait_minutes * 60
+          # And only android-qa.yml names a tag: the one of the pre-release its build is published as. A
+          # build that pre-release is already past is not published whatever its checks say, so the step
+          # does not wait for them.
+          rolling_tag = os.environ.get("ROLLING_TAG", "").strip()
 
 
           class Unreadable(Exception):
@@ -340,10 +344,9 @@ jobs:
                   self.again = again
 
 
-          def check_runs(name):
-              query = urllib.parse.urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+          def read(path):
               request = urllib.request.Request(
-                  f"{api}/repos/{repository}/commits/{sha}/check-runs?{query}",
+                  f"{api}/repos/{repository}/{path}",
                   headers={
                       "Accept": "application/vnd.github+json",
                       "Authorization": f"Bearer {token}",
@@ -353,19 +356,44 @@ jobs:
               )
               try:
                   with urllib.request.urlopen(request, timeout=20) as response:
-                      document = json.load(response)
+                      return json.load(response)
               except urllib.error.HTTPError as error:
                   detail = error.read(300).decode(errors="replace").strip()
                   # A server error and a rate limit pass; a token that may not read the checks does not.
                   raise Unreadable(f"HTTP {error.code}: {detail}", error.code >= 500 or error.code == 429) from None
               except (OSError, ValueError) as error:
                   raise Unreadable(str(error) or type(error).__name__, True) from None
+
+
+          def check_runs(name):
+              query = urllib.parse.urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+              document = read(f"commits/{sha}/check-runs?{query}")
               runs = document.get("check_runs") if isinstance(document, dict) else None
               if not isinstance(runs, list):
                   raise Unreadable("the response has no check_runs list", True)
               return [run for run in runs if isinstance(run, dict) and run.get("name") == name]
 
 
+          def commits_past():
+              """How many commits the rolling tag is past this one: 0 when it is not, or when that cannot be told.
+
+              "ahead" is GitHub's word for a head (the tag) that contains the base (this commit) and more.
+              A tag that does not exist yet, a tag on another history and a request that failed are no
+              reason to stop waiting.
+              """
+              if not rolling_tag:
+                  return 0
+              try:
+                  document = read(f"compare/{sha}...{urllib.parse.quote(rolling_tag, safe='')}?per_page=1")
+              except Unreadable:
+                  return 0
+              if not isinstance(document, dict) or document.get("status") != "ahead":
+                  return 0
+              ahead = document.get("ahead_by")
+              return ahead if isinstance(ahead, int) and ahead > 0 else 0
+
+
+          past = 0
           while True:
               rows = []
               refused = []
@@ -397,12 +425,17 @@ jobs:
                   time.sleep(min(poll_seconds, remaining))
                   continue
               # A check that finished without success is final: waiting for the others changes nothing.
+              if not unfinished or len(refused) > len(unfinished):
+                  break
+              # Nor is anything waited for on behalf of a build that would not be published.
+              past = commits_past()
               remaining = deadline - time.monotonic()
-              if not unfinished or len(refused) > len(unfinished) or remaining <= 0:
+              if past or remaining <= 0:
                   break
               print(f"Waiting for {', '.join(unfinished)} ({'; '.join(refused)}).", flush=True)
               time.sleep(min(poll_seconds, remaining))
 
+          newer = f"{rolling_tag} is {past} commit{'' if past == 1 else 's'} past {sha[:7]}"
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write("#### Checks on the commit\n\n")
               if not rows:
@@ -412,11 +445,22 @@ jobs:
                   for name, state, url in rows:
                       summary.write(f"| {name} | {f'[{state}]({url})' if url else state} |\n")
                   summary.write("\n")
+              if past:
+                  summary.write(f"{newer}: a newer build is published. This build is not, and its checks are not waited for.\n\n")
 
           if not required:
               print("::notice::No check is required: required-checks is empty.")
           for name, state, _ in rows:
               print(f"{name}: {state}")
+          if past:
+              # Neither the checks' answer nor a failure: every pushed commit is built, and the build of
+              # a later one was published first. The output keeps the job that publishes from starting.
+              if os.environ.get("GITHUB_OUTPUT"):
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("superseded=true\n")
+              print(f"::notice title=A newer build is published::{newer}. This build is not published, so its "
+                    f"checks are not waited for ({'; '.join(refused)}).")
+              sys.exit(0)
           if refused:
               # The checks answered, and the answer is no. A step that could not read them never gets
               # here, so the output tells the two apart for the steps that follow.

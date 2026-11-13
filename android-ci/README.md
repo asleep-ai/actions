@@ -242,6 +242,7 @@ Measured cold builds on the GitHub-hosted runner (runs with `runner-labels` left
 - **`result` of a push to those branches therefore no longer says that the release variant builds. The check of the QA build says it**, and a release requires both: `pr-check / result` and `qa / built` are the default `required-checks` of the version bump and of the release ([The check a release requires](#the-check-a-release-requires)). The two defaults change together, so a calling repository that takes them cannot tag a commit whose release variant no job built: without a QA build of the push, the release is refused.
 - A pull request builds the release variant as before, so R8 and keep-rule breakage still surface before the merge, and so does a push to any other branch.
 - A repository that does not call `android-qa.yml` sets `release-build-on-push: true` here and `required-checks: pr-check / result` in the version bump and the release. Change both or neither: with `qa / built` taken out of `required-checks` while `release-build-on-push` is still `false`, a release would be cut from a commit whose release variant no job built.
+- **The same holds for the time between this version of the workflows and the calling repository's own `qa.yml`** ([Changes within `android-ci/v1`](#changes-within-android-civ1)). Until `qa.yml` is merged, no commit has `qa / built`, and every release is refused. A release that cannot wait takes both settings together, `release-build-on-push: true` and `required-checks: pr-check / result`, and **only a commit that was pushed after `release-build-on-push: true` reached the branch**: the pushes before it did not build the release variant, whatever their `pr-check / result` says. `required-checks` alone would release such a commit.
 
 The default:
 
@@ -744,7 +745,7 @@ jobs:
 - Call it on `push` to the branches that are released from, the default branch and `release/*.x`, and on `workflow_dispatch`. Whatever starts the run, only those branches are built ([Which commits are built](#which-commits-are-built)). `release/*.x` and not `release/**`: a push to `release/1.x/fix` would start a run that the plan refuses.
 - **Every push to those branches has to start a run, and no run is cancelled for a later one.** A release of a commit requires the check of its QA build, so:
   - no `paths` or `paths-ignore` filter on the `push` trigger. A push that changed documentation only is built like any other; without its run the commit could not be released;
-  - no `concurrency` in the calling file. With `cancel-in-progress`, the second of two merges in a row would cancel the build of the first, and the first could then not be released. The workflow keeps the order of what is published itself ([The rolling pre-release](#the-rolling-pre-release)).
+  - no `concurrency` in the calling file. With `cancel-in-progress`, the second of two merges in a row would cancel the build of the first, and the first could then not be released. With a group that cancels nothing, a whole run would wait behind the one before it, the wait for that one's checks included. The workflow keeps the order of what is published itself ([The rolling pre-release](#the-rolling-pre-release)).
 - `permissions` must grant the four scopes above: the pre-release and its tag (`contents: write`), private packages, the checks of the commit, and deleting the build's artifact (`actions: write`).
 - `secrets: inherit` is required, as for the release: the names in `local-properties-secrets` are known only to the calling repository.
 
@@ -752,7 +753,7 @@ jobs:
 
 ```
 plan ─▶ primary / build ─▶ fallback / build ─┬▶ built
-                                             └▶ publish
+                                             └▶ checks ─▶ publish
 ```
 
 | job | runs on | what it does |
@@ -761,7 +762,8 @@ plan ─▶ primary / build ─▶ fallback / build ─┬▶ built
 | `primary / build` | picked runner | Builds the commit with `./gradlew ciQa`, checks the APKs and uploads them as an artifact. |
 | `fallback / build` | `fallback-runs-on` | The same build again, only after an infrastructure failure of a self-hosted primary build. |
 | `built` | GitHub-hosted | States whether the commit was built: the check a release requires. |
-| `publish` | GitHub-hosted | Waits for the commit's checks, then replaces the APKs of the rolling pre-release and deletes the artifact. |
+| `checks` | GitHub-hosted | Waits for the commit's checks, each commit on its own. Stops waiting when a newer build is published. |
+| `publish` | GitHub-hosted | Replaces the APKs of the rolling pre-release and deletes the artifact, one build at a time per pre-release. |
 
 The build job is the one of the release ([The build](#the-build)): the work folder emptied before and after, a Gradle user home of its own, no cache and no daemon, the version read back from every APK and every signature verified. A QA build is signed with the release key, so it is trusted with no more than a release is. It is therefore a cold build on every push; size `build-timeout-minutes` for that.
 
@@ -778,7 +780,7 @@ The build job is the one of the release ([The build](#the-build)): the work fold
 - **The head of the source branch or of a maintenance branch `release/<major>.x`, and nothing else.** A push run builds the pushed commit; a manual run builds the head of the branch it was started on.
 - **A manual run on any other ref fails in `plan`**, before a job reads the signing key, and the error says which ref it was and where a QA build is built from. A branch that is not merged yet is not built: a QA build is signed with the release key and handed to people, so it is built from merged code. Merge the change, or test it as a local build.
 - The commit has to be one the branch itself pointed at. A run that waited while the branch moved on still builds its commit; a run for a commit the branch no longer has (a force push) fails.
-- **A commit the pre-release is already past is built too.** Its build is what its check stands for; `publish` then leaves the pre-release as it is ([The rolling pre-release](#the-rolling-pre-release)).
+- **A commit the pre-release is already past is built too.** Its build is what its check stands for; the pre-release is then left as it is ([The rolling pre-release](#the-rolling-pre-release)).
 - This is a rule of the workflow, checked from the run's own ref. It is not a protection of the signing key ([Who can release](#who-can-release)).
 
 ### The check a release requires
@@ -790,6 +792,14 @@ The build job is the one of the release ([The build](#the-build)): the work fold
 - **A manual run reports `<calling job> / built (manual run)` instead.** It builds what its inputs say (a label, a version, another flavor through `gradle-args`). A release reads the newest check run of a name, so under one name a manual build could stand in for the build of the push, or a failed one could hide it.
 - A commit whose push run failed for a reason outside the code is built again with **Re-run failed jobs** on that run; the check then succeeds, even when the pre-release has moved on.
 - A commit that no push run built has no such check and cannot be released: a commit that was pushed together with later ones, or one from before the repository called this workflow. Release a later commit.
+- **Do not make `qa / built` a required status check of a branch ruleset.** No pull request run reports it, so a pull request would wait for it for good. It is required of a release, by the workflows.
+- **Look at the name once.** The name of the job is an expression, and how GitHub prints it on a commit is seen only there. After the first push that this workflow builds, and before the first release:
+
+  ```bash
+  gh api repos/<owner>/<repo>/commits/<sha>/check-runs --jq '.check_runs[].name'
+  ```
+
+  The list has to contain `qa / built`. With another name there, every release is refused (`'qa / built' did not run on the commit`) until that name is in the `required-checks` of the version bump and of the release.
 
 ### The version of a QA build
 
@@ -832,7 +842,8 @@ A label build is a named test build: a fix to be confirmed on the device that sh
 ```
 
 - **It is numbered right after the last release of its line**, the last release the commit contains of the major the branch builds. Its versionCode is that release's plus `k`: `1.13.0` (`101350000`) < `1.13.1-ble-test.2` (`101350002`) < `1.13.1` (`101350100`). So it **installs over the release** a device runs, and **the next patch release installs over it**. Its name is the patch it leads up to.
-- **`k` counts the label builds published after that release**, whatever their label and branch: one above the highest, 1 for the first. A later label build therefore installs over an earlier one. The count is read from the rolling tags ([The rolling pre-release](#the-rolling-pre-release)): each names the build it holds. A build that was planned and never published took no number. Two runs that are planned in the same minute can get the same `k`; they are then two builds of one versionCode, and either installs over the other.
+- **`k` counts the label builds published after that release**, whatever their label and branch: one above the highest, 1 for the first. A later label build therefore installs over an earlier one. The count is read from the rolling tags ([The rolling pre-release](#the-rolling-pre-release)): each names the build it holds. A build that was planned and never published took no number.
+- **A number is taken when its build is published, not when it is planned.** Two label runs whose builds overlap (the second is started before the first is published, which is the whole of a cold build and the wait for the checks) are planned with the same `k`. `publish` therefore reads the tags again right before it moves its own: when another pre-release holds a build of the same versionCode by then, the job fails with `The versionCode is taken` and publishes nothing. Start the workflow again with the same inputs; the new run takes the next number. What is left is two `publish` jobs of different labels that read the tags within the same seconds.
 - **At most 99 after one release.** The hundredth is refused: the code after it is the next patch release's. Release the patch; the count starts at 1 again above it.
 - **A line without a release has no label builds.** There is nothing for the build to sit above, and the run is refused with that reason. Before a first release, test with the QA builds or with a preview. The same holds for the source branch after `release/<major>.x` took over its last major, until the next major is released.
 - **It is published as a pre-release of its own**, `qa-<line>-<label>`. The line's rolling pre-release is not touched, and a later build with the same label replaces the labelled one. It stays until someone deletes it (`gh release delete qa-develop-ble-test --cleanup-tag`).
@@ -845,20 +856,24 @@ A label is a name for a build, not a switch in the app. Behaviour that only one 
 
 `version` gives one manual run the version of its build: the next minor or the next major version after the last release, whose QA builds are numbered above every build of the current minor version. `1.14.0-qa.59` is `101400059`: it installs over `1.13.x`, releases included, and `1.14.0` installs over it.
 
-- **It names one of two versions and nothing else**: after `v1.13.0`, `1.14.0` or `2.0.0`. A value typed into a form is signed with the release key and installed; a device that takes `11.3.1-qa.60` refuses every build of 1.x and 2.x afterwards. Before a first release, `version` is no higher than the version the branch is heading for (`next-version`).
-- It is refused when it is released already, or when the branch cannot release it: a maintenance branch builds its own major, and the source branch no major that has a maintenance branch.
+- **It names one of two versions and nothing else**: after `v1.13.0`, `1.14.0` or `2.0.0`. A value typed into a form is signed with the release key and installed; a device that takes `11.3.1-qa.60` refuses every build of 1.x and 2.x afterwards.
+- **It is later than the version the builds of the branch lead up to without it.** That version itself is refused (`1.13.1` after `v1.13.0`, or `1.14.0` in a repository whose `next-version` is `1.14.0`): the build would have the name and the versionCode of the rolling build and sit in a second pre-release. A lower one is refused too. The error says to run without `version`.
+- **Before a first release no `version` is accepted.** The branch has one version to build then, the one it is heading for (`next-version`), and its builds are of it already.
+- It is refused when it is released already, or when the branch cannot release it: a maintenance branch builds its own major, and the source branch no major that has a maintenance branch. On the source branch, once `release/<major>.x` exists for its last major, that leaves nothing to name: the builds are of the next major already.
 - **The build is published apart**, as `qa-<line>-<version>` (`qa-develop-1.14.0`). The rolling pre-release of the branch stays a build that every device with an earlier one can take: a device that installed `1.14.0-qa.59` does not take `1.13.1-qa.60` afterwards.
 - For a branch, as opposed to one build, use `next-version` in the calling file.
 
 ### The checks of the commit
 
-`publish` hands an APK out only for a commit that passed `required-checks`, by default `pr-check / result`, decided by the script a release is decided with ([What is released](#what-is-released)).
+An APK is handed out only for a commit that passed `required-checks`, by default `pr-check / result`, decided by the script a release is decided with ([What is released](#what-is-released)). The job `checks` decides it, and `publish` starts only when it passed.
 
-- The push that starts the QA build starts the pull request check too, so the check is usually still running when the build is done. `publish` waits for it, asking every 30 seconds, for at most `checks-timeout-minutes`.
+- The push that starts the QA build starts the pull request check too, so the check is usually still running when the build is done. `checks` waits for it, asking every 30 seconds, for at most `checks-timeout-minutes`.
+- **Each commit waits on its own.** `checks` is in no concurrency group, so a commit that waits does not hold up the build of the commit after it: that one is published as soon as its own check has passed.
+- **A build that a newer one overtook is not waited for.** Before each wait the job asks GitHub how the tag of the pre-release compares with the commit. When the tag is at a later commit that contains this one, the build would not be published whatever its checks say ([The rolling pre-release](#the-rolling-pre-release)): the job stops with the notice `A newer build is published`, succeeds, deletes the artifact, and `publish` is skipped. This is how the commit in the middle of several merges in a row ends, whose pull request check was replaced while it waited and never appears: it waits until the build of the next commit is published, not for the whole of `checks-timeout-minutes`. A question that gets no answer changes nothing: the job goes on waiting.
 - A check that failed, was cancelled or was skipped ends the wait at once. Nothing is published, the job fails with the check's state, and the build's artifact is deleted: the APK of a commit that did not pass is kept nowhere.
-- A check that is still missing or running when the time is up fails the job the same way. The usual reason for a check that never appears is a pull request check that does not run on pushes to the branch, or whose run for this commit was replaced while it waited.
+- A check that is still missing or running when the time is up fails the job the same way. That takes a check that never appears on a commit that no newer build overtakes: a pull request check that does not run on pushes to the branch, or a commit in the middle of several merges whose successors are not published either (their checks failed). It costs that one job its wait and holds up nothing else.
 - A request that fails while the job waits (a server error, a rate limit, a timeout) is made again until the time is up. Checks that could not be read at all fail the job without being a refusal: the artifact stays, and **Re-run failed jobs** publishes the build once the API answers.
-- `checks-timeout-minutes` is a whole number of at most 100; the plan refuses more, because `publish` ends after 120 minutes.
+- `checks-timeout-minutes` is a whole number of at most 100; the plan refuses more, because `checks` ends after 120 minutes.
 - The wait is the only time this workflow spends on a GitHub-hosted runner without working. It starts after the build, so it is the difference between the two, not the length of the check.
 - A run whose checks refused the commit is started again as a whole (**Re-run all jobs**) once the check has passed: the artifact is gone.
 - `required-checks: ''` publishes without any check.
@@ -874,20 +889,23 @@ Each line has one GitHub Release, a pre-release that is never the latest release
 | a label build of `develop` with `label: ble-test` | `qa-develop-ble-test` |
 | a build of `develop` with `version: 1.14.0` | `qa-develop-1.14.0` |
 
-- **Every build replaces the APK**, in an order that leaves the pre-release whole at every moment:
+- **Every build replaces the APK**, in an order that never leaves the pre-release without an APK:
   1. The tag is moved to the commit that was built. When the repository refuses that, nothing has changed, and the job fails with what to do.
-  2. The new APKs are uploaded next to the old ones. An APK whose name the release already holds (a build that names every APK alike, or the same run again) is uploaded under another name, the old one is deleted, and the new one takes its name. `gh release upload --clobber` would delete first, and the pre-release would have no APK for as long as the upload takes, or for good when it fails. When an upload fails, the tag is put back.
-  3. Title and notes are rewritten, and the APKs of the build before are deleted.
-  The release holds the newest build only, however many pushes there were, and a run that stops half way is put right by the next one.
+  2. Every new APK is uploaded next to the old ones. An APK whose name the release already holds (a build that names every APK alike, or the same run again) goes up under another name, `<name>.run-<run id>-<attempt>.apk`: `gh release upload --clobber` would delete first, and the pre-release would have no APK for as long as the upload takes, or for good when it fails. **When an upload fails, the step undoes itself**: what it uploaded is removed, the tag is put back, and the pre-release is the build before.
+  3. The switch. An APK that went up under another name replaces the old one: the old one is deleted, then the new one takes its name. Title and notes are rewritten, and the APKs of the build before are deleted.
+  What that order does and does not promise:
+  - **There is always an APK to download**, of the build before or of this one. For a moment in step 3 there are both, and under a name that is replaced there is, between the two calls, only the APK under its upload name. A download by the release page finds a file at every moment; a link to one file name does not, across a build.
+  - **From step 3 on nothing is undone**, because the new build is in the release and the tag has to name the build the release holds. A call that fails there does not stop the rest, and the job ends with the error `Published, but not completely`, which names what is left: an APK that kept its upload name, a title that is still the old one, an old APK that is still there. **Re-run failed jobs** puts it right, and so does the next build that is published.
+  The release holds the newest build only, however many pushes there were.
 - **The tag is an annotated tag that moves**, and its message names the build the pre-release holds: `1.13.1-qa.57 (101300057)`. The label builds after a release are counted from these messages. It never starts with `v`, so neither the version bump nor the release workflow reads it as a version, and a release trigger on `v…` tags does not start for it. Do not base anything on it.
 - **The job token moves the tag** unless the repository's rules say otherwise: a tag ruleset, or immutable releases. Then give the workflow a token that may, as the secret `RELEASE_PUSH_TOKEN`, the one the version bump takes for release tags; it is used for the tag and nothing else.
 - **The notes** state the version name, the versionCode, the commit and the run, and list what the commit adds to the build before it: the pull requests between the commit the tag named and this one, as the version bump lists them. The first build of a line lists what it adds to the last release, and nothing when there is no release yet.
-- **One `publish` job at a time per pre-release**, and none is cancelled half way. Every pushed commit is built, so two builds can finish close together, or in the other order.
-  - **An older build does not replace a newer one.** When the pre-release is already at a later commit, `publish` says so, publishes nothing and succeeds: the commit was built, and that is all its check claims.
+- **One `publish` job at a time per pre-release**, and none is cancelled half way. Every pushed commit is built, so two builds can finish close together, or in the other order. A turn is short: the job waits for nothing but its own uploads, because the wait for the checks is over before it starts ([The checks of the commit](#the-checks-of-the-commit)).
+  - **An older build does not replace a newer one.** When the pre-release is already at a later commit, the build is not published and the run still succeeds: the commit was built, and that is all its check claims. `checks` says so when it would have had to wait, `publish` when the checks had passed already.
   - GitHub keeps one waiting job per group, the one that arrived last. A build whose `publish` was replaced while it waited shows that job as cancelled; the newer build is published, and nothing is lost.
-  - The case that needs a hand: two `publish` jobs wait behind a third, and the one that arrived last is of the older commit, such as a run that was started again. The newer one is cancelled, and the pre-release stays behind until the next push. Run the cancelled `publish` job again (**Re-run failed jobs**); its artifact is kept for a day.
+  - The case that needs a hand: two `publish` jobs wait behind a third, and the one that arrived last is of the older commit, such as a run that was started again. The newer one is cancelled, and the pre-release stays behind until the next push. Run the cancelled `publish` job again (**Re-run failed jobs**); its artifact is kept for a day. It takes three builds whose uploads overlap.
 - **A re-run of an old run** builds its commit again and reports its check. It does not move the pre-release back.
-- **Why a release and not an artifact.** Artifacts count against the organization's Actions storage for as long as they are kept, and a QA APK of every push fills it; assets of a GitHub Release do not count against it. The artifact that carries the APKs from the build job to `publish` is kept for one day, the shortest GitHub allows, and `publish` deletes it once it is done with it: the APK is published, or a newer build is. After a failure of `publish` it stays for that day, so the job can be run again.
+- **Why a release and not an artifact.** Artifacts count against the organization's Actions storage for as long as they are kept, and a QA APK of every push fills it; assets of a GitHub Release do not count against it. The artifact that carries the APKs from the build job to `publish` is kept for one day, the shortest GitHub allows, and the job that is done with it deletes it: `publish` once the APK is published, `checks` when the checks refused the commit or a newer build overtook it. After any other failure it stays for that day, so the job can be run again.
 - The download link of a line is its release page, `…/releases/tag/qa-develop`. The file name of the APK is the build's. A build that puts the version name into it gives every build its own name; nothing in the workflow depends on that.
 
 ### Sentry
@@ -912,12 +930,12 @@ Each line has one GitHub Release, a pre-release that is never the latest release
 | `build-tools-version` | `''` | Optional build-tools version whose `apksigner` and `aapt2` check the APKs. Empty uses the highest installed version. |
 | `sentry-upload` | `false` | Whether the Gradle step gets `SENTRY_AUTH_TOKEN` ([Sentry](#sentry)). |
 | `source-branch` | `''` | The branch releases are cut from. Empty means the repository's default branch. A QA build is built from it or from `release/<major>.x`. |
-| `version` | `''` | Optional, for one run: the next minor or the next major version `X.Y.Z`, for one QA build of it that is published apart ([A build of the next minor or major version](#a-build-of-the-next-minor-or-major-version)). Not with `label`. |
+| `version` | `''` | Optional, for one run: the next minor or the next major version `X.Y.Z`, later than the version the branch builds without it, for one QA build of it that is published apart ([A build of the next minor or major version](#a-build-of-the-next-minor-or-major-version)). Not with `label`. |
 | `next-version` | `''` | Optional, for every run of the calling file: the version the branch is heading for. Used while it is higher than the last release, no higher than the next major version after it, and not released. |
 | `label` | `''` | Optional, for one run: makes the build a label build, a named test build numbered right after the last release of its line ([Label builds](#label-builds)). |
 | `sequence-offset` | `0` | A whole number added to the run number of the calling workflow to give the `N` of a QA build. |
 | `required-checks` | `pr-check / result` | Names of the checks that must have succeeded on the commit before its APK is published, one per line. Empty requires none. |
-| `checks-timeout-minutes` | `60` | How long `publish` waits, after the build, for a required check that has not finished. A whole number, at most 100. |
+| `checks-timeout-minutes` | `60` | How long `checks` waits, after the build, for a required check that has not finished. A whole number, at most 100. |
 | `build-timeout-minutes` | `60` | Timeout of the build job, on either kind of runner. The build never uses a cache, so size it for a cold build. |
 | `self-hosted-max-workers` | `32` | Gradle `--max-workers` on a self-hosted runner. Empty leaves Gradle's default. |
 | `self-hosted-gradle-jvmargs` | `-Xmx16g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8` | `org.gradle.jvmargs` on a self-hosted runner. Empty keeps the caller's `gradle.properties` value. |
@@ -1036,6 +1054,23 @@ Pinning a workflow to a full version or a commit SHA fixes its workflow files, n
 
 `android-pr-check-jobs.yml` and `android-release-build.yml` are internal: their inputs change without notice, so call `android-pr-check.yml`, `android-release.yml` and `android-qa.yml`.
 
+### Changes within `android-ci/v1`
+
+`android-ci/v1.2.0`, the release that adds `android-qa.yml`, changes three things a caller of `android-ci/v1` already relies on. They change together because they are one decision: the release variant of a pushed commit is built once, by the QA build ([Skipped builds](#skipped-builds)).
+
+| what | before | from `v1.2.0` | a caller that does nothing |
+|------|--------|---------------|----------------------------|
+| input `release-build-skip-push-branches` of `android-pr-check.yml` | a list of branches whose pushes skip the release build | **removed**; `release-build-on-push` (boolean) and `source-branch` take its place | A caller that still passes it does not start: GitHub refuses the run with "invalid input". Remove the input. |
+| the release build of a push, in `android-pr-check.yml` | built on every push | **skipped by default** on a push to the source branch and to `release/<major>.x` (`release-build-on-push: false`); pull requests and other pushes build it as before | `pr-check / result` of such a push no longer says that the release variant builds. |
+| default `required-checks` of `android-version-bump.yml` and `android-release.yml` | `pr-check / result` | `pr-check / result` **and `qa / built`** | Every release is refused (`'qa / built' did not run on the commit`) until the repository calls `android-qa.yml` from a job named `qa`, or sets the two inputs of the last line of [Skipped builds](#skipped-builds). |
+
+Moving the tag `android-ci/v1` to this release:
+
+- **Search for the callers first**: every repository that calls `android-pr-check.yml@android-ci/v1` (`org:<org> "android-pr-check.yml@android-ci/v1"` in GitHub's code search). One that passes `release-build-skip-push-branches` breaks at the move, and each one stops releasing until it has its `qa.yml` or the two inputs.
+- **Move it in one sitting with the calling repositories' changes**, and merge those right after. Between the two, a calling repository cannot release, and its pushes to the release branches do not build the release variant.
+- **Not while a version bump or a release is running.** A run reads the workflow file when it starts and each action of this repository when the job that uses it starts. A move in between gives one run the plan of one version and the versionCode formula of another.
+- A calling repository whose earlier workflow made builds by another formula stops making them before the move: their versionCodes and the new ones are counted apart, and may collide or leapfrog a release.
+
 ## Development
 
 ```bash
@@ -1044,4 +1079,4 @@ uv run --with pytest --with pyyaml python -m pytest android-ci -q
 
 The tests read the workflow files. They run the shell of each `run` step against throwaway git repositories and stand-ins for `gradlew`, `keytool`, `gh`, `aapt2` and the GitHub API, check every combination of results and verdicts that `result` has to decide, and fail when the copies that have to match drift apart: the `verify` and `release-build` jobs, the `primary` and `fallback` calls of the build workflows, and the script that reads a commit's checks in the version bump, the release and the QA build.
 
-They cannot evaluate GitHub's expressions or its behaviour: job conditions, job names and the expressions that put a version name together are pinned as text, and how secrets of an environment reach a called workflow, whether a push or the move of a tag is accepted under the repository's rules, under which name the check of a job appears on a commit, whether a started workflow runs, and how GitHub shows a pre-release whose tag was moved are verified only by running the workflows from a calling repository. The stand-in for `gh` in the QA tests keeps the assets of a release and records them after every change, so the tests do see whether a release was ever without its APK; they do not see what the real API answers.
+They cannot evaluate GitHub's expressions or its behaviour: job conditions, job names and the expressions that put a version name together are pinned as text, and how secrets of an environment reach a called workflow, whether a push or the move of a tag is accepted under the repository's rules, under which name the check of a job appears on a commit, what GitHub answers when a tag is compared with a commit, whether a started workflow runs, and how GitHub shows a pre-release whose tag was moved are verified only by running the workflows from a calling repository. The stand-in for `gh` in the QA tests keeps the assets of a release and records them after every change, so the tests do see whether a release was ever without its APK; they do not see what the real API answers.

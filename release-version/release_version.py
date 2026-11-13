@@ -50,8 +50,9 @@ qa    Plan a QA build of a branch head: its version name, its versionCode and
         the last release. The number is qa-sequence plus qa-sequence-offset.
       - version names the version of this one build: the next minor or the
         next major version, whose QA builds install over the releases that
-        are out. Such a build is published apart from the rolling build of
-        its branch.
+        are out, and a later one than the builds of the branch are of without
+        it. Such a build is published apart from the rolling build of its
+        branch.
       - With label, the build is a label build, <version>-<label>.<number>: a
         named test build made after the last release of its line. The version
         is the patch after that release, and the versionCode is the release's
@@ -63,7 +64,8 @@ changes
       What a commit adds to the commit a tag names (the previous build of a
       rolling QA release), as the pull request list of next. When the tag
       does not exist or is not part of the commit's history, the list starts
-      at the last release the commit contains.
+      at the last release the commit contains. With version-code, also
+      whether another rolling tag holds a build of that versionCode.
 
 Anything that cannot be decided fails the step: a release is not planned on a
 guess.
@@ -639,9 +641,16 @@ def qa_base(
     # version is typed into a form for one run, and a build of it is signed with the release key:
     # every device that takes it refuses each lower versionCode afterwards. So it names one of the
     # two versions the line can reach after its next patch, and nothing above them.
+    #
+    # And nothing at or below the version the builds of the branch are of without it. The same
+    # version would be a second build under the name and the versionCode of the rolling one, in
+    # another pre-release; a lower one is in a block of codes the branch has left behind.
     version = parsed(exact)
     problem = usable(version)
-    if not problem and last:
+    if not problem and version <= default:
+        heading = "that very version" if version == default else f"{format_version(default)}, a later version,"
+        problem = f"the QA builds of {branch} lead up to {heading} without it ({why}). Run without version"
+    elif not problem and last:
         steps = (bump_version(last, "minor"), bump_version(last, "major"))
         if version not in steps:
             problem = (
@@ -649,7 +658,8 @@ def qa_base(
                 f"next major version after {prefix}{format_version(last)}. Without version, the build is one of "
                 f"{format_version(default)}"
             )
-    elif not problem and version > default:
+    elif not problem:
+        # Before a first release there is one version to build: the one the branch is heading for.
         problem = (
             f"it is above {format_version(default)}, the version this branch is heading for before its first "
             "release. A later version is named in next-version, in the calling file"
@@ -659,24 +669,32 @@ def qa_base(
     return version, last, own, "given as version"
 
 
-def label_numbers(base: tuple) -> list:
-    """The numbers of the label builds published after the release `base`.
+def rolling_builds() -> list:
+    """The builds the rolling pre-releases hold, as (tag, versionCode).
 
     A rolling pre-release holds one build, and its tag says which: the publish
     job writes "<version name> (<versionCode>)" into the annotated tag it moves.
-    The label builds after a release are the tags whose versionCode is in the
-    ninety-nine codes after that release's, whatever their label and branch.
-    A build that was planned and never published took no number.
+    A tag without such a message names no build.
+    """
+    listing = git("for-each-ref", "--format=%(refname:strip=2)%1f%(objecttype)%1f%(contents:subject)", ROLLING_TAGS)
+    builds = []
+    for line in listing.stdout.splitlines():
+        tag, kind, subject = (line.split("\x1f") + ["", ""])[:3]
+        match = ROLLING_MESSAGE.fullmatch(subject.strip()) if kind == "tag" else None
+        if match:
+            builds.append((tag, int(match["code"])))
+    return builds
+
+
+def label_numbers(base: tuple) -> list:
+    """The numbers of the label builds published after the release `base`.
+
+    They are the rolling tags whose versionCode is in the ninety-nine codes
+    after that release's, whatever their label and branch. A build that was
+    planned and never published took no number.
     """
     low = release_code(*base)
-    listing = git("for-each-ref", "--format=%(objecttype)%1f%(contents:subject)", ROLLING_TAGS).stdout
-    numbers = []
-    for line in listing.splitlines():
-        kind, _, subject = line.partition("\x1f")
-        match = ROLLING_MESSAGE.fullmatch(subject.strip()) if kind == "tag" else None
-        if match and low < int(match["code"]) <= low + MAX_LABEL_BUILDS:
-            numbers.append(int(match["code"]) - low)
-    return numbers
+    return [code - low for _, code in rolling_builds() if low < code <= low + MAX_LABEL_BUILDS]
 
 
 def changes_since(target: str, since_tag: str, prefix: str) -> Changes:
@@ -940,6 +958,16 @@ def run_changes(env: Mapping[str, str]) -> None:
     # that moves the tag afterwards can tell whether it is still where this list was read from.
     named = git("rev-parse", "--verify", "--quiet", f"refs/tags/{since_tag}", check=False) if since_tag else None
     since_object = named.stdout.strip() if named is not None and named.returncode == 0 else ""
+    # A versionCode is published once. The number of a label build was taken from these tags when
+    # the build was planned, and another build may have been published under it since: the caller
+    # asks again here, with the tags as they are when it is about to publish.
+    taken_by = ""
+    given_code = env.get("VERSION_CODE", "").strip()
+    if given_code:
+        code = whole_number(given_code, "version-code")
+        taken_by = next((tag for tag, held in rolling_builds() if held == code and tag != since_tag), "")
+        if taken_by:
+            print(f"{taken_by} holds a build of the versionCode {code}.")
     if changes.stale:
         print(f"{since_tag} is at {changes.since[:7]}, a later commit that contains {target[:7]}.")
     elif changes.unchanged:
@@ -954,6 +982,7 @@ def run_changes(env: Mapping[str, str]) -> None:
         "prs": changes.prs,
         "stale": "true" if changes.stale else "false",
         "unchanged": "true" if changes.unchanged else "false",
+        "code-taken-by": taken_by,
     })
 
 

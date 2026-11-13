@@ -33,7 +33,7 @@ permissions:
   contents: write       # the rolling pre-release and its tag
   packages: read        # private GitHub Packages of this repository
   checks: read          # the checks of the commit
-  actions: write        # delete the build's artifact once it is published
+  actions: write        # delete the build's artifact once it is done with
 
 jobs:
   # The name of this job is part of the check a release requires by default,

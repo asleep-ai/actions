@@ -586,6 +586,21 @@ def test_what_the_push_build_no_longer_covers_is_required_of_a_release_by_defaul
     assert list(example["jobs"]) == ["qa"]
 
 
+def test_the_readme_names_what_changed_for_a_caller_of_the_major_tag(entry):
+    # The three changes reach every caller of android-ci/v1 with the move of that tag: an input
+    # that is gone (a caller that passes it does not start), a build a push no longer makes, and a
+    # check a release requires from then on. The README says so where the tags are described.
+    section = (ROOT / "android-ci" / "README.md").read_text().split("### Changes within `android-ci/v1`", 1)[1].split("\n## ", 1)[0]
+    assert "release-build-skip-push-branches" not in trigger(entry)["inputs"]
+    for word in ("`release-build-skip-push-branches`", "`release-build-on-push: false`", "`pr-check / result` **and `qa / built`**"):
+        assert word in section, word
+    assert "Search for the callers first" in section and "Not while a version bump or a release is running" in section
+    # And where the two settings of a caller without a QA build are described: in the time before
+    # its qa.yml, only a commit pushed after release-build-on-push: true has its release variant built.
+    skipped = (ROOT / "android-ci" / "README.md").read_text().split("### Skipped builds", 1)[1].split("\n### ", 1)[0]
+    assert "only a commit that was pushed after `release-build-on-push: true` reached the branch" in skipped
+
+
 def test_plan_of_the_default_paths_ignore(entry, jobs, tmp_path):
     default = trigger(entry)["inputs"]["paths-ignore"]["default"]
     assert default == DEFAULT_IGNORE
