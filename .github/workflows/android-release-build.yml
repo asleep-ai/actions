@@ -1,13 +1,14 @@
 name: Android release build
 
-# The build job of android-release.yml, which calls this file once on the
-# runner it picked and, after an infrastructure failure on a self-hosted
-# runner, once more on a GitHub-hosted runner. The job builds the tag with
-# ./gradlew ciRelease, signs with the caller's keystore, checks every APK the
-# build left and uploads them as one artifact for the publish job.
+# The build job of android-release.yml and of android-qa.yml. Each calls this
+# file once on the runner it picked and, after an infrastructure failure on a
+# self-hosted runner, once more on a GitHub-hosted runner. The job builds a
+# release tag with ./gradlew ciRelease, or a branch commit with ./gradlew ciQa,
+# signs with the caller's keystore, checks every APK the build left and
+# uploads them as one artifact for the publish job.
 #
-# This file is internal to android-release.yml: call that workflow, not this
-# one. The inputs are documented there and in android-ci/README.md.
+# This file is internal to those two workflows: call them, not this one. The
+# inputs are documented there and in android-ci/README.md.
 on:
   workflow_call:
     inputs:
@@ -18,19 +19,38 @@ on:
       attempt:
         description: >-
           primary or fallback. Both calls share one workflow run, so the
-          artifact with the signed APKs is named android-release-apk-<attempt>.
+          artifact with the signed APKs is named android-<kind>-apk-<attempt>.
+        required: true
+        type: string
+      kind:
+        description: >-
+          release or qa. It decides the Gradle task (ciRelease or ciQa), the
+          name of the artifact and how long it is kept: 90 days for a release,
+          1 day for a QA build, whose publish job deletes it.
         required: true
         type: string
       environment:
-        required: true
+        description: 'Empty runs the job in no environment.'
+        required: false
         type: string
-      tag:
+        default: ''
+      ref:
+        description: >-
+          What is checked out: refs/tags/<tag> for a release, the id of the
+          commit for a QA build.
         required: true
         type: string
       sha:
-        description: 'The commit the tag named when the release was planned.'
+        description: 'The commit the build was planned for.'
         required: true
         type: string
+      sentry-upload:
+        description: >-
+          Whether the Gradle step gets SENTRY_AUTH_TOKEN, whose presence turns
+          the mapping upload on in the caller's build.
+        required: false
+        type: boolean
+        default: true
       version-name:
         required: true
         type: string
@@ -141,7 +161,7 @@ jobs:
           find "$GITHUB_WORKSPACE" -mindepth 1 -delete
           echo "Emptied $GITHUB_WORKSPACE."
 
-      # Before anything is checked out, so a release that cannot be built
+      # Before anything is checked out, so a build that cannot be made
       # stops here and names everything that is missing at once. The four
       # signing values are always needed; the caller lists the rest. A name is
       # looked up among the secrets and then among the variables this job can
@@ -249,26 +269,26 @@ jobs:
       - uses: actions/checkout@v7
         id: checkout
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ inputs.ref }}
           token: ${{ inputs.checkout-submodules != 'false' && secrets.GIT_TOKEN || github.token }}
           submodules: ${{ inputs.checkout-submodules }}
           persist-credentials: false
 
-      # The version and the release were planned for one commit. A tag that
+      # The version and the build were planned for one commit. A tag that
       # was moved since then is another release.
       - name: Check the commit
         id: commit
         env:
-          TAG: ${{ inputs.tag }}
+          REF: ${{ inputs.ref }}
           PLANNED_SHA: ${{ inputs.sha }}
         run: |
           set -euo pipefail
           head=$(git rev-parse HEAD)
           if [[ "$head" != "$PLANNED_SHA" ]]; then
-            echo "::error::Tag $TAG is at $head, and this release was planned for $PLANNED_SHA. The tag was moved; start the release again."
+            echo "::error::$REF is at $head, and this build was planned for $PLANNED_SHA. The ref was moved; start the run again."
             exit 1
           fi
-          echo "Building $TAG at $head."
+          echo "Building $REF at $head."
 
       - name: Set up the JDK
         id: java
@@ -338,6 +358,7 @@ jobs:
       - name: Run Gradle
         id: build
         env:
+          KIND: ${{ inputs.kind }}
           VERSION_NAME: ${{ inputs.version-name }}
           VERSION_CODE: ${{ inputs.version-code }}
           GRADLE_ARGS: ${{ inputs.gradle-args }}
@@ -347,14 +368,24 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GIT_TOKEN || github.token }}
           TOKEN_SOURCE: ${{ secrets.GIT_TOKEN != '' && 'GIT_TOKEN' || 'the job token (GIT_TOKEN did not reach this job)' }}
           # Only this step sees the token. Its presence is what turns the
-          # mapping upload on in the caller's build.
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          # mapping upload on in the caller's build. A QA build gets it only
+          # when its caller asks for the upload.
+          SENTRY_AUTH_TOKEN: ${{ inputs.sentry-upload && secrets.SENTRY_AUTH_TOKEN || '' }}
           RUNNER_KIND: ${{ runner.environment }}
           MAX_WORKERS: ${{ inputs.self-hosted-max-workers }}
           GRADLE_JVMARGS: ${{ inputs.self-hosted-gradle-jvmargs }}
           KOTLIN_DAEMON_JVMARGS: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
         run: |
           set -euo pipefail
+          # The task is one of two names, never a value a caller wrote.
+          case "$KIND" in
+            release) task=ciRelease ;;
+            qa) task=ciQa ;;
+            *)
+              echo "::error::kind is neither release nor qa."
+              exit 1
+              ;;
+          esac
           # Memory settings as in android-pr-check-jobs.yml: a self-hosted
           # host has far more cores than a build has memory for.
           extra=()
@@ -375,20 +406,20 @@ jobs:
           else
             echo "SENTRY_AUTH_TOKEN is not set: the build uploads nothing to Sentry."
           fi
-          echo "Version: $VERSION_NAME ($VERSION_CODE). Gradle user home: $GRADLE_USER_HOME"
-          # A release is built from its sources alone: no daemon of an earlier
-          # build, no build cache entry from anywhere. The copy in the temp
-          # directory is what gradle-log-verdict reads.
+          echo "Task: $task. Version: $VERSION_NAME ($VERSION_CODE). Gradle user home: $GRADLE_USER_HOME"
+          # A build that is signed is built from its sources alone: no daemon
+          # of an earlier build, no build cache entry from anywhere. The copy
+          # in the temp directory is what gradle-log-verdict reads.
           set -f
           # shellcheck disable=SC2086 # word splitting is intended: the value is an argument list
-          ./gradlew ciRelease "-PciVersionName=$VERSION_NAME" "-PciVersionCode=$VERSION_CODE" $GRADLE_ARGS \
+          ./gradlew "$task" "-PciVersionName=$VERSION_NAME" "-PciVersionCode=$VERSION_CODE" $GRADLE_ARGS \
             --no-daemon --no-build-cache ${extra[@]+"${extra[@]}"} 2>&1 | tee "$RUNNER_TEMP/gradle.log"
 
-      # ciRelease leaves the APKs of the release under apk-directory: one, or
+      # The task leaves the APKs of the build under apk-directory: one, or
       # one per flavor. The work folder was empty before the checkout, so
       # every APK there was built by this job. Each has to carry the version
       # it was built for: a build that ignores -PciVersionName or
-      # -PciVersionCode would otherwise be released under the wrong version.
+      # -PciVersionCode would otherwise be published under the wrong version.
       #
       # What the build left is the same on every runner, so a refusal of the
       # APKs themselves sets the output `refused`, and the job reports code: a
@@ -397,6 +428,7 @@ jobs:
       - name: Check the APKs
         id: apk
         env:
+          KIND: ${{ inputs.kind }}
           APK_DIRECTORY: ${{ inputs.apk-directory }}
           VERSION_NAME: ${{ inputs.version-name }}
           VERSION_CODE: ${{ inputs.version-code }}
@@ -408,6 +440,13 @@ jobs:
             echo "refused=true" >> "$GITHUB_OUTPUT"
             exit 1
           }
+          if [[ "$KIND" == qa ]]; then
+            task=ciQa
+            what="the QA build"
+          else
+            task=ciRelease
+            what="the release"
+          fi
           if [[ -z "$APK_DIRECTORY" || "$APK_DIRECTORY" == -* || ! -d "$APK_DIRECTORY" ]]; then
             refuse "apk-directory ($APK_DIRECTORY) is not a directory after the build."
           fi
@@ -416,7 +455,7 @@ jobs:
             apks+=("$found")
           done < <(find "$APK_DIRECTORY" -type f -name '*.apk' | sort)
           if [[ "${#apks[@]}" == 0 ]]; then
-            refuse "ciRelease left no APK under $APK_DIRECTORY."
+            refuse "$task left no APK under $APK_DIRECTORY."
           fi
           # The APKs become assets of one release, which names them by file name.
           duplicates=$(for apk in "${apks[@]}"; do basename "$apk"; done | sort | uniq -d)
@@ -454,7 +493,7 @@ jobs:
             fi
             echo "$apk: versionName=$built_name versionCode=$built_code"
             if [[ "$built_name" != "$VERSION_NAME" || "$built_code" != "$VERSION_CODE" ]]; then
-              echo "::error::$apk is version $built_name ($built_code), and the release is $VERSION_NAME ($VERSION_CODE). The build has to take its version from -PciVersionName and -PciVersionCode."
+              echo "::error::$apk is version $built_name ($built_code), and $what is $VERSION_NAME ($VERSION_CODE). The build has to take its version from -PciVersionName and -PciVersionCode."
               wrong=1
             fi
           done
@@ -478,13 +517,17 @@ jobs:
           expected-cert-sha256: ${{ inputs.expected-cert-sha256 }}
           build-tools-version: ${{ inputs.build-tools-version }}
 
+      # A release keeps its artifact next to the GitHub Release. A QA build is
+      # built on every push and its APK lives in the rolling pre-release, so
+      # its artifact is only the way to the publish job: that job deletes it,
+      # and one day is the shortest time GitHub keeps what it could not.
       - name: Upload the signed APKs
         id: upload
         uses: actions/upload-artifact@v7
         with:
-          name: android-release-apk-${{ inputs.attempt }}
+          name: android-${{ inputs.kind }}-apk-${{ inputs.attempt }}
           path: ${{ steps.apk.outputs.paths }}
-          retention-days: 90
+          retention-days: ${{ inputs.kind == 'qa' && 1 || 90 }}
           if-no-files-found: error
           # A re-run of the job uploads under the same name.
           overwrite: true

@@ -5,25 +5,34 @@ Reusable workflows for Android app repositories. The calling repository keeps a 
 | workflow | description |
 |----------|-------------|
 | [`android-pr-check.yml`](../.github/workflows/android-pr-check.yml) | Pull request check: code style, a verification build and a release build, with a GitHub-hosted re-run after an infrastructure failure on self-hosted runners. |
-| [`android-version-bump.yml`](../.github/workflows/android-version-bump.yml) | Release cut, started by hand: computes the next version from the tags and checks the commit. A dry run by default; with `dry_run` off and the planned version in `confirm`, it tags the commit `vX.Y.Z`. |
-| [`android-release.yml`](../.github/workflows/android-release.yml) | Release of a tag `vX.Y.Z`: a check of the tagged commit, a cold, signed build, a check of the APK, and a GitHub Release with the APK attached. |
+| [`android-version-bump.yml`](../.github/workflows/android-version-bump.yml) | Release cut, started by hand: computes the next version from the tags and checks the commit. A dry run by default; with `dry_run` off and the planned version in `confirm`, it tags the commit `vX.Y.Z`, or `vX.Y.Z-preview.N` for a preview of that version. |
+| [`android-release.yml`](../.github/workflows/android-release.yml) | Release of a tag `vX.Y.Z`: a check of the tagged commit, a cold, signed build, a check of the APK, and a GitHub Release with the APK attached. A tag `vX.Y.Z-preview.N` is built the same way and published as a pre-release. |
+| [`android-qa.yml`](../.github/workflows/android-qa.yml) | QA build of every push to a branch that is released from: the same signed build with a QA version, published as the rolling pre-release of its line once the commit's checks passed. |
 
 A version exists only as a git tag. No file in the calling repository states it, and no branch marks it:
 
 ```
 pull request merged ──▶ pr-check.yml on the push ──▶ `pr-check / result` on the merge commit
-        │
+        │               qa.yml on the push ──▶ build ──▶ (the check passed) ──▶ pre-release qa-<line>
         ▼
 version-bump.yml (by hand: pr, bump)    ──▶ plan                    a dry run, the default
 version-bump.yml (dry_run off, confirm) ──▶ plan ──▶ tag vX.Y.Z     the release
-                                                      │
+                                                      │             (prerelease: tag vX.Y.Z-preview.N)
                                                       ▼
 release.yml (for the tag) ──▶ plan ──▶ build with -PciVersionName, -PciVersionCode ──▶ GitHub Release
 ```
 
 No step waits for a person. The second run tags as soon as its plan passes, and the release is built and published from the tag ([Dry run and confirmation](#dry-run-and-confirmation), [Who can release](#who-can-release)).
 
-How the three fit together is in [Branches, tags and releases](#branches-tags-and-releases).
+Three kinds of build come out of this, all signed with the same key, so each installs over the one before it ([Version and versionCode](#version-and-versioncode)):
+
+| build | made by | published as | kept |
+|-------|---------|--------------|------|
+| QA build | every push to a release branch, or a manual run on one | the rolling pre-release `qa-<line>` | the newest one of each line |
+| preview | the version bump with `prerelease: preview` | the pre-release `vX.Y.Z-preview.N` | every one |
+| release | the version bump | the release `vX.Y.Z` | every one |
+
+How the workflows fit together is in [Branches, tags and releases](#branches-tags-and-releases).
 
 ## android-pr-check.yml
 
@@ -282,12 +291,17 @@ on:
       version:
         description: 'Exception: the exact version X.Y.Z to release (bump is then ignored)'
         type: string
+      prerelease:
+        description: 'none: the release vX.Y.Z. preview: a preview of that version, vX.Y.Z-preview.N'
+        type: choice
+        options: [none, preview]
+        default: none
       dry_run:
         description: 'Dry run: plan and check only. Untick to release, and fill in confirm'
         type: boolean
         default: true
       confirm:
-        description: 'To release (dry run off): the version the dry run planned, e.g. v1.13.1'
+        description: 'To release (dry run off): the version the dry run planned, e.g. v1.13.1 or v2.0.0-preview.1'
         type: string
 
 concurrency:
@@ -308,6 +322,7 @@ jobs:
       sha: ${{ inputs.sha }}
       bump: ${{ inputs.bump }}
       version: ${{ inputs.version }}
+      prerelease: ${{ inputs.prerelease != 'none' && inputs.prerelease || '' }}
       dry_run: ${{ inputs.dry_run }}
       confirm: ${{ inputs.confirm }}
 ```
@@ -316,6 +331,7 @@ jobs:
 
 - `permissions` must grant the four scopes above: the tag (`contents: write`), starting the release workflow (`actions: write`), reading the commit's checks and the pull request.
 - No secret is needed. See [Secrets](#secrets-1) for the one optional token.
+- `prerelease` is a list in the form, so that another kind of prerelease is one more entry. Its first entry stands for the release; the workflow takes an empty value for that ([Previews](#previews)).
 - Keep `dry_run` on by default in the calling file, as above, and pass `confirm`. The two are what stands between a mistaken run and a published release: nothing in the workflow waits for a person ([Dry run and confirmation](#dry-run-and-confirmation)).
 - Give the calling file one `concurrency` group without cancellation, so two releases never run at once. GitHub keeps one waiting run per group: a third run started while one runs and one waits replaces the waiting one. The group above leaves dry runs out of it: a dry run writes nothing, so it starts at once and never replaces a release that waits.
 
@@ -329,7 +345,7 @@ jobs:
 ### What is released
 
 - **The commit** is the merge commit of the pull request named by `pr`: the commit the merge left on its base branch. `sha` names a commit directly and is the exception, for a commit that no pull request produced.
-- **The version** is the last release raised by `bump`. The last release is the highest `vX.Y.Z` among the tags the commit contains, compared as numbers. Tags with a suffix (`v1.2.3-rc.1`) or of another form are not releases. A repository without a release tag counts from `0.0.0`, so `minor` gives `v0.1.0`.
+- **The version** is the last release raised by `bump`. The last release is the highest `vX.Y.Z` among the tags the commit contains, compared as numbers. Tags with a suffix (`v1.2.3-preview.1`, `v1.2.3-rc.1`) or of another form (`qa-develop`) are not releases: previews and QA builds never change which version comes next. A repository without a release tag counts from `0.0.0`, so `minor` gives `v0.1.0`.
 - **An exact version** can be given instead, with `version` (`2.0.0` or `v2.0.0`). `bump` is then not read, and the log and the summary say so. It is for what a bump cannot reach: a first release that does not start at `0.x`, or a version that skips some. The version has to be higher than the last release the commit contains, must not be tagged yet, and is held to every rule below like a version that was computed.
 - **The branch** the commit has to be on is `source-branch`, by default the repository's default branch, or the maintenance branch of the version's major ([Release lines](#release-lines)). "On the branch" means in its first-parent history: a commit the branch itself pointed at.
 - **The summary** shows `vA → vB`, the commit, its release line and versionCode, and the pull requests the release adds (number and title), read from the first-parent history between the two versions. A commit that names no pull request is listed by its id.
@@ -345,6 +361,7 @@ The plan refuses the release, with an error that says which rule it was, when:
 - the commit does not hold `release-workflow` as a workflow that calls `android-release.yml` and can be started by hand ([Starting the release](#starting-the-release)): a commit from before the repository adopted these workflows;
 - a check named in `required-checks` has not succeeded on the commit. The newest run of each check counts, and a check that never ran on the commit is a refusal;
 - the version has no versionCode under [the formula](#version-and-versioncode);
+- with `prerelease`: the value is not `preview`, or the commit is the commit of the last preview of the version or does not contain it ([Previews](#previews));
 - the run is not a dry run and `confirm` is not the planned version ([Dry run and confirmation](#dry-run-and-confirmation)).
 
 These refusals happen in `plan`, and all but the last are the same on a dry run, so a dry run shows whether the release can happen. The `tag` job can still fail on what only shows while writing: the version was taken by another release meanwhile ([Running again](#running-again)), or the repository's rules refuse the push.
@@ -367,7 +384,26 @@ release/1.x     └── v1.13.1 ── v1.13.2 ── v1.14.0 ── …      
 
 Nothing has to be configured for this: a repository without `release/<major>.x` branches has one line, and the rules above reduce to "the commit is on the source branch and contains the last release".
 
-To start a maintenance line, create `release/<major>.x` at the last release of that major (or at a later commit that belongs to it) before the source branch releases the next major. Add `release/**` to the pull request check's branches, and, in a repository that has created the `release` environment, `release/*` to its allowed branches when a job that signs runs on those branches.
+To start a maintenance line, create `release/<major>.x` at the last release of that major (or at a later commit that belongs to it) before the source branch releases the next major. Add `release/**` to the pull request check's branches and to the QA build's, and, in a repository that has created the `release` environment, `release/*` to its allowed branches when a job that signs runs on those branches.
+
+### Previews
+
+A preview is a build of a version that is not released yet, for people outside the team who use it for a while: a demo site, a guest room. It behaves like the release and is not one. With `prerelease: preview` the run plans **the same version** as without it, holds the commit to every rule above, and tags it `vX.Y.Z-preview.N` instead of `vX.Y.Z`:
+
+```bash
+gh workflow run version-bump.yml -f pr=412 -f version=2.0.0 -f prerelease=preview
+gh workflow run version-bump.yml -f pr=412 -f version=2.0.0 -f prerelease=preview -f dry_run=false -f confirm=v2.0.0-preview.1
+```
+
+- **`N` counts the previews of that version**: one above the highest `vX.Y.Z-preview.N` tag of the repository, starting at 1. A fix found at the demo site is merged and previewed again, as `preview.2`.
+- **A preview builds on the one before it.** The commit has to contain the last preview of the same version and add something to it; a commit from before it would carry a higher versionCode and older code. The summary lists what the preview adds to the one before it, or, for the first, to the last release.
+- **`confirm` is the whole name**, `v2.0.0-preview.1` or `2.0.0-preview.1`. The version alone does not confirm a preview, and the name of a preview does not confirm a release. A preview someone else cut in between changes the number, and the run then fails before it tags.
+- **The release workflow builds it like a release**: the same checks of the commit, the same key, `ciRelease` with `-PciVersionName=X.Y.Z-preview.N`, and a GitHub **pre-release** that is never the latest release, with notes ([android-release.yml](#the-tag-1)). Every preview keeps its tag and its pre-release.
+- **Its versionCode is between the QA builds and the release** of its minor version ([Version and versionCode](#version-and-versioncode)): a preview installs over a QA build, a later preview over an earlier one, and the release over all of them. So a site that runs `2.0.0-preview.3` takes `2.0.0` as an update.
+- **A preview of a patch release is below the release that is installed.** `2.0.1-preview.1` is in the block of 2.0, under `2.0.0`, and a device with `2.0.0` takes it only after an uninstall. The plan allows it and says so in a warning. Preview the next minor version (`bump: minor`) when the preview has to install over the release.
+- **The release is not affected.** `vX.Y.Z` is later cut with the same inputs and without `prerelease`; it is planned as if the previews did not exist, from any commit that passes the rules, and its notes cover everything since the release before it.
+- `main-branch`, when a caller uses it, is not moved by a preview.
+- `preview` is the only value. Another kind, such as a release candidate, would be a second entry of the same list with a range of versionCodes of its own ([`release-version`](../release-version/)).
 
 ### The tag
 
@@ -392,7 +428,7 @@ GitHub starts no workflow for a push made with the job token, so the new tag alo
 **No person approves a release, and no job waits.** A run that is not a dry run tags the commit as soon as its plan passes, and the tag is built, signed and published as a GitHub Release without another question. Two inputs take the place of an approval:
 
 - **`dry_run` is on by default**, here and in the calling file. A run started without thinking, from the form or with `gh workflow run version-bump.yml -f pr=…`, plans and checks and writes nothing. Its summary shows `vA → vB`, the commit, the pull requests the release adds and the result of every check, and ends with the value to pass as `confirm`.
-- **`confirm` has to name the planned version** (`v1.13.1` or `1.13.1`) when `dry_run` is off. The plan compares it with the version it computed and refuses the run, before anything is tagged, when it is empty or another version; the error names the version that was computed. A wrong `bump` or a mistyped `version` therefore ends in a failed run and not in a release, as long as the person passes the version they mean to release and not one copied from the failed run. A wrong `pr` is not caught: every pull request merged after the last release plans the same version, so check the commit in the dry run's summary and pass the same `pr` again. On a dry run `confirm` is not read.
+- **`confirm` has to name the planned version** (`v1.13.1` or `1.13.1`; for a preview its whole name, `v2.0.0-preview.1`) when `dry_run` is off. The plan compares it with the version it computed and refuses the run, before anything is tagged, when it is empty or another version; the error names the version that was computed. A wrong `bump` or a mistyped `version` therefore ends in a failed run and not in a release, as long as the person passes the version they mean to release and not one copied from the failed run. A wrong `pr` is not caught: every pull request merged after the last release plans the same version, so check the commit in the dry run's summary and pass the same `pr` again. On a dry run `confirm` is not read.
 
 So a release is two runs: a dry run, read by the person who releases, and the same inputs again with `dry_run` off and `confirm`:
 
@@ -424,8 +460,9 @@ What this is and is not:
 | `sha` | `''` | The exception to `pr`: id of the commit to release, 7 or more hex digits. A branch name is refused. |
 | `bump` | `patch` | Which part of the last version to raise: `patch`, `minor` or `major`. Not read when `version` is given. |
 | `version` | `''` | Optional. The exact version to release, `X.Y.Z`, instead of a bump. Higher than the last release the commit contains, and not tagged yet. |
+| `prerelease` | `''` | Optional. Empty plans the release `vX.Y.Z`. `preview` plans a preview of that version instead, `vX.Y.Z-preview.N` ([Previews](#previews)). Any other value is refused. |
 | `dry_run` | `true` | Plan and check only: nothing is tagged, pushed or started. On by default; a release turns it off and gives `confirm`. |
-| `confirm` | `''` | The version the plan is expected to compute, `X.Y.Z` or `vX.Y.Z`. Required when `dry_run` is `false`: the run is refused before the tag when the plan computes another version. Not read on a dry run. |
+| `confirm` | `''` | The version the plan is expected to compute, `X.Y.Z` or `vX.Y.Z`; for a preview the whole name, `vX.Y.Z-preview.N`. Required when `dry_run` is `false`: the run is refused before the tag when the plan computes another version. Not read on a dry run. |
 | `source-branch` | `''` | The branch releases are cut from. Empty means the repository's default branch. The commit has to be in its first-parent history, or in that of `release/<major>.x` for a major that has that branch. |
 | `required-checks` | `pr-check / result` | Names of the checks that must have succeeded on the commit, one per line, as the commit's list of checks shows them. Empty requires none. |
 | `main-branch` | `''` | Optional. A branch that is moved to the commit of a release from the source branch. Empty, the default, moves no branch. |
@@ -447,7 +484,9 @@ name: Release
 
 on:
   push:
-    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-preview.[0-9]+'
   workflow_dispatch:
 
 concurrency:
@@ -475,6 +514,7 @@ jobs:
 [`release.yml.example`](./release.yml.example) is a complete file.
 
 - `workflow_dispatch` is how [`android-version-bump.yml`](#starting-the-release) starts the release. The tag trigger covers a tag pushed by a person; such a tag is built only when it passes the same checks of branch and commit ([The tag](#the-tag-1)), and without the dry run and the `confirm` of the version bump ([Who can release](#who-can-release)). Leave the trigger out to build a tag only when someone starts the workflow for it.
+- The two tag patterns are the release tags and the preview tags ([Previews](#previews)). A pattern that matched every tag starting with `v` would do no harm, since the workflow refuses a tag of any other form, and neither pattern matches the rolling tags of the QA builds (`qa-…`).
 - `permissions` must grant the four scopes above: the GitHub Release, private packages, the checks of the tagged commit, and pull request descriptions for the release notes.
 - `secrets: inherit` is required here, unlike in the pull request check. See [Secrets and variables](#secrets-and-variables).
 
@@ -495,7 +535,7 @@ plan ─▶ primary / build ─▶ fallback / build ─▶ publish
 
 | what | contract |
 |------|----------|
-| `ciRelease` | Gradle task in the root project that builds the release APKs, signed, and runs the uploads that belong to a release, such as mapping files. One APK, or one per flavor: which variants those are is decided in the calling repository's build, and `gradle-args` can pass it a property. |
+| `ciRelease` | Gradle task in the root project that builds the release APKs, signed, and runs the uploads that belong to a release, such as mapping files. One APK, or one per flavor: which variants those are is decided in the calling repository's build, and `gradle-args` can pass it a property. A preview tag is built by the same task. |
 | APK location | After `ciRelease`, the APKs of the release, and no other `.apk` file, are below `apk-directory`, by default `app/build/outputs/apk`, where the Android Gradle plugin puts the APKs of the `app` module (`release/` without flavors, `<flavor>/release/` with them). Every `.apk` file found there is checked, verified and attached. Their file names differ, because they become assets of one release. |
 | Version | The build takes `versionName` from `-PciVersionName` and `versionCode` from `-PciVersionCode`, for every APK. The workflow reads both back from each APK and fails when one differs. |
 | Signing | The release variant's `signingConfig` reads `KEYSTORE_FILE`, `KEYSTORE_PASSWORD`, `KEY_ALIAS` and `KEY_PASSWORD` from `local.properties` in the repository root, as for the pull request check. |
@@ -507,7 +547,7 @@ plan ─▶ primary / build ─▶ fallback / build ─▶ publish
 
 | name | default | description |
 |------|---------|-------------|
-| `tag` | `''` | The release tag to build. Empty means the ref the run started for: the tag on a tag push, and on a manual run started for a tag. |
+| `tag` | `''` | The tag to build: `vX.Y.Z`, or `vX.Y.Z-preview.N` for a preview. Empty means the ref the run started for: the tag on a tag push, and on a manual run started for a tag. |
 | `runner-labels` | `''` | Self-hosted `runs-on` labels as a JSON array of strings. Empty builds on `fallback-runs-on`, with no runner check and no re-run. |
 | `fallback-runs-on` | `ubuntu-latest` | GitHub-hosted `runs-on`: a bare label or a JSON array of labels, as for the pull request check. |
 | `environment` | `release` | The environment of the build job. See [Environment](#environment). |
@@ -578,14 +618,17 @@ Either way:
 
 `plan` stops the release before any build, and before any job reads the signing key, when:
 
-- the tag is not of the form `vX.Y.Z`, or does not exist. A branch, or a tag with a suffix, is never built;
+- the tag is not of the form `vX.Y.Z` or `vX.Y.Z-preview.N`, or does not exist. A branch, a tag with any other suffix, or the rolling tag of a QA build is never built;
 - the tag is below the highest release tag of its major and has no GitHub Release yet. A new release with a lower version would carry a lower versionCode than the devices of that line already have. Building an older tag again for its existing release is allowed, and so is a new release of a lower major while a higher one exists ([Release lines](#release-lines));
+- the tag is a preview without a GitHub Release yet, and its version is not above the highest release tag of its major (a preview comes before the release of its version), or a higher preview of the same version exists;
 - the tagged commit is in the first-parent history of neither `source-branch` nor `release/<major>.x`, the maintenance branch of the tag's major: a commit of an open pull request, of a branch that was never merged or of another line, or the head commit of a pull request that was merged with a merge commit;
 - a check named in `required-checks` has not succeeded on the tagged commit. The newest run of each check counts, and a check that never ran on the commit is a refusal. The default is `pr-check / result`, which the commit gets from the `push` run of the pull request check on its branch, a run that always builds ([Skipped builds](#skipped-builds)).
 
 The last two are the rules of [`android-version-bump.yml`](#what-is-released), applied again to the tag. They hold for every run of this workflow: a tag the version bump created passes them a second time, and a tag that a person pushed, or a run that a person started for a tag, is held to them all the same. What such a tag does skip is the version bump's plan: the computed version, the summary, the dry run and `confirm` ([Who can release](#who-can-release)).
 
 A tag from before the calling repository had this pull request check has no such check on its commit, and is refused.
+
+A preview tag is held to the same rules, with the branch of its version's line as its branch. What differs is the version the build gets, `X.Y.Z-preview.N` with the versionCode of a preview, and how it is published ([The GitHub Release](#the-github-release)).
 
 ### The build
 
@@ -614,6 +657,7 @@ After the build, every `.apk` file below `apk-directory` is an APK of the releas
 - A new release gets the tag as its title, notes from [`release-notes`](../release-notes/) and every APK of the build.
 - The notes cover what the release adds to the previous release of its own line: the highest lower release tag the tagged commit contains that has a published release. `v1.13.2`, cut from `release/1.x` after `v2.0.0` exists, starts at `v1.13.1`; `v2.0.0` starts at the 1.x release the source branch grew from. A lower tag that was never published, because its build failed and the fix got the next version, is not a start, so its changes are in these notes. When there is no such release, as for the first one, the notes cover the whole history; a tag with a suffix (`vX.Y.Z-label.N`) is never a start.
 - Only the highest version of the repository is created as the latest release (`--latest=true`). A release of a lower major is created with `--latest=false`, whenever it is made.
+- A preview is created as a pre-release (`--prerelease --latest=false`), with its tag as the title. Its notes start at the published preview of the same version before it, so they say what changed since the build the site has, and the first preview of a version starts where the release would. A release never starts at a preview.
 - When the release of the tag exists already, its title, notes and latest mark are kept, because they may have been edited, and the APKs are uploaded again. An asset of the same name is replaced; an APK with another name is added next to it.
 - Running the release of a tag again is therefore safe. An APK the first run did not build, such as another flavor selected with a `gradle-args` property, is a second run for the same tag.
 
@@ -629,18 +673,216 @@ The `fallback` build starts when the primary build ran on a self-hosted runner, 
 
 After a failed primary build the run stays red even when the fallback build passed and the release was published. The summary of `publish` states the outcome.
 
+## android-qa.yml
+
+### Usage
+
+```yaml
+name: QA Build
+
+on:
+  push:
+    branches: [develop, 'release/**']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional: the version X.Y.Z this one build leads up to'
+        type: string
+      label:
+        description: 'Optional: a label (ble-test) for a build kept apart from the rolling one'
+        type: string
+
+concurrency:
+  group: qa-${{ github.ref }}-${{ inputs.label }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  packages: read
+  checks: read
+  actions: write
+
+jobs:
+  qa:
+    uses: asleep-ai/actions/.github/workflows/android-qa.yml@android-ci/v1
+    with:
+      runner-labels: '["self-hosted","Linux","X64"]'
+      version: ${{ inputs.version }}
+      label: ${{ inputs.label }}
+      local-properties-secrets: |
+        EXAMPLE_API_KEY
+        EXAMPLE_BASE_URL
+    secrets: inherit
+```
+
+[`qa.yml.example`](./qa.yml.example) is a complete file.
+
+- Call it on `push` to the branches that are released from, the default branch and `release/**`, and on `workflow_dispatch`. Whatever starts the run, only those branches are built ([Which commits are built](#which-commits-are-built)).
+- `concurrency` belongs to the calling file. With the group above, a newer push cancels the build of the push before it on the same branch, so a line builds its newest commit only, and a labelled build does not cancel the line's own.
+- `permissions` must grant the four scopes above: the pre-release and its tag (`contents: write`), private packages, the checks of the commit, and deleting the build's artifact (`actions: write`).
+- `secrets: inherit` is required, as for the release: the names in `local-properties-secrets` are known only to the calling repository.
+- A path filter on the `push` trigger is the calling repository's choice. Unlike the pull request check, nothing requires a QA build of every commit, so a documentation-only push may skip it; the pre-release then stays at the commit before.
+
+### Jobs
+
+```
+plan ─▶ primary / build ─▶ fallback / build ─▶ publish
+```
+
+| job | runs on | what it does |
+|-----|---------|--------------|
+| `plan` | GitHub-hosted | Refuses a ref that is not built, computes the version name and versionCode with [`release-version`](../release-version/), and picks the runner. |
+| `primary / build` | picked runner | Builds the commit with `./gradlew ciQa`, checks the APKs and uploads them as an artifact. |
+| `fallback / build` | `fallback-runs-on` | The same build again, only after an infrastructure failure of a self-hosted primary build. |
+| `publish` | GitHub-hosted | Waits for the commit's checks, then replaces the APKs of the line's rolling pre-release and deletes the artifact. |
+
+The build job is the one of the release ([The build](#the-build)): the work folder emptied before and after, a Gradle user home of its own, no cache and no daemon, the version read back from every APK and every signature verified. A QA build is signed with the release key, so it is trusted with no more than a release is. It is therefore a cold build on every push; size `build-timeout-minutes` for that.
+
+### What the calling repository provides
+
+| what | contract |
+|------|----------|
+| `ciQa` | Gradle task in the root project that builds the QA APKs, signed with the same `signingConfig` as the release. One APK, or one per flavor, as for `ciRelease`; `gradle-args` can pass it a property. What a QA build differs in (a variant, a flag, an upload it leaves out) is decided in this task, not in the workflow. The name is fixed. |
+| APK location, version, signing, `local.properties` | As for the release ([What the calling repository provides](#what-the-calling-repository-provides-1)): every `.apk` below `apk-directory` is checked and published, the build takes `-PciVersionName` and `-PciVersionCode` as they are, and the four signing keys are written to `local.properties`. |
+| The pull request check on pushes | The APK is published only when `required-checks` succeeded on the commit, and the commit gets `pr-check / result` from the `push` run of the pull request check on its branch. |
+
+### Which commits are built
+
+- **The head of the source branch or of a maintenance branch `release/<major>.x`, and nothing else.** A push run builds the pushed commit; a manual run builds the head of the branch it was started on.
+- **A manual run on any other ref fails in `plan`**, before a job reads the signing key, and the error says which ref it was and where a QA build is built from. A branch that is not merged yet is not built: a QA build is signed with the release key and handed to people, so it is built from merged code. Merge the change, or test it as a local build.
+- The commit has to be one the branch itself pointed at. A run that waited while the branch moved on still builds its commit; a run for a commit the branch no longer has (a force push) fails.
+- This is a rule of the workflow, checked from the run's own ref. It is not a protection of the signing key ([Who can release](#who-can-release)).
+
+### The version of a QA build
+
+A QA build is named after the version it leads up to, the next release of its line:
+
+```
+<version>-<line>.<N>            2.0.0-develop.57      1.13.2-release-1.x.58
+<version>-<label>.<N>           2.0.0-ble-test.59
+```
+
+**`<version>`** is computed from the release tags the commit contains ([What is released](#what-is-released)):
+
+| branch | version |
+|--------|---------|
+| the source branch | The last release raised by patch: `1.13.1` after `v1.13.0`. |
+| the source branch, once `release/<major>.x` exists for the major of its last release | The next major, `2.0.0`: by the rule of [release lines](#release-lines), that is the only version the branch can release. |
+| `release/<major>.x` | The last release of that major raised by patch, or `<major>.0.0` when the branch has none yet. |
+| no release tag at all | `0.0.1`. |
+
+Two inputs change it:
+
+- **`next-version`**, in the calling file, names the version the branch is heading for when that is not the patch after its last release: `2.0.0` before a first release, or the next minor or major while it is developed. It is used while it is higher than the last release the commit contains, belongs to the branch's line and is not released. After that release it is ignored, and the builds go on from the tags: a calling file that still says `2.0.0` after `v2.0.0` builds `2.0.1-develop.N`. The log says when it is not used and why.
+- **`version`**, for one run, names the version outright. It is refused when it is released already, not higher than the last release the commit contains, or of another line. Two uses: a branch that is becoming a new major is shown under that version instead of the old one, and a build that has to install over the current release takes the next minor version, whose codes are above it (below).
+
+**`<line>`** is the branch with slashes as hyphens: `develop`, `release-1.x`. So a build of a maintenance line is told from one of the source branch by its name, whatever the two versions are. **`<label>`** takes its place when the `label` input is given.
+
+**`<N>`** is the run number of the calling workflow plus `sequence-offset`. A later run is a higher number, on whichever branch; a run that is started again keeps its number. A new calling file counts from 1, so a repository whose installed QA builds have higher numbers sets `sequence-offset` to at least the last number that was used.
+
+**The versionCode** is `N` in the block of the version's minor version, below its previews and releases ([Version and versionCode](#version-and-versioncode)):
+
+- A QA build installs over an earlier QA build of the same minor version, and a preview or a release of that minor version installs over it.
+- A QA build does not install over a release of its own minor version. `1.13.1-develop.57` is `101300057`, below `1.13.0` at `101350000`. To put a test build on a device that runs the release, start the run with `version` set to the next minor version: `1.14.0-ble-test.59` is `101400059`. That device then takes `1.14.0` and later, and no further patch of 1.13.
+- A build with `version` is in another block than the builds without it. A device that installed `2.0.0-develop.60` does not take `1.13.1-develop.61` afterwards. For a branch, as opposed to one build, use `next-version`.
+- `N` has to stay below 40000, where the previews start. A build that would reach it fails in `plan`. `sequence-offset` may be negative.
+
+### Labelled builds
+
+`label` names a build apart from the rolling build of its branch: a test build for one device or one question (`ble-test`), or, in a repository with flavors, the build of another flavor.
+
+- Lowercase letters, digits and single hyphens, at most 40 characters. It cannot be the name of the line or of a prerelease kind.
+- The version name is `<version>-<label>.<N>` and the build is published as its own rolling pre-release, `qa-<line>-<label>`. The line's own pre-release is not touched, and a later build with the same label replaces the labelled one.
+- Everything else is the same build: the same branches only, the same checks of the commit, the same numbering.
+- A labelled pre-release stays until someone deletes it (`gh release delete qa-develop-ble-test --cleanup-tag`).
+
+### The checks of the commit
+
+`publish` hands an APK out only for a commit that passed `required-checks`, by default `pr-check / result`: the rule a release of that commit would be held to ([What is released](#what-is-released)), decided by the same script.
+
+- The push that starts the QA build starts the pull request check too, so the check is usually still running when the build is done. `publish` waits for it, asking every 30 seconds, for at most `checks-timeout-minutes`.
+- A check that failed, was cancelled or was skipped ends the wait at once. Nothing is published, the job fails with the check's state, and the build's artifact is deleted: the APK of a commit that did not pass is kept nowhere.
+- A check that is still missing or running when the time is up fails the job the same way. The usual reason for a check that never appears is a pull request check that does not run on pushes to the branch, or whose run for this commit was replaced while it waited.
+- The wait is the only time this workflow spends on a GitHub-hosted runner without working. It starts after the build, so it is the difference between the two, not the length of the check.
+- A run that failed here is started again as a whole (a manual run on the branch, or **Re-run all jobs**) once the check has passed: the artifact is gone.
+- `required-checks: ''` publishes without any check.
+
+### The rolling pre-release
+
+Each line has one GitHub Release, a pre-release that is never the latest release, named by a tag that is not a release tag:
+
+| build | tag and release |
+|-------|-----------------|
+| the source branch `develop` | `qa-develop` |
+| `release/1.x` | `qa-release-1.x` |
+| a build of `develop` with `label: ble-test` | `qa-develop-ble-test` |
+
+- **Every build replaces the APK.** The new APKs are uploaded, the tag is moved to the commit that was built, title and notes are rewritten, and the APKs of the build before are deleted. The release holds the newest build only, however many pushes there were. The new APKs are there before the old ones go, and a run that stops half way is put right by the next one.
+- **The notes** state the version name, the versionCode, the commit and the run, and list what the commit adds to the build before it: the pull requests between the commit the tag named and this one, as the version bump lists them. The first build of a line lists what it adds to the last release, and nothing when there is no release yet.
+- **The tag never starts with `v`**, so neither the version bump nor the release workflow reads it as a version, and a release trigger on `v…` tags does not start for it. It is a lightweight tag that moves; do not base anything on it.
+- **An older build does not replace a newer one.** A run for a commit that the pre-release has already moved past, such as a run that was started again later, fails instead of publishing.
+- **Why a release and not an artifact.** Artifacts count against the organization's Actions storage for as long as they are kept, and a QA APK of every push fills it; assets of a GitHub Release do not count against it. The artifact that carries the APKs from the build job to `publish` is kept for one day, the shortest GitHub allows, and `publish` deletes it as soon as the APK is published. After another failure of `publish` it stays for that day, so the job can be run again.
+- The download link of a line is its release page, `…/releases/tag/qa-develop`. The file name of the APK is the build's, so it changes with every build.
+
+### Sentry
+
+`sentry-upload` decides whether the Gradle step gets `SENTRY_AUTH_TOKEN`, whose presence is what turns the mapping upload on in the calling repository's build. It is off by default: no step of a QA build then has the token, and the build uploads nothing to Sentry. With `sentry-upload: true` the Gradle step, and no other step, gets the secret; name it in `required-secrets` when a QA build must not be made without it. An upload that needs no token is for `ciQa` to leave out.
+
+### Inputs
+
+| name | default | description |
+|------|---------|-------------|
+| `runner-labels` | `''` | Self-hosted `runs-on` labels as a JSON array of strings. Empty builds on `fallback-runs-on`, with no runner check and no re-run. |
+| `fallback-runs-on` | `ubuntu-latest` | GitHub-hosted `runs-on`: a bare label or a JSON array of labels, as for the pull request check. |
+| `environment` | `''` | Optional. An environment for the build job. Empty, the default: none, and the job reads the signing secrets from the repository or the organization. A repository that keeps its signing key in an environment names it here and allows the release branches in its rule ([Environment](#environment)). |
+| `java-version` | `17` | JDK version for the build. |
+| `java-distribution` | `temurin` | JDK distribution for `actions/setup-java`. |
+| `checkout-submodules` | `false` | `submodules` of `actions/checkout` in the build: `false`, `true` or `recursive`. Anything but `false` checks out with `GIT_TOKEN`. |
+| `local-properties-secrets` | `''` | Names of secrets and variables, separated by whitespace or commas, written to `local.properties` under their own names. |
+| `required-secrets` | `''` | Names of secrets and variables that must not be empty and are not written to `local.properties`. |
+| `gradle-args` | `''` | Extra Gradle arguments for `./gradlew ciQa`, split on whitespace without glob expansion. |
+| `apk-directory` | `app/build/outputs/apk` | The directory `ciQa` leaves the APKs in, relative to the repository root. Every `.apk` file below it is published. |
+| `expected-cert-sha256` | `''` | Optional SHA-256 digest of the signing certificate every APK must carry. Empty checks only that the signatures are valid. |
+| `build-tools-version` | `''` | Optional build-tools version whose `apksigner` and `aapt2` check the APKs. Empty uses the highest installed version. |
+| `sentry-upload` | `false` | Whether the Gradle step gets `SENTRY_AUTH_TOKEN` ([Sentry](#sentry)). |
+| `source-branch` | `''` | The branch releases are cut from. Empty means the repository's default branch. A QA build is built from it or from `release/<major>.x`. |
+| `version` | `''` | Optional, for one run: the version `X.Y.Z` the build leads up to, instead of the computed one. |
+| `next-version` | `''` | Optional, for every run of the calling file: the version the branch is heading for. Used while it is higher than the last release and not released. |
+| `label` | `''` | Optional. Names a build apart from the rolling build of its branch ([Labelled builds](#labelled-builds)). |
+| `sequence-offset` | `0` | A whole number added to the run number of the calling workflow to give `N`. |
+| `required-checks` | `pr-check / result` | Names of the checks that must have succeeded on the commit before its APK is published, one per line. Empty requires none. |
+| `checks-timeout-minutes` | `60` | How long `publish` waits, after the build, for a required check that has not finished. At most 100. |
+| `build-timeout-minutes` | `60` | Timeout of the build job, on either kind of runner. The build never uses a cache, so size it for a cold build. |
+| `self-hosted-max-workers` | `32` | Gradle `--max-workers` on a self-hosted runner. Empty leaves Gradle's default. |
+| `self-hosted-gradle-jvmargs` | `-Xmx16g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8` | `org.gradle.jvmargs` on a self-hosted runner. Empty keeps the caller's `gradle.properties` value. |
+| `self-hosted-kotlin-daemon-jvmargs` | `-Xmx6g` | `kotlin.daemon.jvmargs` on a self-hosted runner. Empty keeps the caller's value. |
+
+### Secrets and variables
+
+As for the release ([Secrets and variables](#secrets-and-variables)): the calling job passes `secrets: inherit`, and the build job checks the four signing values and every name in `local-properties-secrets` and `required-secrets` before anything is checked out.
+
+| name | required | used for |
+|------|----------|----------|
+| `KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD` | yes | The signing key, the release's. |
+| `RUNNER_READ_TOKEN` | no | `pick-runner`'s token. |
+| `GIT_TOKEN` | no | Checkout of submodules, and `GITHUB_TOKEN` of the Gradle step. |
+| `SENTRY_AUTH_TOKEN` | no | An environment variable of the Gradle step, only with `sentry-upload: true`. |
+
 ## Branches, tags and releases
 
-The three workflows share one picture of the calling repository:
+The workflows share one picture of the calling repository:
 
 | ref | role |
 |-----|------|
 | the default branch (`source-branch`) | The line of the current major version. Pull requests are merged here, and its releases are cut here. |
 | `release/<major>.x` | The line of an older major that is still maintained ([Release lines](#release-lines)). |
 | tags `vX.Y.Z` | The releases. A tag is created by the version bump and never moved. |
-| GitHub Releases | The published APKs and notes of each tag. |
+| tags `vX.Y.Z-preview.N` | The previews of a version that is not released yet ([Previews](#previews)). Created by the version bump and never moved. |
+| tags `qa-<line>`, `qa-<line>-<label>` | The newest QA build of a line ([The rolling pre-release](#the-rolling-pre-release)). Moved by every build. |
+| GitHub Releases | The published APKs and notes of each tag: releases, and pre-releases for previews and QA builds. |
 
-- **A release is its tag and its GitHub Release, and nothing else records it.** The newest release is the one GitHub marks **Latest**, the highest `vX.Y.Z` tag that has a release; the last release of an older line is the highest such tag of that major.
+- **A release is its tag and its GitHub Release, and nothing else records it.** The newest release is the one GitHub marks **Latest**, the highest `vX.Y.Z` tag that has a release; the last release of an older line is the highest such tag of that major. Previews and QA builds are pre-releases, which GitHub never marks as the latest.
+- **Code moves one way: source branch → QA build → preview → release.** Every push to a release branch is a QA build for the team. A commit that should be seen outside the team before its version is released is tagged as a preview. The release is cut when the version is done. All three are signed with the same key and numbered so that each installs over the one before it ([Version and versionCode](#version-and-versioncode)).
 - **No branch follows the releases.** The workflows write no branch. A `main` branch that an earlier flow moved or merged into with every release is frozen: nothing here reads it or writes it. Block pushes to it with a ruleset, so that it cannot drift into a second, unchecked history. That is a setting of the repository, which a person makes; the workflows cannot. Take the branch out of the pull request check's triggers as well.
 - **A hotfix starts from a tag or from a maintenance branch.** For the current major, branch from the released tag (`git switch -c fix/crash v2.0.1`) and merge the fix into the default branch through a pull request; the release of that pull request contains everything the default branch had before it. For an older major, branch from `release/<major>.x` and merge the pull request there.
 - **No branch is named `release`.** Git cannot keep a branch `release` next to the maintenance branches `release/<major>.x`: a ref cannot be both a name and the directory of other names.
@@ -651,7 +893,8 @@ The three workflows share one picture of the calling repository:
 **Everyone with write access to the repository can release, alone.** That is the whole answer for a repository without the rulesets below, and it is how GitHub works, not an option of these workflows:
 
 - **Starting the version bump.** Write access is what `workflow_dispatch` asks for. One person starts the dry run, reads the plan and starts the release with `confirm`; no second person is involved ([Dry run and confirmation](#dry-run-and-confirmation)). Required reviewers on an environment would add one, and a private repository on the Team plan cannot have them.
-- **Pushing a tag by hand.** Everyone with write access can push a tag `vX.Y.Z`, or start the release workflow for one, without the version bump.
+- **Pushing a tag by hand.** Everyone with write access can push a tag `vX.Y.Z` or `vX.Y.Z-preview.N`, or start the release workflow for one, without the version bump.
+- **Starting a QA build.** Every push to a release branch makes one, and everyone with write access can start one by hand on those branches. The workflow builds no other ref, which is a rule of its own file like the checks below: a branch that changes its calling file is not held by it.
 - **Reading the signing key.** With the signing secrets among the repository's or the organization's secrets, every workflow on every branch can read them. With a `release` environment that holds them, the rule for branches and tags keeps the key from pull request runs and from every other branch, but it goes by ref names: someone with write access can change a workflow on a branch, tag that commit `v0.0.1-x` or push it as `release/x`, and the run of that ref may name the environment and read the key.
 
 What the workflows do enforce, for the version bump and for a hand-pushed tag alike, is **what** is released, not who releases it:
@@ -673,19 +916,22 @@ These are settings of the calling repository. The workflows can neither make the
 
 ## Version and versionCode
 
-The version of a build is the tag. The workflows pass it to Gradle as `-PciVersionName` (`X.Y.Z`) and `-PciVersionCode`, and the calling repository's build uses the two values as they are. A build without them is a local build, and what version it shows is the calling repository's choice.
+The version of a release or a preview is its tag, and the version of a QA build is computed for the commit ([The version of a QA build](#the-version-of-a-qa-build)). The workflows pass it to Gradle as `-PciVersionName` (`X.Y.Z`, `X.Y.Z-preview.N`, `X.Y.Z-develop.N`) and `-PciVersionCode`, and the calling repository's build uses the two values as they are. A build without them is a local build, and what version it shows is the calling repository's choice.
 
 The versionCode is computed in one place, [`release-version/version_code.py`](../release-version/version_code.py):
 
-| build | versionCode |
-|-------|-------------|
-| release `X.Y.Z` | `X × 100000000 + Y × 100000 + 50000 + Z` |
-| QA build `N` after a release of `X.Y` | `X × 100000000 + Y × 100000 + N` |
+| build | versionCode | example |
+|-------|-------------|---------|
+| release `X.Y.Z` | `X × 100000000 + Y × 100000 + 50000 + Z` | `2.0.0` is `200050000` |
+| preview `N` of `X.Y.Z` | `X × 100000000 + Y × 100000 + 40000 + N` | `2.0.0-preview.3` is `200040003` |
+| QA build `N` leading up to `X.Y.Z` | `X × 100000000 + Y × 100000 + N` | `2.0.0-develop.57` is `200000057` |
 
-- Each minor version has a block of 100000 codes: QA builds in the lower half, releases in the upper half.
-- Within a minor version, a release installs over every QA build, and a QA build never installs over a release.
-- Each major version, a [release line](#release-lines), has a block of 100000000 codes. A release is higher than the earlier releases of its own line, and every code of a line, QA builds included, is below every code of the next major. A 1.x release made after `2.0.0` therefore has a lower code than `2.0.0`, as it should.
-- `X` goes up to 20, `Y` up to 999, `Z` and `N` up to 49999. A version outside these is refused when the release is planned.
+- Each minor version has a block of 100000 codes: QA builds at the bottom, previews above them, releases in the upper half.
+- Within a minor version the order is **QA build < preview < release**. A preview installs over every QA build, a release over every preview and QA build, and never the other way round: a QA build does not install over a preview or a release, and a preview does not install over a release.
+- Within each kind, a later build is higher: QA builds in the order they are built, previews of a version in the order of their number, releases in the order of their patch number.
+- The code of a preview counts within the minor version, and its number within the version `X.Y.Z`. A preview of a patch release (`2.0.1-preview.1`, `200040001`) is therefore below the releases its minor version already has; previews are for a version whose minor version has no release yet.
+- Each major version, a [release line](#release-lines), has a block of 100000000 codes. A release is higher than the earlier releases of its own line, and every code of a line, QA builds and previews included, is below every code of the next major. A 1.x release made after `2.0.0` therefore has a lower code than `2.0.0`, as it should.
+- `X` goes up to 20, `Y` up to 999, `Z` up to 49999, the `N` of a QA build up to 39999 and the `N` of a preview up to 9999. A value outside these is refused when the build is planned: a QA build never takes the code of a preview, nor a preview that of a release.
 - `1.13.1` is `101350001`; `0.1.0` is `150000`.
 
 Android installs an APK over an installed one only when its versionCode is not lower. A change of the formula therefore has to keep every new code above the codes that devices already have; the tests next to the formula state the order it has to keep.
@@ -697,12 +943,12 @@ The workflows are released together under `android-ci/vX.Y.Z`, with `android-ci/
 Inside the workflows:
 
 - Actions of this repository are referenced by full path at the workflows' own major tag (`asleep-ai/actions/<name>@android-ci/v1`), so an `android-ci` release carries the actions it was tested with. `pick-runner` and `release-notes`, released before the workflows, are referenced at `pick-runner/v1` and `release-notes/v1`. A `./` action path would be looked up in the calling repository's checkout.
-- `android-pr-check.yml` calls `android-pr-check-jobs.yml`, and `android-release.yml` calls `android-release-build.yml`, as `./.github/workflows/…`, which GitHub resolves in this repository at the same commit as the calling workflow file. The two files of a pair therefore always match.
+- `android-pr-check.yml` calls `android-pr-check-jobs.yml`, and `android-release.yml` and `android-qa.yml` call `android-release-build.yml`, as `./.github/workflows/…`, which GitHub resolves in this repository at the same commit as the calling workflow file. The files therefore always match.
 - Third-party actions are pinned to a commit. GitHub's own (`actions/*`) follow their major tags.
 
 Pinning a workflow to a full version or a commit SHA fixes its workflow files, not everything they run: the actions of this repository are referenced at the floating `android-ci/v1`, `pick-runner/v1` and `release-notes/v1`, so a rule change in `gradle-log-verdict`, for instance, reaches a caller pinned to an older `android-ci` version with the next release.
 
-`android-pr-check-jobs.yml` and `android-release-build.yml` are internal: their inputs change without notice, so call `android-pr-check.yml` and `android-release.yml`.
+`android-pr-check-jobs.yml` and `android-release-build.yml` are internal: their inputs change without notice, so call `android-pr-check.yml`, `android-release.yml` and `android-qa.yml`.
 
 ## Development
 
@@ -710,6 +956,6 @@ Pinning a workflow to a full version or a commit SHA fixes its workflow files, n
 uv run --with pytest --with pyyaml python -m pytest android-ci -q
 ```
 
-The tests read the workflow files. They run the shell of each `run` step against throwaway git repositories and stand-ins for `gradlew`, `keytool`, `gh`, `aapt2` and the GitHub API, check every combination of results and verdicts that `result` has to decide, and fail when the copies that have to match drift apart: the `verify` and `release-build` jobs, and the `primary` and `fallback` calls of both workflow pairs.
+The tests read the workflow files. They run the shell of each `run` step against throwaway git repositories and stand-ins for `gradlew`, `keytool`, `gh`, `aapt2` and the GitHub API, check every combination of results and verdicts that `result` has to decide, and fail when the copies that have to match drift apart: the `verify` and `release-build` jobs, the `primary` and `fallback` calls of the build workflows, and the script that reads a commit's checks in the version bump, the release and the QA build.
 
-They cannot evaluate GitHub's expressions or its behaviour: job conditions are pinned as text, and how secrets of an environment reach a called workflow, whether a push is accepted under the repository's rules, and whether a started workflow runs are verified only by running the workflows from a calling repository.
+They cannot evaluate GitHub's expressions or its behaviour: job conditions are pinned as text, and how secrets of an environment reach a called workflow, whether a push is accepted under the repository's rules, whether a started workflow runs, and how GitHub shows a pre-release whose tag was moved are verified only by running the workflows from a calling repository.

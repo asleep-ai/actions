@@ -1,0 +1,53 @@
+name: QA Build
+
+# The signed QA build of the branches that are released from: every push to
+# the default branch and to a maintenance branch (release/<major>.x), and a
+# manual run started on one of them. Each build replaces the APK of the
+# rolling pre-release of its line: qa-<default branch>, qa-release-1.x.
+#
+# A manual run on any other branch fails in its first job and says why: a QA
+# build is signed with the release key, so it is built from merged code only.
+on:
+  push:
+    branches: [develop, 'release/**']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional: the version X.Y.Z this one build leads up to, instead of the one computed from the tags'
+        required: false
+        type: string
+      label:
+        description: 'Optional: a label (ble-test) for a build kept apart from the rolling one, as qa-<line>-<label>'
+        required: false
+        type: string
+
+# The newest commit of a line wins: a push cancels the build of the push
+# before it. A labelled build is a line of its own.
+concurrency:
+  group: qa-${{ github.ref }}-${{ inputs.label }}
+  cancel-in-progress: true
+
+# The called workflow can use no more than what is granted here, and it fails
+# to start when one of these is missing.
+permissions:
+  contents: write       # the rolling pre-release and its tag
+  packages: read        # private GitHub Packages of this repository
+  checks: read          # the checks of the commit
+  actions: write        # delete the build's artifact once it is published
+
+jobs:
+  qa:
+    uses: asleep-ai/actions/.github/workflows/android-qa.yml@android-ci/v1
+    with:
+      # Leave runner-labels out to build on a GitHub-hosted runner only.
+      runner-labels: '["self-hosted","Linux","X64"]'
+      version: ${{ inputs.version }}
+      label: ${{ inputs.label }}
+      # Secrets and variables written to local.properties under their own
+      # names, next to the four signing keys.
+      local-properties-secrets: |
+        EXAMPLE_API_KEY
+        EXAMPLE_BASE_URL
+    # Every secret: the workflow reads the ones named above and the four
+    # signing secrets by name.
+    secrets: inherit

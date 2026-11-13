@@ -111,7 +111,7 @@ def test_a_new_release_of_the_highest_tag_is_planned(entry, tmp_path):
     directory = gh_directory(tmp_path, TAGS, released=RELEASED)
     result, outputs = check_tag(entry, tmp_path, "v1.10.1", directory)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert outputs == {"tag": "v1.10.1", "sha": SHA, "latest": "true"}
+    assert outputs == {"tag": "v1.10.1", "sha": SHA, "latest": "true", "kind": "release"}
 
 
 def test_the_first_release_is_the_latest(entry, tmp_path):
@@ -121,7 +121,13 @@ def test_the_first_release_is_the_latest(entry, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "tag", ["v1.10.1-qa.3", "v1.10", "1.10.1", "develop", "v01.2.3", "v1.2.3 ", "refs/tags/v1.2.3", ""]
+    "tag",
+    [
+        "v1.10.1-qa.3", "v1.10", "1.10.1", "develop", "v01.2.3", "v1.2.3 ", "refs/tags/v1.2.3", "",
+        # The rolling tag of a QA build, and suffixes that only look like a preview.
+        "qa-develop", "v1.10.1-preview", "v1.10.1-preview.0", "v1.10.1-preview.01", "v1.10.1-rc.1", "v1.10-preview.1",
+        "v1.10.1-preview.1.2", "1.10.1-preview.1",
+    ],
 )
 def test_only_a_release_tag_is_built(entry, tmp_path, tag):
     directory = gh_directory(tmp_path, TAGS)
@@ -161,7 +167,7 @@ def test_a_release_of_a_lower_line_is_not_the_latest(entry, tmp_path):
     directory = gh_directory(tmp_path, LINE_TAGS, released=["v1.13.0", "v1.13.1", "v2.0.0", "v2.0.1"])
     result, outputs = check_tag(entry, tmp_path, "v1.13.2", directory)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert outputs == {"tag": "v1.13.2", "sha": SHA, "latest": "false"}
+    assert outputs == {"tag": "v1.13.2", "sha": SHA, "latest": "false", "kind": "release"}
 
 
 def test_a_release_of_the_highest_line_is_the_latest(entry, tmp_path):
@@ -169,6 +175,65 @@ def test_a_release_of_the_highest_line_is_the_latest(entry, tmp_path):
     result, outputs = check_tag(entry, tmp_path, "v2.0.1", directory)
     assert result.returncode == 0, result.stdout + result.stderr
     assert outputs["latest"] == "true"
+
+
+# Previews of 2.1.0 on the main line and of 1.14.0 on the maintenance branch, next to the releases.
+PREVIEW_TAGS = LINE_TAGS + ["v2.1.0-preview.1", "v2.1.0-preview.2", "v2.1.0-preview.10", "v1.14.0-preview.1", "qa-develop"]
+
+
+@pytest.mark.parametrize("tag", ["v2.1.0-preview.10", "v1.14.0-preview.1"])
+def test_a_preview_tag_is_built_as_a_preview_and_is_never_the_latest(entry, tmp_path, tag):
+    result, outputs = check_tag(entry, tmp_path, tag, gh_directory(tmp_path, PREVIEW_TAGS, released=LINE_TAGS))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs == {"tag": tag, "sha": SHA, "latest": "false", "kind": "preview"}
+    assert f"Preview {tag} at {SHA}. Latest: false. GitHub Release exists: false." in result.stdout
+
+
+def test_the_first_build_of_a_repository_can_be_a_preview(entry, tmp_path):
+    # One caller has no release yet, and shows 2.0.0 at demo sites before it releases it.
+    result, outputs = check_tag(entry, tmp_path, "v2.0.0-preview.1", gh_directory(tmp_path, ["v2.0.0-preview.1"]))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs == {"tag": "v2.0.0-preview.1", "sha": SHA, "latest": "false", "kind": "preview"}
+
+
+def test_a_preview_does_not_change_which_release_is_the_latest(entry, tmp_path):
+    # The highest release tag stays the latest release, whatever previews exist above it.
+    result, outputs = check_tag(entry, tmp_path, "v2.0.1", gh_directory(tmp_path, PREVIEW_TAGS, released=LINE_TAGS[:-1]))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs == {"tag": "v2.0.1", "sha": SHA, "latest": "true", "kind": "release"}
+
+
+def test_a_new_preview_has_to_be_the_highest_of_its_version(entry, tmp_path):
+    result, _ = check_tag(entry, tmp_path, "v2.1.0-preview.2", gh_directory(tmp_path, PREVIEW_TAGS))
+    assert result.returncode == 1
+    assert "v2.1.0-preview.2 is below v2.1.0-preview.10, the highest preview of 2.1.0" in result.stdout
+    # Built again for the pre-release it already has, it passes.
+    directory = gh_directory(tmp_path / "again", PREVIEW_TAGS, released=["v2.1.0-preview.2"])
+    result, outputs = check_tag(entry, tmp_path / "again", "v2.1.0-preview.2", directory)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs["kind"] == "preview" and outputs["latest"] == "false"
+
+
+@pytest.mark.parametrize(
+    ("tag", "highest"),
+    [
+        # The version is released: what follows it is a preview of the next version.
+        ("v2.0.1-preview.1", "v2.0.1"),
+        ("v2.0.0-preview.3", "v2.0.1"),
+        ("v1.13.2-preview.1", "v1.13.2"),
+    ],
+)
+def test_a_new_preview_of_a_version_that_is_released_is_refused(entry, tmp_path, tag, highest):
+    result, _ = check_tag(entry, tmp_path, tag, gh_directory(tmp_path, LINE_TAGS + [tag]))
+    assert result.returncode == 1
+    version = tag[1:].split("-")[0]
+    assert f"{tag} is a preview of {version}, and {highest}, the highest release tag of major {tag[1]}, is not below" in result.stdout
+
+
+def test_a_preview_tag_that_does_not_exist_is_refused(entry, tmp_path):
+    result, _ = check_tag(entry, tmp_path, "v2.1.0-preview.3", gh_directory(tmp_path, PREVIEW_TAGS))
+    assert result.returncode == 1
+    assert "::error::Tag v2.1.0-preview.3 does not exist in acme/app." in result.stdout
 
 
 def test_an_api_failure_is_not_read_as_no_release(entry, tmp_path):
@@ -226,6 +291,9 @@ def check_line(entry, lines: dict, tag: str, sha: str, source: str = "develop"):
         # Before the lines parted: the commit is on both branches.
         ("v1.13.0", "base", "develop"),
         ("v1.13.1", "h", "release/1.x"),
+        # A preview is held to the branch of its version's line like the release itself.
+        ("v2.0.0-preview.1", "a", "develop"),
+        ("v1.14.0-preview.2", "h", "release/1.x"),
     ],
 )
 def test_a_tag_on_a_commit_of_its_release_branch_is_built(entry, lines, tag, commit_name, branch):
@@ -244,6 +312,8 @@ def test_a_tag_on_a_commit_of_its_release_branch_is_built(entry, lines, tag, com
         # release/1.x releases major 1 only.
         ("v2.0.0", "h"),
         ("v3.0.0", "h"),
+        ("v2.0.0-preview.1", "open"),
+        ("v2.0.0-preview.1", "h"),
     ],
 )
 def test_a_tag_on_any_other_commit_is_refused(entry, lines, tag, commit_name):
@@ -345,7 +415,15 @@ def test_plan_takes_the_version_code_from_the_one_formula(entry):
     plan = entry["jobs"]["plan"]
     code = step_by_id(plan, "code")
     assert code["uses"].startswith("asleep-ai/actions/release-version@")
-    assert code["with"] == {"operation": "code", "kind": "release", "version": "${{ steps.tag.outputs.tag }}"}
+    # release or preview, as the tag step read the tag: a preview gets the code of a preview, and its
+    # whole name, X.Y.Z-preview.N, as the version the APK has to carry.
+    assert code["with"] == {
+        "operation": "code",
+        "kind": "${{ steps.tag.outputs.kind }}",
+        "version": "${{ steps.tag.outputs.tag }}",
+    }
+    assert plan["outputs"]["kind"] == "${{ steps.tag.outputs.kind }}"
+    assert plan["outputs"]["version"] == "${{ steps.code.outputs.version }}"
     assert plan["outputs"]["version-code"] == "${{ steps.code.outputs.version-code }}"
     assert step_by_id(plan, "tag")["env"]["TAG"] == "${{ inputs.tag || github.ref_name }}"
     pick = step_by_id(plan, "pick")
@@ -547,14 +625,17 @@ def test_the_work_folder_is_emptied_before_checkout_and_after_the_build_whatever
     assert "if" not in step(build, "Empty the work folder")
 
 
-def test_the_checkout_is_the_tag_and_keeps_no_token(build):
+def test_the_checkout_is_the_tag_and_keeps_no_token(build, entry):
     checkout = step_by_id(build, "checkout")["with"]
     assert checkout == {
-        "ref": "refs/tags/${{ inputs.tag }}",
+        "ref": "${{ inputs.ref }}",
         "token": "${{ inputs.checkout-submodules != 'false' && secrets.GIT_TOKEN || github.token }}",
         "submodules": "${{ inputs.checkout-submodules }}",
         "persist-credentials": False,
     }
+    # A release is checked out by its tag, as a tag: a branch of the same name is not built.
+    for name in ("primary", "fallback"):
+        assert entry["jobs"][name]["with"]["ref"] == "refs/tags/${{ needs.plan.outputs.tag }}"
 
 
 def test_a_moved_tag_is_refused(build, tmp_path):
@@ -563,11 +644,11 @@ def test_a_moved_tag_is_refused(build, tmp_path):
     repo = new_repository(tmp_path / "repo")
     head = git(repo, "rev-parse", "HEAD")
     script = step_by_id(build, "commit")["run"]
-    assert run_script(script, {"TAG": "v1.0.0", "PLANNED_SHA": head}, repo).returncode == 0
+    assert run_script(script, {"REF": "refs/tags/v1.0.0", "PLANNED_SHA": head}, repo).returncode == 0
     commit(repo, {"app/Main.kt": "fun main() = Unit\n"})
-    result = run_script(script, {"TAG": "v1.0.0", "PLANNED_SHA": head}, repo)
+    result = run_script(script, {"REF": "refs/tags/v1.0.0", "PLANNED_SHA": head}, repo)
     assert result.returncode == 1
-    assert "The tag was moved" in result.stdout
+    assert "refs/tags/v1.0.0 is at" in result.stdout and "The ref was moved" in result.stdout
 
 
 # --- build: Gradle ------------------------------------------------------------------------
@@ -646,6 +727,7 @@ def run_gradle(build, tmp_path, runner="github-hosted", outcome="SUCCESSFUL", **
     (workspace / "a.Foo").write_text("")
     executable(workspace / "gradlew", GRADLEW_STUB)
     env = {
+        "KIND": "release",
         "VERSION_NAME": "1.13.1",
         "VERSION_CODE": "101350001",
         "GRADLE_ARGS": "",
@@ -687,6 +769,43 @@ def test_gradle_builds_ci_release_with_the_version_and_no_cache(build, tmp_path)
     assert "sentry-token" not in result.stdout.split("sentry=")[0]
 
 
+def test_a_qa_build_runs_ci_qa_the_same_way(build, tmp_path):
+    result, arguments, log = run_gradle(
+        build, tmp_path, KIND="qa", VERSION_NAME="2.0.0-develop.57", VERSION_CODE="200000057", SENTRY_AUTH_TOKEN=""
+    )
+    assert result.returncode == 0, result.stderr
+    # The same cold, uncached build as a release: it is signed with the same key.
+    assert arguments == [
+        "ciQa", "-PciVersionName=2.0.0-develop.57", "-PciVersionCode=200000057", "--no-daemon", "--no-build-cache",
+    ]
+    assert "Task: ciQa. Version: 2.0.0-develop.57 (200000057)." in result.stdout
+    assert "SENTRY_AUTH_TOKEN is not set: the build uploads nothing to Sentry." in result.stdout
+
+
+@pytest.mark.parametrize("kind", ["", "Release", "ciRelease", "assembleDebug", "qa; rm -rf ."])
+def test_the_gradle_task_is_one_of_two_names(build, tmp_path, kind):
+    # The task is chosen by the kind, never taken from a value: nothing a caller writes is run as a task.
+    result, _, _ = run_gradle_unstarted(build, tmp_path, kind)
+    assert result.returncode == 1
+    assert "::error::kind is neither release nor qa." in result.stdout
+    assert not (tmp_path / "gradlew-args").exists(), "gradlew is not started"
+
+
+def run_gradle_unstarted(build, tmp_path, kind):
+    workspace, temp = tmp_path / "workspace", tmp_path / "temp"
+    workspace.mkdir()
+    temp.mkdir()
+    executable(workspace / "gradlew", GRADLEW_STUB)
+    env = {
+        "KIND": kind, "VERSION_NAME": "1.13.1", "VERSION_CODE": "101350001", "GRADLE_ARGS": "", "GITHUB_ACTOR": "octocat",
+        "GITHUB_TOKEN": "t", "TOKEN_SOURCE": "GIT_TOKEN", "SENTRY_AUTH_TOKEN": "", "RUNNER_KIND": "github-hosted",
+        "MAX_WORKERS": "", "GRADLE_JVMARGS": "", "KOTLIN_DAEMON_JVMARGS": "", "RUNNER_TEMP": str(temp),
+        "GRADLE_USER_HOME": str(temp / "gradle-user-home"), "GRADLEW_ARGS": str(tmp_path / "gradlew-args"),
+        "GRADLEW_OUTCOME": "SUCCESSFUL",
+    }
+    return run_script(step_by_id(build, "build")["run"], env, workspace), None, None
+
+
 def test_gradle_on_a_self_hosted_runner_limits_workers_and_memory(build, tmp_path):
     result, arguments, _ = run_gradle(build, tmp_path, runner="self-hosted")
     assert result.returncode == 0, result.stderr
@@ -716,7 +835,14 @@ def test_the_sentry_token_reaches_the_gradle_step_only(build, entry):
     for item in build["steps"]:
         mentions = "SENTRY_AUTH_TOKEN" in json.dumps({key: value for key, value in item.items() if key != "run"})
         assert mentions == (item.get("id") == "build"), item.get("name")
-    assert step_by_id(build, "build")["env"]["SENTRY_AUTH_TOKEN"] == "${{ secrets.SENTRY_AUTH_TOKEN }}"
+    # A release always gets it. A QA build gets it only when its caller asks for the upload.
+    assert step_by_id(build, "build")["env"]["SENTRY_AUTH_TOKEN"] == (
+        "${{ inputs.sentry-upload && secrets.SENTRY_AUTH_TOKEN || '' }}"
+    )
+    upload = trigger(load(BUILD))["inputs"]["sentry-upload"]
+    assert (upload["type"], upload["default"], upload["required"]) == ("boolean", True, False)
+    for name in ("primary", "fallback"):
+        assert "sentry-upload" not in entry["jobs"][name]["with"]
     assert "SENTRY_AUTH_TOKEN" not in json.dumps(entry["jobs"])
 
 
@@ -754,6 +880,7 @@ def check_apks(build, tmp_path, apks=ONE_APK, **overrides):
     output = tmp_path / "output"
     output.write_text("")
     env = {
+        "KIND": "release",
         "APK_DIRECTORY": "app/build/outputs/apk",
         "VERSION_NAME": "1.13.1",
         "VERSION_CODE": "101350001",
@@ -820,6 +947,20 @@ def test_a_build_that_left_no_apk_is_refused(build, tmp_path):
     assert paths is None and check_apks.refused
 
 
+def test_a_qa_apk_has_to_carry_the_qa_version(build, tmp_path):
+    qa = {"KIND": "qa", "VERSION_NAME": "2.0.0-develop.57", "VERSION_CODE": "200000057"}
+    result, paths = check_apks(build, tmp_path, APK_NAME="2.0.0-develop.57", APK_CODE="200000057", **qa)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert paths == list(ONE_APK)
+    # A ciQa that builds the release version, or ignores the properties.
+    result, paths = check_apks(build, tmp_path / "release", **qa)
+    assert result.returncode == 1
+    assert "App_1.13.1.apk is version 1.13.1 (101350001), and the QA build is 2.0.0-develop.57 (200000057)." in result.stdout
+    assert paths is None and check_apks.refused
+    result, _ = check_apks(build, tmp_path / "none", apks=(), **qa)
+    assert "::error::ciQa left no APK under app/build/outputs/apk." in result.stdout
+
+
 @pytest.mark.parametrize("directory", ["app/build/outputs/elsewhere", "", "-delete"])
 def test_the_apk_directory_has_to_exist(build, tmp_path, directory):
     result, paths = check_apks(build, tmp_path, APK_DIRECTORY=directory)
@@ -875,7 +1016,9 @@ def test_the_apks_are_verified_uploaded_and_the_secrets_deleted(build):
         "build-tools-version": "${{ inputs.build-tools-version }}",
     }
     upload = step(build, "Upload the signed APKs")
-    assert upload["with"]["name"] == "android-release-apk-${{ inputs.attempt }}"
+    assert upload["with"]["name"] == "android-${{ inputs.kind }}-apk-${{ inputs.attempt }}"
+    # A QA artifact is the way to the publish job and nothing else: the shortest time GitHub keeps one.
+    assert upload["with"]["retention-days"] == "${{ inputs.kind == 'qa' && 1 || 90 }}"
     assert upload["with"]["path"] == "${{ steps.apk.outputs.paths }}"
     assert upload["with"]["if-no-files-found"] == "error"
     cleanup = step(build, "Delete the keystore and local.properties")
@@ -936,12 +1079,14 @@ def test_primary_and_fallback_pass_the_same_inputs(entry):
     # The names in local-properties-secrets are known only to the caller, so every secret is handed on.
     assert primary["secrets"] == fallback["secrets"] == "inherit"
     assert "secrets" not in inner
-    assert set(primary["with"]) == set(fallback["with"]) == set(inner["inputs"])
+    # sentry-upload is left at its default: a release always gets the token.
+    assert set(primary["with"]) == set(fallback["with"]) == set(inner["inputs"]) - {"sentry-upload"}
     assert primary["with"]["attempt"] == "primary" and fallback["with"]["attempt"] == "fallback"
-    planned = {"tag": "tag", "sha": "sha", "version-name": "version", "version-code": "version-code"}
+    assert primary["with"]["kind"] == fallback["with"]["kind"] == "release"
+    planned = {"sha": "sha", "version-name": "version", "version-code": "version-code"}
     for name, output in planned.items():
         assert primary["with"][name] == fallback["with"][name] == f"${{{{ needs.plan.outputs.{output} }}}}"
-    forwarded = set(inner["inputs"]) - {"runs-on", "attempt", *planned}
+    forwarded = set(inner["inputs"]) - {"runs-on", "attempt", "kind", "ref", "sentry-upload", *planned}
     assert forwarded == set(inputs) - {
         "tag", "runner-labels", "fallback-runs-on", "source-branch", "required-checks", "release-notes-prompt",
     }
@@ -1050,6 +1195,33 @@ def test_the_notes_start_at_the_previous_release_of_the_same_line(entry, tmp_pat
     assert previous("v1.13.0", "first") == "tag=\n"
 
 
+def test_the_notes_of_a_preview_start_at_the_preview_before_it(entry, tmp_path):
+    from test_pr_check import commit, git, new_repository
+
+    # base(v1.13.0) ── a(v2.0.0-preview.1) ── b(.2, never published) ── c(.3) ── d(.10) ── e(v2.0.0) ── f(v2.1.0-preview.1)
+    repo = new_repository(tmp_path / "repo")
+    git(repo, "tag", "v1.13.0")
+    tags = ("v2.0.0-preview.1", "v2.0.0-preview.2", "v2.0.0-preview.3", "v2.0.0-preview.10", "v2.0.0", "v2.1.0-preview.1")
+    for number, tag in enumerate(tags):
+        commit(repo, {"app.kt": str(number)}, f"change {number}")
+        git(repo, "tag", tag)
+    released = ["v1.13.0", "v2.0.0-preview.1", "v2.0.0-preview.3", "v2.0.0-preview.10", "v2.0.0"]
+
+    def previous(tag: str, name: str) -> str:
+        return previous_release(entry, tmp_path / name, repo, tag, released)
+
+    # The first preview of a version starts where its release would: at the last release of the line.
+    assert previous("v2.0.0-preview.1", "first") == "tag=v1.13.0\n"
+    # The next ones list what changed since the published preview before, in the order of their numbers.
+    assert previous("v2.0.0-preview.2", "second") == "tag=v2.0.0-preview.1\n"
+    assert previous("v2.0.0-preview.3", "unpublished") == "tag=v2.0.0-preview.1\n"
+    assert previous("v2.0.0-preview.10", "tenth") == "tag=v2.0.0-preview.3\n"
+    # The release never starts at one of its previews: its notes are everything since the release before.
+    assert previous("v2.0.0", "release") == "tag=v1.13.0\n"
+    # And a preview of the next version starts at that release, not at a preview of another version.
+    assert previous("v2.1.0-preview.1", "next") == "tag=v2.0.0\n"
+
+
 def test_an_unreadable_release_list_stops_the_notes(entry, tmp_path):
     from test_pr_check import new_repository
 
@@ -1069,7 +1241,8 @@ def test_an_unreadable_release_list_stops_the_notes(entry, tmp_path):
 
 
 def publish_release(
-    entry, tmp_path, exists: str, apks=("SleepHub_release_1.13.1_101350001.apk",), built_on="primary", latest="true"
+    entry, tmp_path, exists: str, apks=("SleepHub_release_1.13.1_101350001.apk",), built_on="primary", latest="true",
+    **overrides,
 ):
     directory = gh_directory(tmp_path, [])
     apk_directory = tmp_path / "apk"
@@ -1087,6 +1260,7 @@ def publish_release(
         "VERSION": "1.13.1",
         "VERSION_CODE": "101350001",
         "LATEST": latest,
+        "KIND": "release",
         "EXISTS": exists,
         "APK_DIRECTORY": str(apk_directory),
         "NOTES_FILE": str(tmp_path / "notes.md"),
@@ -1094,10 +1268,40 @@ def publish_release(
         "SELF_HOSTED": "true",
         "GITHUB_SERVER_URL": "https://github.invalid",
         "GITHUB_STEP_SUMMARY": str(summary),
+        **overrides,
     }
     script = step(entry["jobs"]["publish"], "Create or update the GitHub Release")["run"]
     result = run_script(script, env, tmp_path)
     return result, (directory / "calls").read_text().splitlines(), summary
+
+
+PREVIEW = {"TAG": "v2.0.0-preview.2", "VERSION": "2.0.0-preview.2", "VERSION_CODE": "200040002", "KIND": "preview"}
+
+
+def test_a_preview_is_published_as_a_pre_release_that_is_not_the_latest(entry, tmp_path):
+    apks = ("HeySleep_release_2.0.0-preview.2_200040002.apk",)
+    result, calls, summary = publish_release(entry, tmp_path, "false", apks=apks, latest="false", **PREVIEW)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert calls == [
+        "release create v2.0.0-preview.2 --verify-tag --title v2.0.0-preview.2 "
+        f"--notes-file {tmp_path / 'notes.md'} --prerelease --latest=false {tmp_path / 'apk' / apks[0]}"
+    ]
+    text = summary.read_text()
+    assert "### Android preview v2.0.0-preview.2" in text
+    assert "Created the pre-release with HeySleep_release_2.0.0-preview.2_200040002.apk" in text
+    assert "| 2.0.0-preview.2 | 200040002 | false | a self-hosted runner |" in text
+
+
+def test_a_preview_built_again_keeps_its_pre_release(entry, tmp_path):
+    result, calls, _ = publish_release(entry, tmp_path, "true", apks=("a.apk",), latest="false", **PREVIEW)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert calls == [f"release upload v2.0.0-preview.2 {tmp_path / 'apk' / 'a.apk'} --clobber"]
+
+
+def test_the_plan_decides_that_a_preview_is_a_pre_release(entry):
+    create = step(entry["jobs"]["publish"], "Create or update the GitHub Release")
+    assert create["env"]["KIND"] == "${{ needs.plan.outputs.kind }}"
+    assert create["env"]["VERSION"] == "${{ needs.plan.outputs.version }}"
 
 
 def test_a_new_release_is_created_with_the_notes_and_the_apk(entry, tmp_path):
@@ -1232,7 +1436,9 @@ def test_the_example_passes_only_what_the_workflow_declares(entry):
     assert example["permissions"] == {
         "contents": "write", "packages": "read", "checks": "read", "pull-requests": "read",
     }
-    assert example[True]["push"]["tags"] == ["v[0-9]+.[0-9]+.[0-9]+"]
+    # A tag a person pushed starts the release too: a release tag, or the tag of a preview. No other
+    # tag does, the rolling tags of the QA builds (qa-...) included.
+    assert example[True]["push"]["tags"] == ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-preview.[0-9]+"]
     assert "workflow_dispatch" in example[True]
 
 

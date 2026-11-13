@@ -9,6 +9,10 @@ name: Android version bump
 # starts the caller's release workflow. Nobody is asked in between. The tag is
 # the release: no branch is moved unless the caller names one.
 #
+# With prerelease set to preview, the same version is planned and checked, and
+# the tag is vX.Y.Z-preview.N: a preview of the version, which the release
+# workflow builds with the release key and publishes as a GitHub pre-release.
+#
 # The caller's contract and every input are in android-ci/README.md.
 on:
   workflow_call:
@@ -43,6 +47,15 @@ on:
         required: false
         type: string
         default: ''
+      prerelease:
+        description: >-
+          Optional. Empty, the default, plans the release vX.Y.Z. preview
+          plans a preview of that version instead: the tag vX.Y.Z-preview.N,
+          N one above the previews of X.Y.Z that exist. No other value is
+          accepted.
+        required: false
+        type: string
+        default: ''
       dry_run:
         description: >-
           Plan and check only: nothing is tagged, pushed or started. True by
@@ -54,8 +67,9 @@ on:
       confirm:
         description: >-
           The version the plan is expected to compute, X.Y.Z or vX.Y.Z, as a
-          dry run showed it. Required when dry_run is false: the run tags only
-          when the plan computes this very version. Not read on a dry run.
+          dry run showed it; for a preview the whole name, vX.Y.Z-preview.N.
+          Required when dry_run is false: the run tags only when the plan
+          computes this very version. Not read on a dry run.
         required: false
         type: string
         default: ''
@@ -116,7 +130,7 @@ on:
         description: The tag of the planned version.
         value: ${{ jobs.plan.outputs.tag }}
       version:
-        description: The planned version, X.Y.Z.
+        description: The planned version, X.Y.Z, or X.Y.Z-preview.N for a preview.
         value: ${{ jobs.plan.outputs.version }}
       target-sha:
         description: The commit that is released.
@@ -174,12 +188,15 @@ jobs:
           sha: ${{ inputs.sha }}
           bump: ${{ inputs.bump }}
           version: ${{ inputs.version }}
+          prerelease: ${{ inputs.prerelease }}
           source-branch: ${{ inputs.source-branch || github.event.repository.default_branch }}
 
       - name: Write the plan to the summary
         env:
           TAG: ${{ steps.version.outputs.tag }}
           PREVIOUS_TAG: ${{ steps.version.outputs.previous-tag }}
+          PREVIOUS_PRERELEASE_TAG: ${{ steps.version.outputs.previous-prerelease-tag }}
+          NOTICE: ${{ steps.version.outputs.notice }}
           VERSION_CODE: ${{ steps.version.outputs.version-code }}
           TARGET_SHA: ${{ steps.version.outputs.target-sha }}
           LINE_BRANCH: ${{ steps.version.outputs.branch }}
@@ -187,6 +204,7 @@ jobs:
           PR: ${{ inputs.pr }}
           BUMP: ${{ inputs.bump }}
           VERSION_GIVEN: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
@@ -204,6 +222,17 @@ jobs:
             echo "- versionCode: $VERSION_CODE"
             if [[ -n "$VERSION_GIVEN" ]]; then
               echo "- The version was given (\`version\`); \`bump\` ($BUMP) is ignored."
+            fi
+            if [[ -n "$PRERELEASE" ]]; then
+              echo "- A $PRERELEASE, not a release: it is published as a GitHub pre-release, and \`${TAG%-"$PRERELEASE".*}\` is still to be released."
+              if [[ -n "$PREVIOUS_PRERELEASE_TAG" ]]; then
+                echo "- The $PRERELEASE before this one is \`$PREVIOUS_PRERELEASE_TAG\`; the list below is what this one adds to it."
+              fi
+            fi
+            if [[ -n "$NOTICE" ]]; then
+              echo
+              # printf: the sentence holds tag names, not a format.
+              printf '> [!WARNING]\n> %s.\n' "$NOTICE"
             fi
             echo
             echo "#### Included"
@@ -273,6 +302,7 @@ jobs:
           import json
           import os
           import sys
+          import time
           import urllib.error
           import urllib.parse
           import urllib.request
@@ -282,6 +312,14 @@ jobs:
           sha = os.environ["TARGET_SHA"]
           token = os.environ.get("TOKEN", "").strip()
           required = [line.strip() for line in os.environ.get("REQUIRED_CHECKS", "").splitlines() if line.strip()]
+          # Only android-qa.yml waits: its build starts with the push that also starts the checks. A
+          # release is decided from the checks as they are.
+          try:
+              wait_minutes = float(os.environ.get("CHECKS_WAIT_MINUTES") or 0)
+              poll_seconds = float(os.environ.get("CHECKS_POLL_SECONDS") or 30)
+          except ValueError:
+              sys.exit("::error::The time to wait for the checks is not a number.")
+          deadline = time.monotonic() + wait_minutes * 60
 
 
           def check_runs(name):
@@ -309,19 +347,32 @@ jobs:
               return [run for run in runs if isinstance(run, dict) and run.get("name") == name]
 
 
-          rows = []
-          refused = []
-          for name in required:
-              runs = check_runs(name)
-              if not runs:
-                  rows.append((name, "not run", ""))
-                  refused.append(f"'{name}' did not run on the commit")
-                  continue
-              newest = max(runs, key=lambda run: (str(run.get("started_at") or ""), run.get("id") or 0))
-              state = newest.get("conclusion") or newest.get("status") or "unknown"
-              rows.append((name, state, newest.get("html_url") or ""))
-              if newest.get("status") != "completed" or newest.get("conclusion") != "success":
-                  refused.append(f"'{name}' is {state}")
+          while True:
+              rows = []
+              refused = []
+              # Checks that may still succeed: not started on the commit yet, or not finished.
+              unfinished = []
+              for name in required:
+                  runs = check_runs(name)
+                  if not runs:
+                      rows.append((name, "not run", ""))
+                      refused.append(f"'{name}' did not run on the commit")
+                      unfinished.append(name)
+                      continue
+                  newest = max(runs, key=lambda run: (str(run.get("started_at") or ""), run.get("id") or 0))
+                  state = newest.get("conclusion") or newest.get("status") or "unknown"
+                  rows.append((name, state, newest.get("html_url") or ""))
+                  if newest.get("status") != "completed":
+                      refused.append(f"'{name}' is {state}")
+                      unfinished.append(name)
+                  elif newest.get("conclusion") != "success":
+                      refused.append(f"'{name}' is {state}")
+              # A check that finished without success is final: waiting for the others changes nothing.
+              remaining = deadline - time.monotonic()
+              if not unfinished or len(refused) > len(unfinished) or remaining <= 0:
+                  break
+              print(f"Waiting for {', '.join(unfinished)} ({'; '.join(refused)}).", flush=True)
+              time.sleep(min(poll_seconds, remaining))
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write("#### Checks on the commit\n\n")
@@ -338,8 +389,10 @@ jobs:
           for name, state, _ in rows:
               print(f"{name}: {state}")
           if refused:
-              print(f"::error title=The commit has not passed its checks::{sha[:7]}: {'; '.join(refused)}. "
-                    "Release a commit whose checks succeeded, or run them again on this one.")
+              # Only when the wait ran out: a check that failed ended it early.
+              waited = f" after waiting {wait_minutes:g} minutes" if wait_minutes and len(refused) == len(unfinished) else ""
+              print(f"::error title=The commit has not passed its checks::{sha[:7]}: {'; '.join(refused)}{waited}. "
+                    "Take a commit whose checks succeeded, or run them again on this one.")
               sys.exit(1)
           CHECKS
 
@@ -351,7 +404,8 @@ jobs:
       # The branch follows the releases of the source branch only. A release
       # from a maintenance branch (release/<major>.x) is a commit the main
       # branch cannot move forward to, and it is left where it is. The source
-      # branch itself is never moved: it holds the commit already.
+      # branch itself is never moved: it holds the commit already. A preview
+      # moves no branch either: the branch follows the releases.
       - name: Check that the main branch can move
         id: main
         env:
@@ -359,11 +413,15 @@ jobs:
           LINE_BRANCH: ${{ steps.version.outputs.branch }}
           SOURCE_BRANCH: ${{ inputs.source-branch || github.event.repository.default_branch }}
           TARGET_SHA: ${{ steps.version.outputs.target-sha }}
+          PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
           moved="$MAIN_BRANCH"
           if [[ -z "$MAIN_BRANCH" ]]; then
             line="No branch is moved: the tag is the release."
+          elif [[ -n "$PRERELEASE" ]]; then
+            moved=""
+            line="\`$MAIN_BRANCH\` is not moved: it follows the releases, and this is a $PRERELEASE."
           elif [[ "$MAIN_BRANCH" == "$SOURCE_BRANCH" ]]; then
             moved=""
             line="No branch is moved: \`$MAIN_BRANCH\` is the branch the release is cut from."
@@ -434,9 +492,10 @@ jobs:
           if [[ -z "$confirm" ]]; then
             refuse "The release is not confirmed" "The plan computed $TAG ($plan), and confirm is empty: a run that is not a dry run has to name the planned version."
           fi
-          # Only a version is printed back.
-          if [[ ! "$confirm" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            refuse "confirm is not a version" "The plan computed $TAG ($plan), and confirm is not of the form X.Y.Z or vX.Y.Z."
+          # Only a version is printed back: X.Y.Z, or the name of a prerelease
+          # of one, X.Y.Z-preview.N.
+          if [[ ! "$confirm" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-z]+\.[0-9]+)?$ ]]; then
+            refuse "confirm is not a version" "The plan computed $TAG ($plan), and confirm is not of the form X.Y.Z or vX.Y.Z (X.Y.Z-preview.N for a preview)."
           fi
           if [[ "$confirm" != "$TAG" && "$confirm" != "$VERSION" ]]; then
             refuse "confirm does not name the planned version" "The plan computed $TAG ($plan), and confirm is $confirm."
@@ -504,6 +563,7 @@ jobs:
           sha: ${{ needs.plan.outputs.target-sha }}
           bump: ${{ inputs.bump }}
           version: ${{ inputs.version }}
+          prerelease: ${{ inputs.prerelease }}
           source-branch: ${{ inputs.source-branch || github.event.repository.default_branch }}
 
       # One atomic push. With a main-branch, the tag and the branch move

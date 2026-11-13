@@ -11,6 +11,10 @@ name: Version Bump
 # older major version, into its maintenance branch release/<major>.x. The
 # workflow finds the line from the commit, whichever branch the run is
 # started from.
+#
+# With prerelease set to preview, the run plans a preview of the same version
+# instead: the tag vX.Y.Z-preview.N, which release.yml publishes as a GitHub
+# pre-release.
 on:
   workflow_dispatch:
     inputs:
@@ -35,13 +39,21 @@ on:
         description: 'Exception: the exact version X.Y.Z to release (bump is then ignored)'
         required: false
         type: string
+      prerelease:
+        description: 'none: the release vX.Y.Z. preview: a preview of that version, vX.Y.Z-preview.N'
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - preview
       dry_run:
         description: 'Dry run: plan and check only. Untick to release, and fill in confirm'
         required: false
         default: true
         type: boolean
       confirm:
-        description: 'To release (dry run off): the version the dry run planned, e.g. v1.13.1'
+        description: 'To release (dry run off): the version the dry run planned, e.g. v1.13.1 or v2.0.0-preview.1'
         required: false
         type: string
 
@@ -69,5 +81,8 @@ jobs:
       sha: ${{ inputs.sha }}
       bump: ${{ inputs.bump }}
       version: ${{ inputs.version }}
+      # The form offers a list, whose first entry stands for "no prerelease";
+      # the workflow takes an empty value for that.
+      prerelease: ${{ inputs.prerelease != 'none' && inputs.prerelease || '' }}
       dry_run: ${{ inputs.dry_run }}
       confirm: ${{ inputs.confirm }}
