@@ -62,7 +62,7 @@ BRANCH = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")
 SHA = re.compile(r"[0-9a-fA-F]{7,64}")
 SQUASH_SUBJECT = re.compile(r"(?P<title>.*\S)\s*\(#(?P<number>[0-9]+)\)")
 MERGE_SUBJECT = re.compile(r"Merge pull request #(?P<number>[0-9]+) from \S+")
-# The list is read by a person approving a release; a release this large is summarised.
+# The list is read by the person who cuts the release; a release this large is summarised.
 MAX_LISTED = 200
 ZERO = (0, 0, 0)
 

@@ -3,10 +3,11 @@ name: Android version bump
 # Reusable release cut for an Android app repository whose versions are git
 # tags. A person starts it by hand for a merged pull request. The plan job
 # computes the next version, checks that the commit passed its checks and
-# writes what would be released to the job summary. The tag job then waits for
-# the approval of its environment, tags the commit vX.Y.Z and starts the
-# caller's release workflow. The tag is the release: no branch is moved unless
-# the caller names one.
+# writes what would be released to the job summary. That is all a run does by
+# default: it is a dry run. With dry_run off and the planned version repeated
+# in confirm, the tag job follows at once: it tags the commit vX.Y.Z and
+# starts the caller's release workflow. Nobody is asked in between. The tag is
+# the release: no branch is moved unless the caller names one.
 #
 # The caller's contract and every input are in android-ci/README.md.
 on:
@@ -44,11 +45,20 @@ on:
         default: ''
       dry_run:
         description: >-
-          Plan and check only: nothing is tagged, pushed or started, and no
-          approval is asked for.
+          Plan and check only: nothing is tagged, pushed or started. True by
+          default, so a release is a run that turns it off on purpose and
+          names the planned version in confirm.
         required: false
         type: boolean
-        default: false
+        default: true
+      confirm:
+        description: >-
+          The version the plan is expected to compute, X.Y.Z or vX.Y.Z, as a
+          dry run showed it. Required when dry_run is false: the run tags only
+          when the plan computes this very version. Not read on a dry run.
+        required: false
+        type: string
+        default: ''
       source-branch:
         description: >-
           The branch releases are cut from; empty means the default branch of
@@ -77,19 +87,24 @@ on:
         default: ''
       release-workflow:
         description: >-
-          File name of the caller's workflow that builds a release tag. It is
-          started for the new tag. Empty starts nothing.
+          File name of the caller's workflow that builds a release tag, in
+          .github/workflows. It is started for the new tag, so the commit that
+          is released has to hold it, as a workflow that calls
+          android-release.yml. Empty starts nothing and checks nothing.
         required: false
         type: string
         default: release.yml
       environment:
         description: >-
-          The environment of the job that tags. Its required reviewers are the
-          approval of the release. It is not the environment that holds the
-          signing key: that one is the build job's, in android-release.yml.
+          Optional. An environment for the job that tags. Empty, the default:
+          the job runs in no environment and starts as soon as the plan
+          passed. Where GitHub offers required reviewers (not for a private
+          repository on the Team plan), the reviewers of an environment named
+          here approve the tag. It is not the environment of the signing key:
+          that one is the build job's, in android-release.yml.
         required: false
         type: string
-        default: release-approval
+        default: ''
     secrets:
       RELEASE_PUSH_TOKEN:
         description: >-
@@ -119,10 +134,11 @@ defaults:
 
 jobs:
   # Read-only. What the release would be, and whether the commit may be
-  # released, is decided here, so a dry run shows the same refusals and an
-  # approver sees the summary before the tag job asks. What can only fail
-  # while writing (a version another release took meanwhile, a push the
-  # repository's rules refuse) fails in the tag job.
+  # released, is decided here, so a dry run shows every refusal a release
+  # would meet. Nothing stands between this job and the tag job but the
+  # confirm input, which is checked here. What can only fail while writing (a
+  # version another release took meanwhile, a push the repository's rules
+  # refuse) fails in the tag job.
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -179,8 +195,10 @@ jobs:
             echo
             if [[ "$DRY_RUN" == true ]]; then
               echo "**Dry run.** Nothing is tagged, pushed or started."
-              echo
+            else
+              echo "**Not a dry run.** When every check below passes and \`confirm\` names \`$TAG\`, the commit is tagged and the release starts at once."
             fi
+            echo
             echo "- Commit: [\`${TARGET_SHA:0:7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$TARGET_SHA)${PR:+, the merge commit of #${PR#\#}}"
             echo "- Release line: \`$LINE_BRANCH\`"
             echo "- versionCode: $VERSION_CODE"
@@ -194,6 +212,47 @@ jobs:
             printf '%s\n' "${PRS:-Nothing listed.}"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The tag job starts release-workflow for the tag, and GitHub runs the
+      # file the tagged commit holds, not the one of the branch this run was
+      # started from. A commit from before the repository called
+      # android-release.yml has another workflow under that name, or none: it
+      # would build the tag its own way, without the checks of
+      # android-release.yml and without the tag's version, or the tag would be
+      # left with nothing to build it. Such a commit is refused here, before
+      # anything is tagged.
+      - name: Check the release workflow of the commit
+        env:
+          RELEASE_WORKFLOW: ${{ inputs.release-workflow }}
+          TARGET_SHA: ${{ steps.version.outputs.target-sha }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$RELEASE_WORKFLOW" ]]; then
+            echo "No release workflow is started (release-workflow is empty): nothing to check."
+            exit 0
+          fi
+          if [[ ! "$RELEASE_WORKFLOW" =~ ^[A-Za-z0-9._-]+\.ya?ml$ ]]; then
+            echo "::error::release-workflow is not the file name of a workflow in .github/workflows (name.yml)."
+            exit 1
+          fi
+          path=".github/workflows/$RELEASE_WORKFLOW"
+          short="${TARGET_SHA:0:7}"
+          later="Release a commit that has it: the merge commit of the pull request that brought the workflow in, or a later one."
+          if ! content=$(git show "$TARGET_SHA:$path" 2>/dev/null); then
+            echo "::error title=The commit has no release workflow::$short holds no $path, so nothing would build its tag. $later"
+            exit 1
+          fi
+          # A uses: line of a job, whatever the owner and the ref; a line in a
+          # comment does not count.
+          if ! grep -Eq "^[[:space:]]*uses:[[:space:]]*[\"']?[^[:space:]#\"']+/\.github/workflows/android-release\.yml@" <<< "$content"; then
+            echo "::error title=The commit's release workflow is not the shared one::$path at $short does not call android-release.yml. A commit from before the repository adopted that workflow holds the earlier one, which would build the tag without its checks and without the tag's version. $later"
+            exit 1
+          fi
+          if ! grep -Eq '^[^#]*workflow_dispatch' <<< "$content"; then
+            echo "::error title=The commit's release workflow cannot be started::$path at $short has no workflow_dispatch trigger, which is how the release is started for the tag. $later"
+            exit 1
+          fi
+          echo "$path at $short calls android-release.yml and can be started for the tag."
 
       # A release is cut from a commit that passed the same checks a pull
       # request has to pass. The newest check run of each name counts. A check
@@ -331,9 +390,66 @@ jobs:
             echo "#### Branch"
             echo
             echo "$line"
+            echo
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # The only job that writes. The environment decides who may let it run.
+      # The last step of the plan, and the only word a person has in a
+      # release: no job waits for anyone. A run that is not a dry run goes on
+      # to tag only when confirm repeats the version this plan computed, which
+      # the person knows from the summary of a dry run. A wrong pr, bump or
+      # version then ends here instead of in a published release. A dry run
+      # does not read confirm; having passed every check, it says what to pass.
+      - name: Check the confirmation
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          CONFIRM: ${{ inputs.confirm }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PREVIOUS_TAG: ${{ steps.version.outputs.previous-tag }}
+        run: |
+          set -euo pipefail
+          plan="${PREVIOUS_TAG:-no release yet} → $TAG"
+          if [[ "$DRY_RUN" == true ]]; then
+            echo "Dry run: confirm is not read. To release this plan ($plan), start the run again with dry_run=false and confirm=$TAG."
+            {
+              echo "#### To release this plan"
+              echo
+              echo "Every check passed. Start the run again with the same inputs, \`dry_run\` off and \`confirm\` set to \`$TAG\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          refuse() {
+            echo "::error title=$1::$2 Nothing is tagged. Read the plan in the summary of this run, and when it is the release you mean, start the run again with confirm=$TAG."
+            {
+              echo "#### Not released: $1"
+              echo
+              echo "$2 Nothing is tagged."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+          # Whitespace around the value is not part of it.
+          confirm="${CONFIRM#"${CONFIRM%%[![:space:]]*}"}"
+          confirm="${confirm%"${confirm##*[![:space:]]}"}"
+          if [[ -z "$confirm" ]]; then
+            refuse "The release is not confirmed" "The plan computed $TAG ($plan), and confirm is empty: a run that is not a dry run has to name the planned version."
+          fi
+          # Only a version is printed back.
+          if [[ ! "$confirm" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            refuse "confirm is not a version" "The plan computed $TAG ($plan), and confirm is not of the form X.Y.Z or vX.Y.Z."
+          fi
+          if [[ "$confirm" != "$TAG" && "$confirm" != "$VERSION" ]]; then
+            refuse "confirm does not name the planned version" "The plan computed $TAG ($plan), and confirm is $confirm."
+          fi
+          echo "Confirmed: $TAG."
+          {
+            echo "#### Confirmed"
+            echo
+            echo "\`confirm\` names the planned version, \`$TAG\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The only job that writes. It follows the plan at once: with the default,
+  # empty environment nobody is asked, and a run that is not a dry run and
+  # whose plan passed pushes the tag.
   tag:
     needs: plan
     if: ${{ !inputs.dry_run }}
@@ -375,8 +491,10 @@ jobs:
             exit 1
           fi
 
-      # Time passes between the plan and the approval. The version is planned
-      # again from the repository as it is now, and has to come out the same.
+      # The plan may be old by now: the job waited for a runner or for the
+      # reviewers of an environment, or it is a re-run of a failed attempt,
+      # which keeps the plan of the first. The version is planned again from
+      # the repository as it is now, and has to come out the same.
       - name: Plan the version again
         id: version
         if: ${{ steps.state.outputs.exists == 'false' }}

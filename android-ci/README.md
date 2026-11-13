@@ -5,7 +5,7 @@ Reusable workflows for Android app repositories. The calling repository keeps a 
 | workflow | description |
 |----------|-------------|
 | [`android-pr-check.yml`](../.github/workflows/android-pr-check.yml) | Pull request check: code style, a verification build and a release build, with a GitHub-hosted re-run after an infrastructure failure on self-hosted runners. |
-| [`android-version-bump.yml`](../.github/workflows/android-version-bump.yml) | Release cut, started by hand: computes the next version from the tags, checks the commit, and after approval tags it `vX.Y.Z`. |
+| [`android-version-bump.yml`](../.github/workflows/android-version-bump.yml) | Release cut, started by hand: computes the next version from the tags and checks the commit. A dry run by default; with `dry_run` off and the planned version in `confirm`, it tags the commit `vX.Y.Z`. |
 | [`android-release.yml`](../.github/workflows/android-release.yml) | Release of a tag `vX.Y.Z`: a check of the tagged commit, a cold, signed build, a check of the APK, and a GitHub Release with the APK attached. |
 
 A version exists only as a git tag. No file in the calling repository states it, and no branch marks it:
@@ -14,11 +14,14 @@ A version exists only as a git tag. No file in the calling repository states it,
 pull request merged ──▶ pr-check.yml on the push ──▶ `pr-check / result` on the merge commit
         │
         ▼
-version-bump.yml (by hand: pr, bump) ──▶ plan ──▶ approval ──▶ tag vX.Y.Z
-                                                                      │
-                                                                      ▼
+version-bump.yml (by hand: pr, bump)    ──▶ plan                    a dry run, the default
+version-bump.yml (dry_run off, confirm) ──▶ plan ──▶ tag vX.Y.Z     the release
+                                                      │
+                                                      ▼
 release.yml (for the tag) ──▶ plan ──▶ build with -PciVersionName, -PciVersionCode ──▶ GitHub Release
 ```
+
+No step waits for a person. The second run tags as soon as its plan passes, and the release is built and published from the tag ([Dry run and confirmation](#dry-run-and-confirmation), [Who can release](#who-can-release)).
 
 How the three fit together is in [Branches, tags and releases](#branches-tags-and-releases).
 
@@ -280,8 +283,12 @@ on:
         description: 'Exception: the exact version X.Y.Z to release (bump is then ignored)'
         type: string
       dry_run:
+        description: 'Dry run: plan and check only. Untick to release, and fill in confirm'
         type: boolean
-        default: false
+        default: true
+      confirm:
+        description: 'To release (dry run off): the version the dry run planned, e.g. v1.13.1'
+        type: string
 
 concurrency:
   group: ${{ inputs.dry_run && format('version-bump-dry-{0}', github.run_id) || 'version-bump' }}
@@ -302,21 +309,22 @@ jobs:
       bump: ${{ inputs.bump }}
       version: ${{ inputs.version }}
       dry_run: ${{ inputs.dry_run }}
+      confirm: ${{ inputs.confirm }}
 ```
 
 [`version-bump.yml.example`](./version-bump.yml.example) is a complete file.
 
 - `permissions` must grant the four scopes above: the tag (`contents: write`), starting the release workflow (`actions: write`), reading the commit's checks and the pull request.
 - No secret is needed. See [Secrets](#secrets-1) for the one optional token.
-- Create the `release-approval` environment with its required reviewers before the first run ([Approval and dry run](#approval-and-dry-run)).
-- Give the calling file one `concurrency` group without cancellation, so two releases never run at once. A run that waits for its approval holds the group, and GitHub keeps one waiting run per group: a third run started while one runs and one waits replaces the waiting one. The group above leaves dry runs out of it: a dry run writes nothing, so it starts at once and never replaces a release that waits.
+- Keep `dry_run` on by default in the calling file, as above, and pass `confirm`. The two are what stands between a mistaken run and a published release: nothing in the workflow waits for a person ([Dry run and confirmation](#dry-run-and-confirmation)).
+- Give the calling file one `concurrency` group without cancellation, so two releases never run at once. GitHub keeps one waiting run per group: a third run started while one runs and one waits replaces the waiting one. The group above leaves dry runs out of it: a dry run writes nothing, so it starts at once and never replaces a release that waits.
 
 ### Jobs
 
 | job | runs on | what it does |
 |-----|---------|--------------|
-| `plan` | GitHub-hosted | Read-only. Computes the next version with [`release-version`](../release-version/), checks the commit, and writes the plan to the job summary. |
-| `tag` | GitHub-hosted, in `environment` | Waits for the environment's approval, tags the commit and starts `release-workflow`. Skipped on a dry run. |
+| `plan` | GitHub-hosted | Read-only. Computes the next version with [`release-version`](../release-version/), checks the commit, writes the plan to the job summary and, when the run is not a dry run, checks `confirm` against the planned version. |
+| `tag` | GitHub-hosted | Follows `plan` at once: tags the commit and starts `release-workflow`. Skipped on a dry run, and when `plan` refused. Runs in `environment` when the caller names one. |
 
 ### What is released
 
@@ -334,10 +342,12 @@ The plan refuses the release, with an error that says which rule it was, when:
 - the last release of the version's major is not the one the commit contains: the commit contains no release tag at all while the repository has some, or the line went on elsewhere;
 - the branch has released a higher version after the commit, which matters when `major` opens a line that has no release yet;
 - `version` is not `X.Y.Z`, is tagged already, or is not higher than the last release the commit contains;
+- the commit does not hold `release-workflow` as a workflow that calls `android-release.yml` and can be started by hand ([Starting the release](#starting-the-release)): a commit from before the repository adopted these workflows;
 - a check named in `required-checks` has not succeeded on the commit. The newest run of each check counts, and a check that never ran on the commit is a refusal;
-- the version has no versionCode under [the formula](#version-and-versioncode).
+- the version has no versionCode under [the formula](#version-and-versioncode);
+- the run is not a dry run and `confirm` is not the planned version ([Dry run and confirmation](#dry-run-and-confirmation)).
 
-These refusals happen in `plan`, so a dry run shows them and nobody is asked to approve a release that cannot happen. The `tag` job can still fail on what only shows while writing: the environment does not allow the branch the run was started from, the version was taken by another release while the run waited ([Running again](#running-again)), or the repository's rules refuse the push.
+These refusals happen in `plan`, and all but the last are the same on a dry run, so a dry run shows whether the release can happen. The `tag` job can still fail on what only shows while writing: the version was taken by another release meanwhile ([Running again](#running-again)), or the repository's rules refuse the push.
 
 `required-checks` defaults to `pr-check / result`, the check of [`android-pr-check.yml`](#android-pr-checkyml) when the calling job is named `pr-check`. The merge commit gets that check from the `push` run of the pull request check on its branch, so the calling repository has to run it on pushes to that branch, and that run always builds ([Skipped builds](#skipped-builds)). A run that was cancelled leaves the check `cancelled`, and a commit that was pushed together with later ones has no check; run the pull request check again for that commit, or release a later one.
 
@@ -357,12 +367,13 @@ release/1.x     └── v1.13.1 ── v1.13.2 ── v1.14.0 ── …      
 
 Nothing has to be configured for this: a repository without `release/<major>.x` branches has one line, and the rules above reduce to "the commit is on the source branch and contains the last release".
 
-To start a maintenance line, create `release/<major>.x` at the last release of that major (or at a later commit that belongs to it) before the source branch releases the next major. Add `release/**` to the pull request check's branches, and `release/*` to the allowed branches of the `release` environment when a job that signs runs on those branches.
+To start a maintenance line, create `release/<major>.x` at the last release of that major (or at a later commit that belongs to it) before the source branch releases the next major. Add `release/**` to the pull request check's branches, and, in a repository that has created the `release` environment, `release/*` to its allowed branches when a job that signs runs on those branches.
 
 ### The tag
 
 - The tag is an annotated tag on the commit itself. No commit is created: the version is in no file.
 - Nothing else is written. No branch is moved: the tag and the GitHub Release that `android-release.yml` publishes for it are the whole record of a release ([Branches, tags and releases](#branches-tags-and-releases)).
+- The tag is pushed as soon as the plan of a run that is not a dry run has passed. Nothing waits in between ([Dry run and confirmation](#dry-run-and-confirmation)).
 - The push uses the job token. A repository whose rules restrict who may create `v*` tags provides `RELEASE_PUSH_TOKEN` ([Who can release](#who-can-release)).
 
 `main-branch` is an option for a repository that wants a branch to follow its releases; it is empty by default. When it is set, a release from the source branch moves that branch to the tagged commit as a fast-forward, in one atomic push with the tag: when the branch cannot move, no tag is left behind. The plan refuses a release when the branch holds a commit the release lacks, a release from a maintenance branch does not move it, and the source branch itself is never the branch that is moved. The branch cannot be named `release`: git cannot keep a branch `release` next to the maintenance branches `release/<major>.x`.
@@ -371,25 +382,39 @@ To start a maintenance line, create `release/<major>.x` at the last release of t
 
 GitHub starts no workflow for a push made with the job token, so the new tag alone would not start the release. The `tag` job therefore starts `release-workflow` for the tag itself, as a manual run: starting a workflow by hand is one of the two events the job token may cause.
 
-- The calling repository's release workflow needs the `workflow_dispatch` trigger, and has to exist at the tagged commit.
-- The release runs as a run of its own, on the tag. It can be run again without another version bump, and the rules of its environment see the tag as the ref.
-- With `RELEASE_PUSH_TOKEN`, the tag push itself starts every workflow that triggers on tags. Set `release-workflow: ''` then, or the release runs twice.
+- GitHub runs the workflow file of the tagged commit, not the one of the branch the version bump was started from. The plan therefore reads `.github/workflows/<release-workflow>` at the commit that is released and refuses the release when the file is missing, does not call `android-release.yml`, or has no `workflow_dispatch` trigger.
+- That refusal matters right after a repository adopts these workflows. A commit from before the adoption can pass every other rule: it is on the branch, contains the last release and has a green check. Its release workflow is the earlier one, which would build the new tag its own way, with the version its own files state and without the checks of `android-release.yml`. The first commit that can be released is the merge commit of the pull request that brought the calling `release.yml` in.
+- The release runs as a run of its own, on the tag. It can be run again without another version bump, and the rules of its environment, when it has one, see the tag as the ref.
+- With `RELEASE_PUSH_TOKEN`, the tag push itself starts every workflow that triggers on tags. Set `release-workflow: ''` then, or the release runs twice. The plan then checks no release workflow: which commits may be tagged is for the calling repository to watch.
 
-### Approval and dry run
+### Dry run and confirmation
 
-The `tag` job runs in `environment`, by default `release-approval`, and the required reviewers of that environment are the approval: the job waits until one of them approves, with the plan already in the summary of the run.
+**No person approves a release, and no job waits.** A run that is not a dry run tags the commit as soon as its plan passes, and the tag is built, signed and published as a GitHub Release without another question. Two inputs take the place of an approval:
 
-- **The approval has an environment of its own.** The signing key is in another one, `release`, which the build job of `android-release.yml` names. Reviewers on `release` would be asked once for the tag and again for the build, and again for every other job that signs with that key, such as a QA build of every push. So `release` carries only rules for branches and tags, and `release-approval` carries the reviewers and no secret.
-- **Create `release-approval` before the first run**, with required reviewers and with the branch the version bump is started from (the default branch) among its allowed branches. GitHub creates an environment that a workflow names and that does not exist, without any rule: the `tag` job then runs at once, and the release has no approval.
-- The approval covers releases that start here. A `vX.Y.Z` tag that a person pushes is built without it ([Who can release](#who-can-release)).
+- **`dry_run` is on by default**, here and in the calling file. A run started without thinking, from the form or with `gh workflow run version-bump.yml -f pr=…`, plans and checks and writes nothing. Its summary shows `vA → vB`, the commit, the pull requests the release adds and the result of every check, and ends with the value to pass as `confirm`.
+- **`confirm` has to name the planned version** (`v1.13.1` or `1.13.1`) when `dry_run` is off. The plan compares it with the version it computed and refuses the run, before anything is tagged, when it is empty or another version; the error names the version that was computed. A wrong `pr`, `bump` or `version` therefore ends in a failed run and not in a release, as long as the person passes the version they mean to release and not one copied from the failed run. On a dry run `confirm` is not read.
 
-With `dry_run`, only `plan` runs. Nothing is tagged, pushed or started, and no approval is asked for.
+So a release is two runs: a dry run, read by the person who releases, and the same inputs again with `dry_run` off and `confirm`:
+
+```bash
+gh workflow run version-bump.yml -f pr=857 -f bump=patch
+gh workflow run version-bump.yml -f pr=857 -f bump=patch -f dry_run=false -f confirm=v1.13.1
+```
+
+What this is and is not:
+
+- It guards against mistakes: a run started by accident, a wrong pull request number, a bump that gives another version than intended, a release someone else cut in between (the planned version is then another one).
+- It is not a second person. The one who starts the run can read the plan and confirm it alone. Who that can be is in [Who can release](#who-can-release).
+- A `vX.Y.Z` tag that a person pushes by hand passes neither input; `android-release.yml` checks its branch and its checks and builds it.
+
+**`environment` is empty by default**, and the `tag` job then runs in no environment. GitHub's required reviewers on an environment would be an approval before the tag, but they exist only for public repositories and on the Enterprise plan: a private repository on the Team plan cannot set them (nor a wait timer). An environment without reviewers stops nothing, and one that a workflow names without it existing is created by GitHub without any rule, so naming one "for approval" there only records a deployment for each release. A repository that does have required reviewers creates an environment with them, allows the branch the version bump is started from, and passes its name as `environment`; the `tag` job then waits for a reviewer with the plan in the summary. Keep that environment apart from the one of the signing key ([Environment](#environment)): reviewers on the key's environment would be asked again for the build and for every other job that signs.
 
 ### Running again
 
-- Time passes between the plan and the approval. Before it pushes, the `tag` job plans the version again from the repository as it is then, and stops when the result differs: another release happened meanwhile.
+- The `tag` job plans the version again from the repository as it is when the job runs, and stops when the result differs from the plan: another release happened meanwhile. That covers a job that waited, for a runner or for an environment's reviewers, and a re-run of a failed job, which keeps the earlier plan.
 - A run whose `tag` job failed can be run again with **Re-run failed jobs**: the plan is kept, and the job finds out by itself how far it got. When the tag is on the commit already, it does only what is left: starting the release.
 - **Re-run all jobs**, or a new run with the same inputs, plans again. After the tag was pushed that plan fails, because the commit is now the last release and has nothing new. What is left can then be done by hand: start the release workflow for the tag.
+- A re-run keeps the inputs of the run, `dry_run` and `confirm` included: re-running a release that failed before it tagged is that release again, with no dry run in between.
 
 ### Inputs
 
@@ -399,12 +424,13 @@ With `dry_run`, only `plan` runs. Nothing is tagged, pushed or started, and no a
 | `sha` | `''` | The exception to `pr`: id of the commit to release, 7 or more hex digits. A branch name is refused. |
 | `bump` | `patch` | Which part of the last version to raise: `patch`, `minor` or `major`. Not read when `version` is given. |
 | `version` | `''` | Optional. The exact version to release, `X.Y.Z`, instead of a bump. Higher than the last release the commit contains, and not tagged yet. |
-| `dry_run` | `false` | Plan and check only. |
+| `dry_run` | `true` | Plan and check only: nothing is tagged, pushed or started. On by default; a release turns it off and gives `confirm`. |
+| `confirm` | `''` | The version the plan is expected to compute, `X.Y.Z` or `vX.Y.Z`. Required when `dry_run` is `false`: the run is refused before the tag when the plan computes another version. Not read on a dry run. |
 | `source-branch` | `''` | The branch releases are cut from. Empty means the repository's default branch. The commit has to be in its first-parent history, or in that of `release/<major>.x` for a major that has that branch. |
 | `required-checks` | `pr-check / result` | Names of the checks that must have succeeded on the commit, one per line, as the commit's list of checks shows them. Empty requires none. |
 | `main-branch` | `''` | Optional. A branch that is moved to the commit of a release from the source branch. Empty, the default, moves no branch. |
-| `release-workflow` | `release.yml` | File name of the calling repository's workflow that is started for the new tag. Empty starts nothing. |
-| `environment` | `release-approval` | The environment of the `tag` job. Its required reviewers are the approval. Not the environment of the signing key. |
+| `release-workflow` | `release.yml` | File name, in `.github/workflows`, of the calling repository's workflow that is started for the new tag. The commit that is released has to hold it, calling `android-release.yml`. Empty starts nothing and checks nothing. |
+| `environment` | `''` | Optional. An environment for the `tag` job. Empty, the default: no environment, and the job follows the plan at once. Only where required reviewers exist does naming one add an approval. Not the environment of the signing key. |
 
 ### Secrets
 
@@ -448,7 +474,7 @@ jobs:
 
 [`release.yml.example`](./release.yml.example) is a complete file.
 
-- `workflow_dispatch` is how [`android-version-bump.yml`](#starting-the-release) starts the release. The tag trigger covers a tag pushed by a person; such a tag is built only when it passes the same checks of branch and commit ([The tag](#the-tag-1)), and without the approval of the version bump ([Who can release](#who-can-release)). Leave the trigger out to build a tag only when someone starts the workflow for it.
+- `workflow_dispatch` is how [`android-version-bump.yml`](#starting-the-release) starts the release. The tag trigger covers a tag pushed by a person; such a tag is built only when it passes the same checks of branch and commit ([The tag](#the-tag-1)), and without the dry run and the `confirm` of the version bump ([Who can release](#who-can-release)). Leave the trigger out to build a tag only when someone starts the workflow for it.
 - `permissions` must grant the four scopes above: the GitHub Release, private packages, the checks of the tagged commit, and pull request descriptions for the release notes.
 - `secrets: inherit` is required here, unlike in the pull request check. See [Secrets and variables](#secrets-and-variables).
 
@@ -520,23 +546,33 @@ The workflow reads these by name:
 How the values are read:
 
 - Before anything is checked out, the build job checks the four signing values and every name in `local-properties-secrets` and `required-secrets`. All empty names are printed in one error. A value is never printed.
-- A name is looked up among the secrets, then among the variables. For each, GitHub gives the job the closest value: the environment's, then the repository's, then the organization's. Where a value is kept is therefore the calling repository's choice; the signing secrets belong in the environment (see below).
+- A name is looked up among the secrets, then among the variables. For each, GitHub gives the job the closest value: the environment's, then the repository's, then the organization's. Where a value is kept is therefore the calling repository's choice, the signing secrets included ([Environment](#environment)).
 - That step is the only one that is handed every secret. It runs after the work folder was emptied, and its script imports nothing from the work folder. It writes the values for `local.properties` to a file in the job's temp directory, readable by the runner's user only, and a later step moves the file into place with the keystore path as `KEYSTORE_FILE`.
 - Values are written with the escapes of `java.util.Properties`, so a backslash, a leading space, a line break or a character outside ASCII in a secret reaches the build unchanged.
 - The keystore, `local.properties` and the prepared file are deleted at the end of the job, whatever happened before.
 
 ### Environment
 
-The build job runs in `environment`, by default `release`, which holds the four signing secrets:
+The build job runs in `environment`, by default `release`. What that means depends on whether the calling repository has created an environment of that name, and both are supported:
 
-- Secrets of an environment are read only by jobs that name it, and only in runs on a ref that the environment's rule for deployment branches and tags allows. Keeping the signing secrets there, and not among the repository's secrets, keeps them from pull request runs and from runs on any other branch.
-- Set that rule to selected branches and tags: the release tags (`v*`) for this workflow, whatever line they belong to, and the branches of the calling repository's other jobs that sign, such as a QA build of the default branch (and `release/*` for one on maintenance branches). A run on any other ref cannot start a job in the environment.
-- **No required reviewers here.** They would make every job that names the environment wait: the build, the `fallback` build again, and those other jobs on every push. The approval of a release is the environment of the version bump's `tag` job ([Approval and dry run](#approval-and-dry-run)).
-- **The environment is optional.** A repository can leave `release` uncreated: GitHub creates it without rules on the first run, and the job reads the signing secrets from the repository or the organization. The key is then readable by any workflow of the repository; create the environment with the rule above to limit it to the release tags and the named branches.
+**Not created (the signing secrets are repository or organization secrets).**
+
+- GitHub creates the environment, without any rule and without secrets, the first time a job names it. The job reads the four signing secrets from the repository or the organization, like every other value.
+- Nothing limits who reads the key. Every workflow of the repository, on every branch, can read a repository secret, so anyone who can push a branch with a workflow file can sign with the release key. Pull requests from forks and from Dependabot get no secrets.
+- The only trace of the environment is a deployment record named `release` for each build.
+- Which refs the calling repository's other signing jobs accept (a QA build, a prerelease) is then a policy of those workflows, stated and checked in their own files. It is not a protection of the key: a branch that changes the workflow file changes the check.
+
+**Created, with the signing secrets in it and a rule for deployment branches and tags.**
+
+- Secrets of an environment are read only by jobs that name it, and only in runs on a ref that the rule allows. With the signing secrets there, and deleted from the repository's secrets, pull request runs and runs on any other branch cannot read the key.
+- Set the rule to selected branches and tags: the release tags (`v*`) for this workflow, whatever line they belong to, and the branches of the calling repository's other jobs that sign, such as a QA build of the default branch (and `release/*` for one on maintenance branches). A run on any other ref cannot start a job in the environment. Deployment branch rules and environment secrets are available to private repositories on the Team plan; required reviewers are not.
+- **No required reviewers here**, where they exist. They would make every job that names the environment wait: the build, the `fallback` build again, and those other jobs on every push.
+- The rule goes by ref names. What it does not do is in [Who can release](#who-can-release).
+
+Either way:
+
 - `plan` and `publish` name no environment and read no signing secret.
 - `android-version-bump.yml` does not use this environment, so the branch it is started from does not have to be allowed here.
-
-What the rule does not do is in [Who can release](#who-can-release).
 
 ### The tag
 
@@ -547,7 +583,7 @@ What the rule does not do is in [Who can release](#who-can-release).
 - the tagged commit is in the first-parent history of neither `source-branch` nor `release/<major>.x`, the maintenance branch of the tag's major: a commit of an open pull request, of a branch that was never merged or of another line, or the head commit of a pull request that was merged with a merge commit;
 - a check named in `required-checks` has not succeeded on the tagged commit. The newest run of each check counts, and a check that never ran on the commit is a refusal. The default is `pr-check / result`, which the commit gets from the `push` run of the pull request check on its branch, a run that always builds ([Skipped builds](#skipped-builds)).
 
-The last two are the rules of [`android-version-bump.yml`](#what-is-released), applied again to the tag. They hold for every run of this workflow: a tag the version bump created passes them a second time, and a tag that a person pushed, or a run that a person started for a tag, is held to them all the same. What such a tag does skip is the approval ([Who can release](#who-can-release)).
+The last two are the rules of [`android-version-bump.yml`](#what-is-released), applied again to the tag. They hold for every run of this workflow: a tag the version bump created passes them a second time, and a tag that a person pushed, or a run that a person started for a tag, is held to them all the same. What such a tag does skip is the version bump's plan: the computed version, the summary, the dry run and `confirm` ([Who can release](#who-can-release)).
 
 A tag from before the calling repository had this pull request check has no such check on its commit, and is refused.
 
@@ -608,19 +644,29 @@ The three workflows share one picture of the calling repository:
 - **No branch follows the releases.** The workflows write no branch. A `main` branch that an earlier flow moved or merged into with every release is frozen: nothing here reads it or writes it. Block pushes to it with a ruleset, so that it cannot drift into a second, unchecked history. That is a setting of the repository, which a person makes; the workflows cannot. Take the branch out of the pull request check's triggers as well.
 - **A hotfix starts from a tag or from a maintenance branch.** For the current major, branch from the released tag (`git switch -c fix/crash v2.0.1`) and merge the fix into the default branch through a pull request; the release of that pull request contains everything the default branch had before it. For an older major, branch from `release/<major>.x` and merge the pull request there.
 - **No branch is named `release`.** Git cannot keep a branch `release` next to the maintenance branches `release/<major>.x`: a ref cannot be both a name and the directory of other names.
-- A repository whose earlier releases were merge commits on `main` that the default branch never received merges `main` into the default branch once, with a merge commit and not a squash. Until then the default branch does not contain the last release tag, and the version bump refuses.
+- A repository whose earlier releases were merge commits on `main` that the default branch never received merges `main` into the default branch once, with a merge commit and not a squash. Until then the default branch does not contain the last release tag, and the version bump refuses. That merge commit is itself not released when it was made before the calling `release.yml` was merged: the plan refuses a commit whose release workflow is still the earlier one ([Starting the release](#starting-the-release)).
 
 ### Who can release
 
-A release through `android-version-bump.yml` is approved by a reviewer of `release-approval`, for a commit whose branch and checks the plan verified. Two things are outside that, and both follow from how GitHub works, not from an option of these workflows:
+**Everyone with write access to the repository can release, alone.** That is the whole answer for a repository without the rulesets below, and it is how GitHub works, not an option of these workflows:
 
-- **A tag can be pushed by hand.** Everyone with write access can push a tag `vX.Y.Z`, or start the release workflow for one. `android-release.yml` then verifies the branch and the checks of the tagged commit itself ([The tag](#the-tag-1)), so code that was not merged or did not pass is not built. Nobody approves that release, though: the approval is a rule of the version bump's environment, and the release does not run in it.
-- **The `release` environment trusts ref names.** Its rule allows `v*` tags and the named branches, whatever workflow file the commit behind such a ref holds. Someone with write access can change a workflow on a branch, tag that commit `v0.0.1-x` or push it as `release/x`, and the run of that ref may name the environment and read the signing key. The environment keeps the key from pull request runs and from every other branch; it does not keep it from people who can create the refs it allows.
+- **Starting the version bump.** Write access is what `workflow_dispatch` asks for. One person starts the dry run, reads the plan and starts the release with `confirm`; no second person is involved ([Dry run and confirmation](#dry-run-and-confirmation)). Required reviewers on an environment would add one, and a private repository on the Team plan cannot have them.
+- **Pushing a tag by hand.** Everyone with write access can push a tag `vX.Y.Z`, or start the release workflow for one, without the version bump.
+- **Reading the signing key.** With the signing secrets among the repository's or the organization's secrets, every workflow on every branch can read them. With a `release` environment that holds them, the rule for branches and tags keeps the key from pull request runs and from every other branch, but it goes by ref names: someone with write access can change a workflow on a branch, tag that commit `v0.0.1-x` or push it as `release/x`, and the run of that ref may name the environment and read the key.
 
-Rulesets close both, and without them write access to the repository is the right to release and to use the signing key:
+What the workflows do enforce, for the version bump and for a hand-pushed tag alike, is **what** is released, not who releases it:
 
+- the commit is in the first-parent history of the source branch or of its maintenance branch, so it went through whatever the repository requires of a merge there (a reviewed pull request, when the branch is protected so);
+- `required-checks` succeeded on that very commit;
+- the version is the next one of its line, and the APKs carry it.
+
+The version bump adds the dry-run default and `confirm`. They catch a mistake; they do not stop a person who means to release.
+
+Rulesets narrow the "who", and without them write access to the repository is the right to release and to use the signing key:
+
+- Require pull requests, with a review, on the default branch and on `release/**` branches, so that code and workflow files change only through review. The rules above lean on this one.
 - Restrict who may create, update and delete tags matching `v*`.
-- Restrict who may create `release/**` branches, and require pull requests on them and on the default branch, so that a workflow file changes only through review.
+- Restrict who may create `release/**` branches.
 - A rule on `v*` tags also refuses the version bump's own tag push, unless the actor behind its token is let through. Give the workflow a token of an actor on the rule's bypass list, such as a GitHub App, as `RELEASE_PUSH_TOKEN`, and set `release-workflow: ''`, because a tag pushed with that token starts the release through its tag trigger.
 
 These are settings of the calling repository. The workflows can neither make them nor see whether they are made.

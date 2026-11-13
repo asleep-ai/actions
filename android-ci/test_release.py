@@ -1215,7 +1215,7 @@ def test_no_secret_is_required_by_the_declaration(entry):
         "KEYSTORE_BASE64", "KEYSTORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD",
         "RUNNER_READ_TOKEN", "GIT_TOKEN", "SENTRY_AUTH_TOKEN", "OPENAI_API_KEY",
     ]
-    # The signing secrets live in the environment of the build job, where a caller cannot pass them from.
+    # The signing secrets may live in the environment of the build job, where a caller cannot pass them from.
     assert all(secret["required"] is False for secret in secrets.values())
     used = set(re.findall(r"secrets\.([A-Z0-9_]+)", (WORKFLOWS / ENTRY).read_text() + (WORKFLOWS / BUILD).read_text()))
     assert used <= set(secrets)

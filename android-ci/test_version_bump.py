@@ -63,7 +63,9 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
     assert "- versionCode: 101350001\n" in text
     # The titles are written as they are.
     assert prs + "\n" in text
-    assert "Dry run" not in text
+    # A run that releases says so at the top: nothing waits between the plan and the tag.
+    assert "**Dry run.**" not in text
+    assert "**Not a dry run.** When every check below passes and `confirm` names `v1.13.1`, the commit is tagged" in text
     assert "is ignored" not in text
 
     # A first release whose version was given, as a dry run.
@@ -74,9 +76,223 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
     text = summary.read_text()
     assert text.startswith("### no release yet → v2.0.0\n")
     assert "**Dry run.** Nothing is tagged, pushed or started." in text
+    assert "Not a dry run" not in text
     assert "merge commit of" not in text
     assert "- The version was given (`version`); `bump` (patch) is ignored.\n" in text
     assert "Nothing listed." in text
+
+
+# --- plan: the release workflow of the commit ----------------------------------------------
+
+SHARED_RELEASE = """\
+name: Release
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+jobs:
+  release:
+    uses: asleep-ai/actions/.github/workflows/android-release.yml@android-ci/v1
+    secrets: inherit
+"""
+# The workflow a repository had before it called the shared one: it builds whatever ref it is
+# started for. The shared workflow is named in a comment only.
+EARLIER_RELEASE = """\
+name: Release Build
+# To be replaced by asleep-ai/actions/.github/workflows/android-release.yml@android-ci/v1.
+#   uses: asleep-ai/actions/.github/workflows/android-release.yml@android-ci/v1
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./gradlew assembleRelease
+"""
+
+
+def check_release_workflow(jobs, repository: Path, target: str, workflow: str = "release.yml"):
+    env = {"RELEASE_WORKFLOW": workflow, "TARGET_SHA": target}
+    return run_script(step(jobs["plan"], "Check the release workflow of the commit")["run"], env, repository)
+
+
+@pytest.fixture
+def repository(tmp_path) -> Path:
+    path = tmp_path / "repository"
+    path.mkdir()
+    git(path, "init", "-q", "-b", "develop")
+    commit(path, {"app/Main.kt": "fun main() {}\n"}, "base")
+    return path
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        SHARED_RELEASE,
+        # Another owner, a commit as the ref, quotes, and the trigger in the short form.
+        "on: [push, workflow_dispatch]\njobs:\n  release:\n    uses: 'acme/actions/.github/workflows/android-release.yml@"
+        + "0" * 40 + "'\n",
+        'on:\n  workflow_dispatch:\njobs:\n  release:\n    if: ${{ !inputs.label }}\n'
+        '    uses: "asleep-ai/actions/.github/workflows/android-release.yml@android-ci/v1"\n',
+    ],
+)
+def test_a_commit_whose_release_workflow_calls_the_shared_one_passes(jobs, repository, content):
+    target = commit(repository, {".github/workflows/release.yml": content}, "ci: release from tags (#871)")
+    result = check_release_workflow(jobs, repository, target)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f".github/workflows/release.yml at {target[:7]} calls android-release.yml" in result.stdout
+
+
+def test_a_commit_from_before_the_shared_release_workflow_is_refused(jobs, repository):
+    # One caller's first release: the merge of main into develop contains the last release tag and
+    # passed its checks, and its release.yml is still the earlier workflow, which would build the new
+    # tag with the version of its own files. The file of the branch tip does not help that commit.
+    before = commit(repository, {".github/workflows/release.yml": EARLIER_RELEASE}, "Merge main into develop (#872)")
+    after = commit(repository, {".github/workflows/release.yml": SHARED_RELEASE}, "ci: release from tags (#871)")
+    result = check_release_workflow(jobs, repository, before)
+    assert result.returncode == 1
+    assert "::error title=The commit's release workflow is not the shared one::" in result.stdout
+    assert f".github/workflows/release.yml at {before[:7]} does not call android-release.yml" in result.stdout
+    assert "the merge commit of the pull request that brought the workflow in, or a later one" in result.stdout
+    assert check_release_workflow(jobs, repository, after).returncode == 0
+
+
+def test_a_commit_without_the_release_workflow_is_refused(jobs, repository):
+    target = git(repository, "rev-parse", "HEAD")
+    result = check_release_workflow(jobs, repository, target)
+    assert result.returncode == 1
+    assert f"::error title=The commit has no release workflow::{target[:7]} holds no .github/workflows/release.yml" in result.stdout
+    # The file under another name is not the one that is started.
+    target = commit(repository, {".github/workflows/publish.yml": SHARED_RELEASE}, "ci (#2)")
+    assert check_release_workflow(jobs, repository, target).returncode == 1
+    assert check_release_workflow(jobs, repository, target, workflow="publish.yml").returncode == 0
+
+
+def test_a_release_workflow_that_cannot_be_started_is_refused(jobs, repository):
+    content = SHARED_RELEASE.replace("  workflow_dispatch:\n", "").replace(
+        "name: Release\n", "name: Release\n# workflow_dispatch was removed\n"
+    )
+    target = commit(repository, {".github/workflows/release.yml": content}, "ci (#2)")
+    result = check_release_workflow(jobs, repository, target)
+    assert result.returncode == 1
+    assert "::error title=The commit's release workflow cannot be started::" in result.stdout
+    assert "has no workflow_dispatch trigger" in result.stdout
+
+
+def test_without_a_release_workflow_nothing_is_checked(jobs, repository):
+    result = check_release_workflow(jobs, repository, git(repository, "rev-parse", "HEAD"), workflow="")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "nothing to check" in result.stdout
+
+
+@pytest.mark.parametrize("workflow", ["../../build.gradle.kts", "release", "Release Build", "release.yml:x", "a/release.yml"])
+def test_release_workflow_has_to_be_a_file_name(jobs, repository, workflow):
+    target = commit(repository, {".github/workflows/release.yml": SHARED_RELEASE}, "ci (#2)")
+    result = check_release_workflow(jobs, repository, target, workflow=workflow)
+    assert result.returncode == 1
+    assert "release-workflow is not the file name of a workflow" in result.stdout
+
+
+def test_the_examples_release_workflow_passes_the_check(jobs, repository):
+    # The file a calling repository copies is one the version bump accepts.
+    example = (ROOT / "android-ci" / "release.yml.example").read_text()
+    target = commit(repository, {".github/workflows/release.yml": example}, "ci (#2)")
+    result = check_release_workflow(jobs, repository, target)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- plan: the confirmation -----------------------------------------------------------------
+
+
+def check_confirmation(jobs, tmp_path, confirm: str, dry_run: str = "false", tag: str = "v1.13.1", previous: str = "v1.13.0"):
+    summary = tmp_path / "summary"
+    summary.write_text("")
+    env = {
+        "DRY_RUN": dry_run,
+        "CONFIRM": confirm,
+        "TAG": tag,
+        "VERSION": tag.removeprefix("v"),
+        "PREVIOUS_TAG": previous,
+        "GITHUB_STEP_SUMMARY": str(summary),
+    }
+    result = run_script(step(jobs["plan"], "Check the confirmation")["run"], env, tmp_path)
+    return result, summary.read_text()
+
+
+@pytest.mark.parametrize("confirm", ["v1.13.1", "1.13.1", "  v1.13.1\n"])
+def test_a_release_is_confirmed_by_the_planned_version(jobs, tmp_path, confirm):
+    result, summary = check_confirmation(jobs, tmp_path, confirm)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Confirmed: v1.13.1." in result.stdout
+    assert "`confirm` names the planned version, `v1.13.1`." in summary
+
+
+@pytest.mark.parametrize("confirm", ["", "  ", "\n"])
+def test_a_release_without_confirm_is_refused(jobs, tmp_path, confirm):
+    result, summary = check_confirmation(jobs, tmp_path, confirm)
+    assert result.returncode == 1
+    assert "::error title=The release is not confirmed::The plan computed v1.13.1 (v1.13.0 → v1.13.1), and confirm is empty" in result.stdout
+    assert "start the run again with confirm=v1.13.1" in result.stdout
+    assert "#### Not released: The release is not confirmed" in summary
+    assert "Nothing is tagged." in summary
+
+
+@pytest.mark.parametrize("confirm", ["v1.13.2", "1.14.0", "v1.13.0", "v2.0.0", "1.13.10", "v1.13.01"])
+def test_confirm_of_another_version_is_refused_and_names_the_planned_one(jobs, tmp_path, confirm):
+    # A wrong pr or bump: the person expected one version and the plan computed another.
+    result, summary = check_confirmation(jobs, tmp_path, confirm)
+    assert result.returncode == 1
+    assert (
+        "::error title=confirm does not name the planned version::The plan computed v1.13.1 (v1.13.0 → v1.13.1), "
+        f"and confirm is {confirm}. Nothing is tagged."
+    ) in result.stdout
+    assert "Confirmed" not in result.stdout + summary
+
+
+@pytest.mark.parametrize("confirm", ["yes", "true", "v2.5", "v1.13.1-rc.1", "v1.13.1 v1.13.1", "v1.13.1\n::notice::x", "$(id)"])
+def test_confirm_that_is_not_a_version_is_refused_without_being_printed(jobs, tmp_path, confirm):
+    result, summary = check_confirmation(jobs, tmp_path, confirm)
+    assert result.returncode == 1
+    assert "::error title=confirm is not a version::The plan computed v1.13.1" in result.stdout
+    assert "::notice::" not in result.stdout
+    assert confirm not in result.stdout and confirm not in summary
+
+
+def test_a_first_release_is_confirmed_like_any_other(jobs, tmp_path):
+    result, _ = check_confirmation(jobs, tmp_path, "", tag="v2.0.0", previous="")
+    assert result.returncode == 1
+    assert "The plan computed v2.0.0 (no release yet → v2.0.0), and confirm is empty" in result.stdout
+    assert check_confirmation(jobs, tmp_path, "2.0.0", tag="v2.0.0", previous="")[0].returncode == 0
+
+
+@pytest.mark.parametrize("confirm", ["", "v1.13.1", "v9.9.9", "anything"])
+def test_a_dry_run_does_not_read_confirm_and_says_what_to_pass(jobs, tmp_path, confirm):
+    result, summary = check_confirmation(jobs, tmp_path, confirm, dry_run="true")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "start the run again with dry_run=false and confirm=v1.13.1" in result.stdout
+    assert "#### To release this plan" in summary
+    assert "`dry_run` off and `confirm` set to `v1.13.1`" in summary
+    assert "Confirmed" not in result.stdout + summary
+
+
+def test_the_confirmation_is_the_last_step_of_the_plan_and_the_tag_job_needs_the_plan(jobs):
+    # A refusal by any earlier step, or by this one, leaves the tag job without the job it needs.
+    plan, tag = jobs["plan"], jobs["tag"]
+    last = plan["steps"][-1]
+    assert last["name"] == "Check the confirmation"
+    assert "if" not in last, "the step runs on every run of the plan"
+    assert last["env"] == {
+        "DRY_RUN": "${{ inputs.dry_run }}",
+        "CONFIRM": "${{ inputs.confirm }}",
+        "TAG": "${{ steps.version.outputs.tag }}",
+        "VERSION": "${{ steps.version.outputs.version }}",
+        "PREVIOUS_TAG": "${{ steps.version.outputs.previous-tag }}",
+    }
+    assert tag["needs"] == "plan"
+    # The version the tag job tags is the one that was confirmed.
+    assert jobs["plan"]["outputs"]["tag"] == "${{ steps.version.outputs.tag }}"
+    assert step(tag, "Push the tag and the main branch")["env"]["TAG"] == "${{ needs.plan.outputs.tag }}"
 
 
 # --- plan: the checks of the commit --------------------------------------------------------
@@ -562,10 +778,11 @@ def test_only_the_tag_job_writes_and_only_after_the_plan(jobs):
     assert workflow["permissions"] == {"contents": "read"}
     plan, tag = jobs["plan"], jobs["tag"]
     assert plan["permissions"] == {"contents": "read", "checks": "read", "pull-requests": "read"}
-    assert "environment" not in plan, "the plan is shown before anyone is asked to approve"
+    assert "environment" not in plan, "the plan never waits: a dry run shows it at once"
     assert plan["steps"][0]["with"] == {"fetch-depth": 0, "persist-credentials": False}
     assert tag["needs"] == "plan"
     assert tag["if"] == "${{ !inputs.dry_run }}"
+    # Empty by default: the job then runs in no environment, right after the plan.
     assert tag["environment"] == "${{ inputs.environment }}"
     assert tag["permissions"] == {"contents": "write", "actions": "write", "pull-requests": "read"}
     assert tag["steps"][0]["with"] == {
@@ -582,22 +799,37 @@ def test_only_the_tag_job_writes_and_only_after_the_plan(jobs):
     assert names == [
         "Plan the version",
         "Write the plan to the summary",
+        "Check the release workflow of the commit",
         "Check the commit's checks",
         "Check that the main branch can move",
+        "Check the confirmation",
     ]
+    for name in names[2:]:
+        assert "if" not in step(plan, name), f"{name}: a dry run shows the same refusals"
+    guard = step(plan, "Check the release workflow of the commit")
+    assert guard["env"] == {
+        "RELEASE_WORKFLOW": "${{ inputs.release-workflow }}",
+        "TARGET_SHA": "${{ steps.version.outputs.target-sha }}",
+    }
+    # The file that is checked is the one the tag job starts.
+    assert step(tag, "Start the release workflow")["env"]["RELEASE_WORKFLOW"] == "${{ inputs.release-workflow }}"
 
 
 def test_inputs_secrets_and_outputs(jobs):
     call = trigger(load(ENTRY))
     assert list(call["inputs"]) == [
-        "pr", "sha", "bump", "version", "dry_run", "source-branch", "required-checks", "main-branch",
+        "pr", "sha", "bump", "version", "dry_run", "confirm", "source-branch", "required-checks", "main-branch",
         "release-workflow", "environment",
     ]
-    assert call["inputs"]["dry_run"] == {**call["inputs"]["dry_run"], "type": "boolean", "default": False}
+    # A run is a dry run unless it says otherwise, and a run that says otherwise has to name the
+    # planned version: no job waits for an approval, so these two are what stands before the tag.
+    assert call["inputs"]["dry_run"] == {**call["inputs"]["dry_run"], "type": "boolean", "default": True}
+    assert call["inputs"]["confirm"] == {**call["inputs"]["confirm"], "type": "string", "default": "", "required": False}
     assert call["inputs"]["version"]["default"] == ""
-    # The approval has an environment of its own: the one that holds the signing key is the build
-    # job's, and reviewers on that one would also be asked for every other job that signs.
-    assert call["inputs"]["environment"]["default"] == "release-approval"
+    # No environment by default: required reviewers, the one rule that would make it an approval,
+    # do not exist for a private repository on the Team plan. The build job's default is another
+    # matter: it names the environment a repository may keep its signing key in.
+    assert call["inputs"]["environment"]["default"] == ""
     assert trigger(load("android-release.yml"))["inputs"]["environment"]["default"] == "release"
     assert call["secrets"]["RELEASE_PUSH_TOKEN"]["required"] is False
     assert set(call["secrets"]) == {"RELEASE_PUSH_TOKEN"}
@@ -628,11 +860,14 @@ def test_the_example_passes_only_what_the_workflow_declares():
     assert job["uses"] == f"asleep-ai/actions/.github/workflows/{ENTRY}@android-ci/v1"
     assert set(job["with"]) <= set(call["inputs"])
     dispatch = example[True]["workflow_dispatch"]["inputs"]
-    assert list(dispatch) == ["pr", "sha", "bump", "version", "dry_run"]
+    assert list(dispatch) == ["pr", "sha", "bump", "version", "dry_run", "confirm"]
     assert dispatch["bump"]["options"] == ["patch", "minor", "major"]
+    # The form opens as a dry run, like the called workflow: a release is a run that unticks it.
+    assert dispatch["dry_run"]["type"] == "boolean" and dispatch["dry_run"]["default"] is True
+    assert "default" not in dispatch["confirm"]
     for name in dispatch:
         assert job["with"][name] == f"${{{{ inputs.{name} }}}}"
-    # Nothing else is passed: no branch is moved and the approval is asked in release-approval, by default.
+    # Nothing else is passed: no branch is moved and the tag job runs in no environment, by default.
     assert set(job["with"]) == set(dispatch)
     # The called workflow cannot be given more than the caller has.
     assert example["permissions"] == {
@@ -640,12 +875,19 @@ def test_the_example_passes_only_what_the_workflow_declares():
     }
     assert "secrets" not in job
     assert example["concurrency"]["cancel-in-progress"] is False
-    # A dry run writes nothing, so it does not wait behind a release that waits for its approval.
+    # A dry run writes nothing, so it neither waits behind a release nor replaces one that waits.
     assert example["concurrency"]["group"] == (
         "${{ inputs.dry_run && format('version-bump-dry-{0}', github.run_id) || 'version-bump' }}"
     )
-    usage = README.read_text().split("## android-version-bump.yml", 1)[1].split("```yaml", 1)[1].split("```", 1)[0]
-    assert yaml.safe_load(usage)["concurrency"] == example["concurrency"]
+    usage = yaml.safe_load(
+        README.read_text().split("## android-version-bump.yml", 1)[1].split("```yaml", 1)[1].split("```", 1)[0]
+    )
+    assert usage["concurrency"] == example["concurrency"]
+    shown = usage[True]["workflow_dispatch"]["inputs"]
+    assert list(shown) == list(dispatch)
+    assert shown["dry_run"]["default"] is True
+    (shown_job,) = usage["jobs"].values()
+    assert shown_job["with"] == job["with"]
 
 
 def test_readme_lists_every_input_with_its_default():

@@ -39,7 +39,9 @@ on:
       environment:
         description: >-
           The environment of the build job. Its secrets are the ones the job
-          reads first, and its protection rules apply to the job.
+          reads first, and its protection rules apply to the job. A repository
+          that has not created it gets an empty one without rules, and the job
+          reads the repository's and the organization's secrets.
         required: false
         type: string
         default: release
@@ -159,9 +161,9 @@ on:
         type: string
         default: -Xmx6g
     # The workflow reads these by name. None is required here: the four
-    # signing secrets normally live in the environment of the build job, where
-    # the caller cannot pass them from, and the build job itself fails when one
-    # is empty. The secrets and variables named in local-properties-secrets
+    # signing secrets may live in the environment of the build job, where the
+    # caller cannot pass them from, and the build job itself fails when one is
+    # empty. The secrets and variables named in local-properties-secrets
     # and required-secrets are read by name as well, which is why the caller
     # passes `secrets: inherit`.
     secrets:

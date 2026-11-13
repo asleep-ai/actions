@@ -37,6 +37,8 @@ jobs:
         EXAMPLE_BASE_URL
       # Must not be empty, and are not written to local.properties.
       required-secrets: SENTRY_AUTH_TOKEN
-    # Every secret: the workflow reads the ones named above by name, and the
-    # signing secrets of the `release` environment in its build job.
+    # Every secret: the workflow reads the ones named above and the four
+    # signing secrets by name. The signing secrets are the repository's or
+    # the organization's, or those of the `release` environment when the
+    # repository has created it.
     secrets: inherit

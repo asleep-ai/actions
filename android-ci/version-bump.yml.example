@@ -1,9 +1,11 @@
 name: Version Bump
 
-# Started by hand for a merged pull request. The run plans the next version,
-# waits for the approval of the `release-approval` environment, tags the merge
-# commit vX.Y.Z and starts release.yml for the tag. The tag is the release: no
-# branch is moved and nothing is committed.
+# Started by hand for a merged pull request. The run plans the next version
+# and checks the commit, and that is all it does as long as dry_run is on,
+# which is the default. With dry_run off and the planned version in confirm,
+# it then tags the merge commit vX.Y.Z and starts release.yml for the tag, at
+# once: nobody is asked in between. The tag is the release: no branch is moved
+# and nothing is committed.
 #
 # The pull request was merged into the default branch or, for a hotfix of an
 # older major version, into its maintenance branch release/<major>.x. The
@@ -34,15 +36,19 @@ on:
         required: false
         type: string
       dry_run:
-        description: 'Plan and check only: nothing is tagged, pushed or started'
+        description: 'Dry run: plan and check only. Untick to release, and fill in confirm'
         required: false
-        default: false
+        default: true
         type: boolean
+      confirm:
+        description: 'To release (dry run off): the version the dry run planned, e.g. v1.13.1'
+        required: false
+        type: string
 
-# One release at a time: a second run waits for the first, also while the
-# first waits for its approval. GitHub keeps one waiting run per group, so a
-# third run would replace the one that waits. A dry run writes nothing and
-# gets a group of its own, so it never waits and never replaces a release.
+# One release at a time: a second run waits for the first. GitHub keeps one
+# waiting run per group, so a third run would replace the one that waits. A
+# dry run writes nothing and gets a group of its own, so it neither waits
+# behind a release nor replaces one.
 concurrency:
   group: ${{ inputs.dry_run && format('version-bump-dry-{0}', github.run_id) || 'version-bump' }}
   cancel-in-progress: false
@@ -64,3 +70,4 @@ jobs:
       bump: ${{ inputs.bump }}
       version: ${{ inputs.version }}
       dry_run: ${{ inputs.dry_run }}
+      confirm: ${{ inputs.confirm }}
