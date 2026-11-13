@@ -141,16 +141,26 @@ def test_fallback_json_string_is_one_label(tmp_path):
     assert json.loads(out["runs-on"]) == "ubuntu-latest"
 
 
+@pytest.mark.parametrize("fallback", ["", " \n"])
+def test_empty_fallback_is_the_default(tmp_path, fallback):
+    # What `fallback: ${{ vars.UNSET }}` passes: action.yml's default does not apply.
+    code, out = run_main(tmp_path, pages({"runners": []}), FALLBACK=fallback)
+    assert code == 0
+    assert json.loads(out["runs-on"]) == "ubuntu-latest"
+
+
 @pytest.mark.parametrize("fallback", [
-    "",
     "[]",
     '["ubuntu-latest", 1]',
     '[" ubuntu-latest"]',
+    '["ubuntu-latest"',
     '{"group":"larger"}',
     "ubuntu-latest, macos-latest",
     "ubuntu-latest macos-latest",
     '"ubuntu-latest',
     '""',
+    '"[\\"ubuntu-latest\\"]"',  # an array quoted once more, e.g. toJSON() of a string
+    "'ubuntu-latest'",
 ])
 def test_invalid_fallback_fails_the_step(tmp_path, capsys, fallback):
     code, out = run_main(tmp_path, pages({"runners": []}), FALLBACK=fallback)
@@ -188,6 +198,87 @@ def test_unreadable_response_picks_labels_unchecked(tmp_path, capsys, body):
     assert out["online-count"] == ""
     # A recognised failure with its reason, not a crash caught by the catch-all.
     assert "unexpected error" not in capsys.readouterr().out
+
+
+ONLINE_LABELS = [{"name": "self-hosted"}, {"name": "Linux"}, {"name": "X64"}]
+
+
+@pytest.mark.parametrize("entry", [
+    {"status": "online", "labels": ["self-hosted", "Linux", "X64"]},
+    {"status": "online", "labels": [{"id": 1}, {"id": 2}, {"id": 3}]},
+    {"status": "online", "labels": "self-hosted"},
+    {"status": "online"},
+    {"status": "Online", "labels": ONLINE_LABELS},
+    {"status": "idle", "labels": ONLINE_LABELS},
+    {"labels": ONLINE_LABELS},
+])
+def test_unexpected_runner_entry_is_a_failed_check(tmp_path, capsys, entry):
+    # Skipping such an entry would report an online runner as offline.
+    _, out = run_main(tmp_path, pages({"runners": [entry]}))
+    assert out["self-hosted"] == "true"
+    assert out["online-count"] == ""
+    printed = capsys.readouterr().out
+    assert "::warning title=Runner check failed::" in printed
+    assert "unexpected error" not in printed
+
+
+def test_fewer_runners_than_total_count_is_a_failed_check(tmp_path, capsys):
+    # One page arrives, with a Link header the parser does not follow.
+    def fetch(url, token):
+        body = {"total_count": 3, "runners": [runner(status="offline")]}
+        return json.dumps(body).encode(), f"<{API}/orgs/acme/actions/runners?page=2>; rel=next"
+
+    _, out = run_main(tmp_path, fetch)
+    assert out["self-hosted"] == "true"
+    assert out["online-count"] == ""
+    assert "read 1 runners where the response counts 3" in capsys.readouterr().out
+
+
+def test_total_count_matching_across_pages(tmp_path):
+    fetch = pages(
+        {"total_count": 3, "runners": [runner(status="offline")] * 2},
+        {"total_count": 3, "runners": [runner()]},
+    )
+    _, out = run_main(tmp_path, fetch)
+    assert out["online-count"] == "1"
+
+
+def test_stops_after_max_pages(tmp_path, capsys):
+    calls = []
+
+    def fetch(url, token):
+        calls.append(url)
+        return json.dumps({"runners": []}).encode(), f'<{API}/orgs/acme/actions/runners?page=2>; rel="next"'
+
+    _, out = run_main(tmp_path, fetch)
+    assert len(calls) == pick.MAX_PAGES
+    assert out["self-hosted"] == "true"
+    assert out["online-count"] == ""
+    assert f"more than {pick.MAX_PAGES} pages" in capsys.readouterr().out
+
+
+def test_organization_is_quoted_in_the_url(tmp_path):
+    fetch = pages({"runners": []})
+    run_main(tmp_path, fetch, ORG="a/b c")
+    assert fetch.calls[0][0] == f"{API}/orgs/a%2Fb%20c/actions/runners?per_page=100"
+
+
+def test_empty_organization_uses_the_repository_owner(tmp_path):
+    fetch = pages({"runners": [runner()]})
+    code, _ = run_main(tmp_path, fetch, ORG="", GITHUB_REPOSITORY_OWNER="acme-owner")
+    assert code == 0
+    assert "/orgs/acme-owner/" in fetch.calls[0][0]
+
+
+def test_warning_from_main_is_escaped(tmp_path, capsys):
+    # An API error body is quoted in the warning and must not start a command.
+    def fetch(url, token):
+        raise pick.CheckError("HTTP 403: denied\n::error::injected 100%")
+
+    run_main(tmp_path, fetch)
+    printed = capsys.readouterr().out
+    assert "HTTP 403: denied%0A::error::injected 100%25" in printed
+    assert not any(line.startswith("::error") for line in printed.splitlines())
 
 
 def test_unexpected_error_picks_labels_unchecked(tmp_path, capsys):

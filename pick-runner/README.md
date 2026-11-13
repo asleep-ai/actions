@@ -30,7 +30,7 @@ jobs:
 
 No checkout is needed; the action only calls the GitHub API.
 
-If the `pick-runner` job itself fails (an invalid input, a GitHub-hosted outage, its timeout), the jobs that need it are skipped. To send them to the self-hosted labels instead, let them run anyway and repeat the labels as the default:
+If the `pick-runner` job itself fails (an invalid input, a GitHub-hosted outage, its timeout), the jobs that need it are skipped. A skipped job [counts as passing for a required status check](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks), so a pull request could then merge without `build` having run. To send the jobs to the self-hosted labels instead, let them run anyway and repeat the labels as the default:
 
 ```yaml
   build:
@@ -39,14 +39,16 @@ If the `pick-runner` job itself fails (an invalid input, a GitHub-hosted outage,
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs-on || '["self-hosted","Linux","X64"]') }}
 ```
 
+`!cancelled()` also lets `build` run when any other job it needs has failed. If it needs more than `pick-runner`, check those jobs' `needs.<job>.result` in the same `if`.
+
 ## Inputs
 
 | name | required | default | description |
 |------|----------|---------|-------------|
 | `labels` | yes | | Self-hosted `runs-on` labels as a JSON array of strings. |
 | `token` | yes | | Token that can list the organization's self-hosted runners (see [Token](#token)). When empty, the check is skipped (see [Rules](#rules)). |
-| `fallback` | no | `ubuntu-latest` | `runs-on` when no matching runner is online: one label (`ubuntu-latest`), or a JSON array of labels. A `runs-on` object (`group:`) is not supported. |
-| `organization` | no | `github.repository_owner` | Organization whose runners are checked. |
+| `fallback` | no | `ubuntu-latest` | `runs-on` when no matching runner is online: one label (`ubuntu-latest`), or a JSON array of labels. A `runs-on` object (`group:`) is not supported. An empty value means the default. |
+| `organization` | no | `github.repository_owner` | Organization whose runners are checked. An empty value means the default. |
 
 ## Outputs
 
@@ -70,7 +72,8 @@ If the `pick-runner` job itself fails (an invalid input, a GitHub-hosted outage,
 - Only the organization's runner list is read. A runner registered on a repository is not counted, and runner-group access is not checked: a runner in a group the calling repository cannot use may still be counted.
 - A failed check is not evidence that the runners are offline, so it keeps the self-hosted labels instead of silently moving every run to GitHub-hosted runners. Watch for the `Runner check failed` warning.
 - Every page of the runner list is read. Pagination links and redirects are only followed on the API host the token was issued for.
-- A `fallback` that is not one label or an array of labels fails the step: quoted JSON is unwrapped, but an object, or a single label containing a comma or whitespace, is rejected. A label that no runner has would leave the jobs queued, which is what this action is there to prevent.
+- A runner entry that does not look as expected (a status other than `online` or `offline`, labels in another shape), or a list shorter than its `total_count`, is an unreadable response, not a runner that does not match.
+- A `fallback` that is not shaped like one label or an array of labels fails the step: a quoted JSON string is unwrapped, but an object, a value that still starts with a quote or a bracket, or a single label containing a comma or whitespace is rejected. Only the shape is checked. A misspelt label passes, and no runner has it, so the jobs would wait in the queue.
 
 ## Token
 

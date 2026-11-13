@@ -34,3 +34,26 @@ jobs:
 
       - name: Run pick-runner tests
         run: uv run --with pytest python -m pytest pick-runner -q
+
+      # Load the action the way a caller does: an action.yml GitHub cannot load
+      # passes actionlint and the unit tests. With no token the check is skipped
+      # (hence the "Runner check skipped" warning on this job), so no secret is
+      # needed.
+      - name: Run the pick-runner action
+        id: pick
+        uses: ./pick-runner
+        with:
+          labels: '["self-hosted","Linux","X64"]'
+          token: ''
+
+      - name: Check the pick-runner outputs
+        env:
+          RUNS_ON: ${{ steps.pick.outputs.runs-on }}
+          SELF_HOSTED: ${{ steps.pick.outputs.self-hosted }}
+          ONLINE_COUNT: ${{ steps.pick.outputs.online-count }}
+        run: |
+          set -euo pipefail
+          echo "runs-on=$RUNS_ON self-hosted=$SELF_HOSTED online-count=$ONLINE_COUNT"
+          [[ "$RUNS_ON" == '["self-hosted","Linux","X64"]' ]]
+          [[ "$SELF_HOSTED" == true ]]
+          [[ -z "$ONLINE_COUNT" ]]

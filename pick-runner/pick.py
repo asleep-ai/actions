@@ -16,7 +16,8 @@ Rules:
   any other error while reading the runners) -> the labels, with a warning. A
   failed check is not evidence that the runners are offline, and the labels are
   what the jobs used before this check.
-- Invalid inputs fail the step: they are caller bugs, not runner state.
+- Invalid inputs fail the step: they are caller bugs, not runner state. An
+  empty fallback or organization is not invalid: it means the default.
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional, Tuple
 
+DEFAULT_FALLBACK = "ubuntu-latest"
 PER_PAGE = 100
 MAX_PAGES = 50
 NEXT_LINK = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
@@ -80,7 +82,9 @@ def parse_fallback(raw: str) -> str:
     """
     text = raw.strip()
     if not text:
-        raise InputError("fallback must not be empty")
+        # action.yml's default only applies when the input is not given at all;
+        # `fallback: ${{ vars.X }}` with X unset arrives here as an empty string.
+        return json.dumps(DEFAULT_FALLBACK)
     if text.startswith("["):
         return json.dumps(parse_labels(text, "fallback"), separators=(",", ":"))
     shape = InputError(f"fallback must be one label or a JSON array of labels, got {text!r}")
@@ -91,9 +95,10 @@ def parse_fallback(raw: str) -> str:
             label = json.loads(text)
         except json.JSONDecodeError:
             raise shape from None
-    # A label with a comma or whitespace is far more likely a list or an object
-    # written the wrong way; the array form still takes such a label.
-    if not label or label.startswith("{") or "," in label or any(ch.isspace() for ch in label):
+    # A label that opens like JSON or a quote, or holds a comma or whitespace, is
+    # far more likely a list, an object or a quoted value written the wrong way;
+    # the array form still takes such a label.
+    if not label or label[0] in "[{\"'" or "," in label or any(ch.isspace() for ch in label):
         raise shape
     return json.dumps(label)
 
@@ -115,6 +120,7 @@ def list_runners(org: str, token: str, api_url: str, fetch: Fetch) -> list:
     base = api_url.rstrip("/")
     url: Optional[str] = f"{base}/orgs/{urllib.parse.quote(org, safe='')}/actions/runners?per_page={PER_PAGE}"
     runners: list = []
+    total = None
     pages = 0
     while url:
         pages += 1
@@ -128,24 +134,36 @@ def list_runners(org: str, token: str, api_url: str, fetch: Fetch) -> list:
         if not isinstance(document, dict) or not isinstance(document.get("runners"), list):
             raise CheckError("the response has no runners list")
         runners.extend(document["runners"])
+        total = document.get("total_count", total)
         url = next_link(link, base)
+    # total_count is every runner of the organization. Reading fewer means a
+    # page was missed, for instance behind a Link header this parser cannot
+    # follow, and the missing page may hold the online runner.
+    if isinstance(total, int) and not isinstance(total, bool) and total != len(runners):
+        raise CheckError(f"read {len(runners)} runners where the response counts {total}")
     return runners
 
 
 def count_online(runners: list, labels: list) -> int:
+    """Count the online runners carrying every label.
+
+    An entry that does not look as expected is a failed check, never a runner
+    that does not match: skipping it could turn an online runner into "offline".
+    """
     wanted = {label.casefold() for label in labels}
     online = 0
     for runner in runners:
-        if not isinstance(runner, dict) or not isinstance(runner.get("labels", []), list):
+        if not isinstance(runner, dict):
             raise CheckError("unexpected runner entry in the response")
-        if runner.get("status") != "online":
-            continue
-        carried = {
-            label["name"].casefold()
-            for label in runner.get("labels", [])
-            if isinstance(label, dict) and isinstance(label.get("name"), str)
-        }
-        if wanted <= carried:
+        status = runner.get("status")
+        if status not in ("online", "offline"):
+            raise CheckError(f"unexpected runner status in the response: {status!r}")
+        carried = runner.get("labels")
+        if not isinstance(carried, list) or not all(
+            isinstance(label, dict) and isinstance(label.get("name"), str) for label in carried
+        ):
+            raise CheckError("unexpected runner labels in the response")
+        if status == "online" and wanted <= {label["name"].casefold() for label in carried}:
             online += 1
     return online
 
@@ -221,8 +239,9 @@ def escape(text: str) -> str:
 def main(env: Mapping[str, str] = os.environ, fetch: Fetch = http_get) -> int:
     try:
         labels = parse_labels(env.get("LABELS", ""))
-        fallback = parse_fallback(env.get("FALLBACK", "ubuntu-latest"))
-        org = env.get("ORG", "").strip()
+        fallback = parse_fallback(env.get("FALLBACK", ""))
+        # As with fallback, an input given as an empty string gets the default.
+        org = env.get("ORG", "").strip() or env.get("GITHUB_REPOSITORY_OWNER", "").strip()
         if not org:
             raise InputError("organization must not be empty")
     except InputError as exc:

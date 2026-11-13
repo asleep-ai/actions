@@ -21,11 +21,13 @@ inputs:
   fallback:
     description: >-
       runs-on to use when no matching runner is online: a single label, or a
-      JSON array of labels.
+      JSON array of labels. An empty value means the default.
     required: false
     default: ubuntu-latest
   organization:
-    description: Organization whose runners are checked.
+    description: >-
+      Organization whose runners are checked. An empty value means the
+      repository owner.
     required: false
     default: ${{ github.repository_owner }}
 
