@@ -18,8 +18,8 @@ Shared GitHub Actions, reusable workflows, local lint hooks, and adoption templa
 | path | description |
 |------|-------------|
 | [`android-pr-check.yml`](./.github/workflows/android-pr-check.yml) | Pull request check for Android app repositories: code style, a verification build and a release build on self-hosted runners, re-run on a GitHub-hosted runner only after an infrastructure failure, with one aggregate check. |
-| [`android-version-bump.yml`](./.github/workflows/android-version-bump.yml) | Release cut, started by hand for a merged pull request: the next version from the tags, a check of the commit, and after the approval of an environment the tag `vX.Y.Z` and the main branch on that commit. |
-| [`android-release.yml`](./.github/workflows/android-release.yml) | Release of a tag `vX.Y.Z`: a cold build signed with the caller's keystore, a check of the APK's version and signature, and a GitHub Release with the APK and release notes. |
+| [`android-version-bump.yml`](./.github/workflows/android-version-bump.yml) | Release cut, started by hand for a merged pull request: the next version from the tags, a check of the commit, and after the approval of an environment the tag `vX.Y.Z` and the main branch on that commit. Maintenance branches (`release/<major>.x`) are release lines of their own. |
+| [`android-release.yml`](./.github/workflows/android-release.yml) | Release of a tag `vX.Y.Z`: a cold build signed with the caller's keystore, a check of every APK's version and signature, and a GitHub Release with the APKs and release notes. |
 
 All three are documented in [`android-ci/`](./android-ci/). The calling repository keeps a short workflow file per workflow and the Gradle tasks they run (`ciVerify`, `ciReleaseBuild`, `ciRelease`). The workflows are released together under `android-ci/vX.Y.Z`.
 

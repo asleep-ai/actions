@@ -83,13 +83,14 @@ on:
         required: false
         type: string
         default: ''
-      apk-path:
+      apk-directory:
         description: >-
-          Glob pattern of the APK that ciRelease builds, relative to the
-          repository root. It has to match exactly one file.
+          The directory ciRelease leaves the release APKs in, relative to the
+          repository root. Every .apk file below it is checked, verified and
+          attached to the release: one APK, or one per flavor.
         required: false
         type: string
-        default: app/build/outputs/apk/release/*.apk
+        default: app/build/outputs/apk
       expected-cert-sha256:
         description: >-
           Optional SHA-256 digest of the signing certificate the APK must
@@ -108,7 +109,9 @@ on:
         default: ''
       release-branch:
         description: >-
-          The branch the tagged commit has to be on. Empty skips the check.
+          The branch the tagged commit has to be on. A commit on the
+          maintenance branch of its major version, release/<major>.x, is
+          accepted as well. Empty skips the check.
         required: false
         type: string
         default: main
@@ -214,7 +217,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       sha: ${{ steps.tag.outputs.sha }}
-      previous-tag: ${{ steps.tag.outputs.previous-tag }}
+      latest: ${{ steps.tag.outputs.latest }}
       version: ${{ steps.code.outputs.version }}
       version-code: ${{ steps.code.outputs.version-code }}
       runs-on: ${{ steps.pick.outputs.runs-on }}
@@ -244,37 +247,62 @@ jobs:
             exit 1
           fi
           sha=$(gh api "repos/$GH_REPO/commits/tags/$TAG" --jq '.sha')
+
+          # A major version is a release line: 1.x may still be released from
+          # its maintenance branch after 2.0.0 exists.
+          major="${TAG#v}"
+          major="${major%%.*}"
           highest=$(tail -1 <<< "$tags")
-          previous=$(grep -B1 -xF "$TAG" <<< "$tags" | head -1)
-          if [[ "$previous" == "$TAG" ]]; then
-            previous=""
+          line_highest=$(grep -E "^v${major}\." <<< "$tags" | tail -1)
+
+          # The published releases, read in a statement of its own: a request
+          # that failed must not read as "nothing is published".
+          if ! published=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.draft | not) | .tag_name'); then
+            echo "::error::Cannot list the releases of $GH_REPO."
+            exit 1
           fi
 
           # The release of this tag may exist already: a re-run, or another
-          # APK for the same release. `gh release view` cannot tell a release
-          # that is not there from a request that failed, so the API is asked.
-          if published=$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq '.tag_name' 2>&1); then
+          # APK for the same release.
+          if grep -qxF "$TAG" <<< "$published"; then
             exists=true
-          elif grep -q 'HTTP 404' <<< "$published"; then
-            exists=false
           else
-            echo "::error::Cannot tell whether release $TAG exists: $published"
+            exists=false
+          fi
+
+          # A version below the highest one of its line would be a lower
+          # versionCode than the devices of that line already have, which no
+          # device can install. Building an older release again, for its
+          # existing GitHub Release, is fine.
+          if [[ "$exists" == false && "$TAG" != "$line_highest" ]]; then
+            echo "::error::$TAG is below $line_highest, the highest release tag of major $major, and has no GitHub Release yet. A new release has to be the highest version of its line."
             exit 1
           fi
 
-          # A version below the highest one would be a lower versionCode than
-          # devices already have, which no device can install. Building an
-          # older release again, for its existing GitHub Release, is fine.
-          if [[ "$exists" == false && "$TAG" != "$highest" ]]; then
-            echo "::error::$TAG is below $highest, the highest release tag, and has no GitHub Release yet. A new release has to be the highest version."
-            exit 1
+          # Only the highest version of all is the repository's latest
+          # release. A release of a lower line, or an older one built again,
+          # must not take that mark.
+          if [[ "$TAG" == "$highest" ]]; then
+            latest=true
+          else
+            latest=false
           fi
 
+          on=""
           if [[ -n "$RELEASE_BRANCH" ]]; then
-            # identical or behind: the tagged commit is on the branch.
-            status=$(gh api "repos/$GH_REPO/compare/$RELEASE_BRANCH...$sha" --jq '.status')
-            if [[ "$status" != identical && "$status" != behind ]]; then
-              echo "::error::The commit of $TAG ($sha) is not on $RELEASE_BRANCH (compared: $status). Releases are built from commits of $RELEASE_BRANCH."
+            # The tagged commit has to be on the release branch or on the
+            # maintenance branch of its line. identical or behind: the commit
+            # is on the branch. A branch that does not exist answers 404, and
+            # the commit is not on it.
+            for branch in "$RELEASE_BRANCH" "release/$major.x"; do
+              status=$(gh api "repos/$GH_REPO/compare/$branch...$sha" --jq '.status' 2>/dev/null || true)
+              if [[ "$status" == identical || "$status" == behind ]]; then
+                on="$branch"
+                break
+              fi
+            done
+            if [[ -z "$on" ]]; then
+              echo "::error::The commit of $TAG ($sha) is on neither $RELEASE_BRANCH nor release/$major.x. Releases are built from commits of those branches."
               exit 1
             fi
           fi
@@ -282,9 +310,9 @@ jobs:
           {
             echo "tag=$TAG"
             echo "sha=$sha"
-            echo "previous-tag=$previous"
+            echo "latest=$latest"
           } >> "$GITHUB_OUTPUT"
-          echo "Release $TAG at $sha. Previous release: ${previous:-none}. GitHub Release exists: $exists."
+          echo "Release $TAG at $sha${on:+, on $on}. Latest: $latest. GitHub Release exists: $exists."
 
       - name: Compute the versionCode
         id: code
@@ -320,7 +348,7 @@ jobs:
       local-properties-secrets: ${{ inputs.local-properties-secrets }}
       required-secrets: ${{ inputs.required-secrets }}
       gradle-args: ${{ inputs.gradle-args }}
-      apk-path: ${{ inputs.apk-path }}
+      apk-directory: ${{ inputs.apk-directory }}
       expected-cert-sha256: ${{ inputs.expected-cert-sha256 }}
       build-tools-version: ${{ inputs.build-tools-version }}
       build-timeout-minutes: ${{ inputs.build-timeout-minutes }}
@@ -358,7 +386,7 @@ jobs:
       local-properties-secrets: ${{ inputs.local-properties-secrets }}
       required-secrets: ${{ inputs.required-secrets }}
       gradle-args: ${{ inputs.gradle-args }}
-      apk-path: ${{ inputs.apk-path }}
+      apk-directory: ${{ inputs.apk-directory }}
       expected-cert-sha256: ${{ inputs.expected-cert-sha256 }}
       build-tools-version: ${{ inputs.build-tools-version }}
       build-timeout-minutes: ${{ inputs.build-timeout-minutes }}
@@ -367,7 +395,7 @@ jobs:
       self-hosted-kotlin-daemon-jvmargs: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
     secrets: inherit
 
-  # Publishes the APK of the build that passed. It runs on GitHub, checks out
+  # Publishes the APKs of the build that passed. It runs on GitHub, checks out
   # the repository only to read its history for the release notes, and runs
   # none of its code: the token that can write releases exists in this job
   # alone.
@@ -388,10 +416,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Download the signed APK
+      # The name is built here and not passed as a job output: the runner
+      # drops an output that contains the value of a secret, and "release" is
+      # a likely key alias.
+      - name: Download the signed APKs
         uses: actions/download-artifact@v8
         with:
-          name: ${{ needs.primary.result == 'success' && needs.primary.outputs.artifact || needs.fallback.outputs.artifact }}
+          name: android-release-apk-${{ needs.primary.result == 'success' && 'primary' || 'fallback' }}
           path: ${{ runner.temp }}/android-release-apk
 
       - name: Look for the GitHub Release
@@ -413,6 +444,41 @@ jobs:
           echo "exists=$exists" >> "$GITHUB_OUTPUT"
           echo "GitHub Release $TAG exists: $exists."
 
+      # The notes cover what this release adds to the one before it on its own
+      # line: the highest lower release tag that the tagged commit contains.
+      # So 1.13.2, cut from a maintenance branch after 2.0.0 exists, starts at
+      # 1.13.1, and 2.0.0 starts at the 1.x release the main line grew from.
+      # Only a tag with a published release is a start: a lower tag whose
+      # release never happened (its build failed, and the fix got the next
+      # version) has its changes listed here.
+      - name: Find the previous release of the line
+        id: previous
+        if: ${{ steps.release.outputs.exists == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if ! published=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.draft | not) | .tag_name'); then
+            echo "::error::Cannot list the releases of $GH_REPO."
+            exit 1
+          fi
+          contained=$(git tag --merged "refs/tags/$TAG" | grep -E "$pattern" || true)
+          # In rising order up to the tag itself: the last published one wins.
+          previous=""
+          while IFS= read -r candidate; do
+            if [[ "$candidate" == "$TAG" ]]; then
+              break
+            fi
+            if grep -qxF "$candidate" <<< "$published"; then
+              previous="$candidate"
+            fi
+          done < <(printf '%s\n%s\n' "$contained" "$TAG" | grep -E "$pattern" | sort -V -u)
+          echo "tag=$previous" >> "$GITHUB_OUTPUT"
+          echo "Previous release of the line: ${previous:-none}."
+
       # Only for a new release: the notes of an existing one may have been
       # edited by hand, and they are kept.
       - name: Write the release notes
@@ -421,14 +487,14 @@ jobs:
         uses: asleep-ai/actions/release-notes@release-notes/v1
         with:
           current-tag: ${{ needs.plan.outputs.tag }}
-          previous-tag: ${{ needs.plan.outputs.previous-tag }}
+          previous-tag: ${{ steps.previous.outputs.tag }}
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           system-prompt: ${{ inputs.release-notes-prompt }}
           output-file: ${{ runner.temp }}/android-release-notes.md
 
       # Running the release again is safe: an existing release keeps its
-      # title and notes and gets the APK again, replacing an asset of the same
-      # name. An APK with another name is added next to it.
+      # title, notes and latest mark and gets the APKs again, replacing assets
+      # of the same name. An APK with another name is added next to them.
       - name: Create or update the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -436,6 +502,7 @@ jobs:
           TAG: ${{ needs.plan.outputs.tag }}
           VERSION: ${{ needs.plan.outputs.version }}
           VERSION_CODE: ${{ needs.plan.outputs.version-code }}
+          LATEST: ${{ needs.plan.outputs.latest }}
           EXISTS: ${{ steps.release.outputs.exists }}
           APK_DIRECTORY: ${{ runner.temp }}/android-release-apk
           NOTES_FILE: ${{ runner.temp }}/android-release-notes.md
@@ -444,23 +511,26 @@ jobs:
         run: |
           set -euo pipefail
           apks=()
-          while IFS= read -r -d '' apk; do
+          names=""
+          while IFS= read -r apk; do
             apks+=("$apk")
-          done < <(find "$APK_DIRECTORY" -type f -name '*.apk' -print0)
-          if [[ "${#apks[@]}" != 1 ]]; then
-            echo "::error::The build artifact holds ${#apks[@]} APK files; exactly one is expected."
+            names="${names:+$names, }$(basename "$apk")"
+          done < <(find "$APK_DIRECTORY" -type f -name '*.apk' | sort)
+          if [[ "${#apks[@]}" == 0 ]]; then
+            echo "::error::The build artifact holds no APK."
             exit 1
           fi
-          apk="${apks[0]}"
 
           if [[ "$EXISTS" == true ]]; then
-            gh release upload "$TAG" "$apk" --clobber
-            action="Added $(basename "$apk") to the existing release"
+            gh release upload "$TAG" "${apks[@]}" --clobber
+            action="Added $names to the existing release"
           else
             # --verify-tag: if the tag was deleted meanwhile, fail instead of
-            # letting gh create it on the default branch.
-            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$NOTES_FILE" "$apk"
-            action="Created the release with $(basename "$apk")"
+            # letting gh create it on the default branch. --latest is always
+            # stated: a release of a lower line must not become the latest
+            # release because it is the newest.
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$NOTES_FILE" "--latest=$LATEST" "${apks[@]}"
+            action="Created the release with $names"
           fi
 
           if [[ "$BUILT_ON" == fallback ]]; then
@@ -477,8 +547,8 @@ jobs:
             echo
             echo "$action: <$url>"
             echo
-            echo "| version | versionCode | built on |"
-            echo "|---------|-------------|----------|"
-            echo "| $VERSION | $VERSION_CODE | $where |"
+            echo "| version | versionCode | latest | built on |"
+            echo "|---------|-------------|--------|----------|"
+            echo "| $VERSION | $VERSION_CODE | $([[ "$EXISTS" == true ]] && echo unchanged || echo "$LATEST") | $where |"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "$action: $url"

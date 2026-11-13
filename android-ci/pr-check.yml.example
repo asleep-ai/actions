@@ -1,10 +1,13 @@
 name: PR Check
 
+# release/** covers maintenance branches (release/1.x). The version bump
+# releases a commit only when this check succeeded on it, and a merge commit
+# gets the check from the push run on its branch.
 on:
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, 'release/**']
   push:
-    branches: [main, develop]
+    branches: [main, develop, 'release/**']
   workflow_dispatch:
 
 concurrency:

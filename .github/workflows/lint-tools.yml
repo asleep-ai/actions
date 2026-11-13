@@ -5,7 +5,7 @@ on:
     paths:
       - '.github/workflows/lint-tools.yml'
       - '.pre-commit-hooks.yaml'
-      - 'android-ci/pr-check.yml.example'
+      - 'android-ci/*.yml.example'
       - 'detekt/**'
       - 'ktfmt/**'
       - 'pre-commit-changed/**'
@@ -15,7 +15,7 @@ on:
     paths:
       - '.github/workflows/lint-tools.yml'
       - '.pre-commit-hooks.yaml'
-      - 'android-ci/pr-check.yml.example'
+      - 'android-ci/*.yml.example'
       - 'detekt/**'
       - 'ktfmt/**'
       - 'pre-commit-changed/**'
@@ -70,5 +70,5 @@ jobs:
         run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
       - name: Lint Ruff workflow example
         run: ${{ steps.get.outputs.executable }} ruff/ruff.yml.example
-      - name: Lint Android PR check workflow example
-        run: ${{ steps.get.outputs.executable }} android-ci/pr-check.yml.example
+      - name: Lint Android workflow examples
+        run: ${{ steps.get.outputs.executable }} android-ci/pr-check.yml.example android-ci/version-bump.yml.example android-ci/release.yml.example

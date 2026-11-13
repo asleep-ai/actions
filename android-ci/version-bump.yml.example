@@ -3,6 +3,11 @@ name: Version Bump
 # Started by hand for a merged pull request. The run plans the next version,
 # waits for the approval of the `release` environment, tags the merge commit
 # vX.Y.Z, moves main to it and starts release.yml for the tag.
+#
+# The pull request was merged into the default branch or, for a hotfix of an
+# older major version, into its maintenance branch release/<major>.x. The
+# workflow finds the line from the commit, whichever branch the run is
+# started from.
 on:
   workflow_dispatch:
     inputs:
@@ -29,7 +34,8 @@ on:
         default: false
         type: boolean
 
-# One release at a time, and none is dropped: a second run waits for the first.
+# One release at a time: a second run waits for the first. GitHub keeps one
+# waiting run per group, so a third run would replace the one that waits.
 concurrency:
   group: version-bump
   cancel-in-progress: false

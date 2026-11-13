@@ -52,6 +52,9 @@ printf '%s\\n' "$*" >> "$GH_DIR/calls"
 case "$*" in
   "api --paginate repos/acme/app/git/matching-refs/tags/v --jq .[].ref | ltrimstr(\\"refs/tags/\\")")
     cat "$GH_DIR/tags" ;;
+  "api --paginate repos/acme/app/releases --jq .[] | select(.draft | not) | .tag_name")
+    if [ -f "$GH_DIR/release-error" ]; then cat "$GH_DIR/release-error" >&2; exit 1; fi
+    cat "$GH_DIR/released" ;;
   "api repos/acme/app/commits/tags/"*)
     cat "$GH_DIR/sha" ;;
   "api repos/acme/app/releases/tags/"*)
@@ -59,7 +62,12 @@ case "$*" in
     if [ ! -f "$GH_DIR/release" ]; then echo "gh: Not Found (HTTP 404)" >&2; exit 1; fi
     cat "$GH_DIR/release" ;;
   "api repos/acme/app/compare/"*)
-    cat "$GH_DIR/compare" ;;
+    # One file per branch that exists; any other branch answers as GitHub does.
+    comparison="${2#repos/acme/app/compare/}"
+    branch="${comparison%%...*}"
+    file="$GH_DIR/compare-$(printf '%s' "$branch" | tr '/' '_')"
+    if [ ! -f "$file" ]; then echo "gh: Not Found (HTTP 404)" >&2; exit 1; fi
+    cat "$file" ;;
   "release upload "*|"release create "*|"workflow run "*)
     exit "${GH_EXIT:-0}" ;;
   *)
@@ -69,15 +77,19 @@ esac
 SHA = "1f" * 20
 
 
-def gh_directory(tmp_path: Path, tags: list[str], released: bool = False, compare: str = "identical") -> Path:
+def gh_directory(tmp_path: Path, tags: list[str], released=(), compare="identical", release_exists=False) -> Path:
+    """A stand-in for gh: the tags, the tags with a published release, how the tagged commit compares with
+    each branch (a status means main), and whether the release asked for by tag exists."""
     directory = tmp_path / "gh"
     directory.mkdir(parents=True)
     executable(directory / "gh", GH_STUB)
     (directory / "tags").write_text("".join(f"{tag}\n" for tag in tags))
     (directory / "sha").write_text(SHA + "\n")
-    (directory / "compare").write_text(compare + "\n")
+    for branch, status in ({"main": compare} if isinstance(compare, str) else compare).items():
+        (directory / f"compare-{branch.replace('/', '_')}").write_text(status + "\n")
     (directory / "calls").write_text("")
-    if released:
+    (directory / "released").write_text("".join(f"{tag}\n" for tag in released))
+    if release_exists:
         (directory / "release").write_text("v0\n")
     return directory
 
@@ -100,21 +112,24 @@ def check_tag(entry, tmp_path, tag: str, directory: Path, branch: str = "main"):
 
 
 TAGS = ["v1.9.0", "v1.10.0", "v1.10.1", "v1.10.1-qa.3", "v1.11.2-handok-reset-off.84", "v2", "vnext"]
+RELEASED = ["v1.11.2-handok-reset-off.84", "v1.10.0", "v1.9.0"]
+# Two lines: 1.x on its maintenance branch, 2.x on the main line.
+LINE_TAGS = ["v1.13.0", "v1.13.1", "v1.13.2", "v2.0.0", "v2.0.1"]
 
 
 def test_a_new_release_of_the_highest_tag_is_planned(entry, tmp_path):
-    directory = gh_directory(tmp_path, TAGS)
+    directory = gh_directory(tmp_path, TAGS, released=RELEASED)
     result, outputs = check_tag(entry, tmp_path, "v1.10.1", directory)
     assert result.returncode == 0, result.stdout + result.stderr
-    # The previous release is the next lower version, whatever other tags exist.
-    assert outputs == {"tag": "v1.10.1", "sha": SHA, "previous-tag": "v1.10.0"}
+    assert outputs == {"tag": "v1.10.1", "sha": SHA, "latest": "true"}
     assert "repos/acme/app/compare/main..." + SHA in (directory / "calls").read_text()
+    assert "on main" in result.stdout
 
 
-def test_the_first_release_has_no_previous_tag(entry, tmp_path):
+def test_the_first_release_is_the_latest(entry, tmp_path):
     result, outputs = check_tag(entry, tmp_path, "v0.1.0", gh_directory(tmp_path, ["skeleton-v0.1", "v0.1.0"]))
     assert result.returncode == 0, result.stdout + result.stderr
-    assert outputs["previous-tag"] == ""
+    assert outputs["latest"] == "true"
 
 
 @pytest.mark.parametrize(
@@ -136,32 +151,61 @@ def test_a_tag_that_does_not_exist_is_refused(entry, tmp_path):
     assert "::error::Tag v3.0.0 does not exist in acme/app." in result.stdout
 
 
-def test_a_new_release_below_the_highest_tag_is_refused(entry, tmp_path):
+def test_a_new_release_below_the_highest_tag_of_its_line_is_refused(entry, tmp_path):
     result, _ = check_tag(entry, tmp_path, "v1.9.0", gh_directory(tmp_path, TAGS))
     assert result.returncode == 1
-    assert "v1.9.0 is below v1.10.1, the highest release tag" in result.stdout
+    assert "v1.9.0 is below v1.10.1, the highest release tag of major 1" in result.stdout
+    result, _ = check_tag(entry, tmp_path / "lines", "v1.13.1", gh_directory(tmp_path / "lines", LINE_TAGS))
+    assert result.returncode == 1
+    assert "v1.13.1 is below v1.13.2, the highest release tag of major 1" in result.stdout
 
 
 def test_an_older_release_that_exists_can_be_built_again(entry, tmp_path):
-    result, outputs = check_tag(entry, tmp_path, "v1.9.0", gh_directory(tmp_path, TAGS, released=True))
+    result, outputs = check_tag(entry, tmp_path, "v1.9.0", gh_directory(tmp_path, TAGS, released=RELEASED + ["v1.10.1"]))
     assert result.returncode == 0, result.stdout + result.stderr
-    assert outputs["previous-tag"] == ""
+    # It does not take the latest mark from the newer release.
+    assert outputs["latest"] == "false"
     assert "GitHub Release exists: true" in result.stdout
 
 
+def test_a_release_of_a_lower_line_is_built_from_its_maintenance_branch(entry, tmp_path):
+    # 2.0.1 exists, and 1.13.2 is released after it from release/1.x, which main never receives.
+    compare = {"main": "diverged", "release/1.x": "identical"}
+    directory = gh_directory(tmp_path, LINE_TAGS, released=["v1.13.0", "v1.13.1", "v2.0.0", "v2.0.1"], compare=compare)
+    result, outputs = check_tag(entry, tmp_path, "v1.13.2", directory)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs == {"tag": "v1.13.2", "sha": SHA, "latest": "false"}
+    assert "on release/1.x" in result.stdout
+
+
+def test_a_release_of_the_highest_line_is_the_latest(entry, tmp_path):
+    directory = gh_directory(tmp_path, LINE_TAGS, released=["v1.13.0", "v1.13.1", "v1.13.2", "v2.0.0"])
+    result, outputs = check_tag(entry, tmp_path, "v2.0.1", directory)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs["latest"] == "true"
+
+
 def test_an_api_failure_is_not_read_as_no_release(entry, tmp_path):
-    directory = gh_directory(tmp_path, TAGS)
+    directory = gh_directory(tmp_path, TAGS, released=RELEASED)
     (directory / "release-error").write_text("gh: Server Error (HTTP 502)\n")
     result, _ = check_tag(entry, tmp_path, "v1.9.0", directory)
     assert result.returncode == 1
-    assert "Cannot tell whether release v1.9.0 exists" in result.stdout
+    assert "::error::Cannot list the releases of acme/app." in result.stdout
 
 
 @pytest.mark.parametrize(("status", "code"), [("identical", 0), ("behind", 0), ("ahead", 1), ("diverged", 1)])
 def test_the_tagged_commit_has_to_be_on_the_release_branch(entry, tmp_path, status, code):
+    # No release/1.x branch exists here: that comparison answers 404.
     result, _ = check_tag(entry, tmp_path, "v1.10.1", gh_directory(tmp_path, TAGS, compare=status))
     assert result.returncode == code, result.stdout + result.stderr
-    assert ("is not on main" in result.stdout) == (code == 1)
+    assert ("is on neither main nor release/1.x" in result.stdout) == (code == 1)
+
+
+def test_a_commit_on_another_line_s_branch_is_refused(entry, tmp_path):
+    compare = {"main": "diverged", "release/1.x": "ahead", "release/2.x": "identical"}
+    result, _ = check_tag(entry, tmp_path, "v1.10.1", gh_directory(tmp_path, TAGS, compare=compare))
+    assert result.returncode == 1
+    assert "is on neither main nor release/1.x" in result.stdout
 
 
 def test_an_empty_release_branch_skips_the_branch_check(entry, tmp_path):
@@ -324,8 +368,12 @@ def test_invalid_names_fail_without_being_printed(build, tmp_path, listed, requi
 def test_the_values_step_is_the_only_one_that_sees_every_secret(build):
     text = (WORKFLOWS / BUILD).read_text()
     assert text.count("toJSON(secrets)") == 1
-    values = build["steps"][0]
+    emptied, values = build["steps"][:2]
+    # Nothing an earlier job left in the work folder is there when the secrets arrive, and the script
+    # does not import from the work folder: `python3 -` alone would put it first on the module path.
+    assert emptied["id"] == "workspace"
     assert values["id"] == "values", "the check runs before anything is checked out or set up"
+    assert "python3 -I - <<'VALUES'" in values["run"]
     assert values["env"]["SECRETS_JSON"] == "${{ toJSON(secrets) }}"
     assert values["env"]["VARS_JSON"] == "${{ toJSON(vars) }}"
     assert "toJSON(secrets)" not in (WORKFLOWS / ENTRY).read_text()
@@ -363,7 +411,7 @@ def test_a_github_hosted_work_folder_is_left_alone(build, tmp_path, name):
 
 def test_the_work_folder_is_emptied_before_checkout_and_after_the_build_whatever_happened(build):
     ids = [item.get("id") for item in build["steps"]]
-    assert ids.index("values") < ids.index("workspace") < ids.index("checkout")
+    assert ids.index("workspace") == 0 < ids.index("values") < ids.index("checkout")
     names = [item.get("name") for item in build["steps"]]
     again = step(build, "Empty the work folder again")
     assert again["if"] == "${{ always() }}"
@@ -546,29 +594,41 @@ def test_the_sentry_token_reaches_the_gradle_step_only(build, entry):
     assert "SENTRY_AUTH_TOKEN" not in json.dumps(entry["jobs"])
 
 
-# --- build: the APK ------------------------------------------------------------------------
+# --- build: the APKs -----------------------------------------------------------------------
 
+# Answers with the version in APK_NAME and APK_CODE, except for an APK listed in APK_OTHER, which
+# answers as a local build does.
 AAPT2_STUB = """#!/usr/bin/env bash
 [ "$1 $2" = "dump badging" ] || exit 64
-echo "package: name='ai.asleep.app' versionCode='${APK_CODE}' versionName='${APK_NAME}' platformBuildVersionName='16'"
+name="$APK_NAME"
+code="$APK_CODE"
+case " ${APK_OTHER:-} " in *" $(basename "$3") "*) name=0.0.0-dev; code=1 ;; esac
+echo "package: name='ai.asleep.app' versionCode='${code}' versionName='${name}' platformBuildVersionName='16'"
 echo "application-label:'App'"
 """
+ONE_APK = ("app/build/outputs/apk/release/App_1.13.1.apk",)
+FLAVOR_APKS = (
+    "app/build/outputs/apk/sleephub/release/SleepHub_release_1.13.1_101350001.apk",
+    "app/build/outputs/apk/sweet sleep/release/SweetSleep_release_1.13.1_101350001.apk",
+)
 
 
-def check_apk(build, tmp_path, apks=("app/build/outputs/apk/release/App_1.13.1.apk",), **overrides):
+def check_apks(build, tmp_path, apks=ONE_APK, **overrides):
     workspace, sdk = tmp_path / "workspace", tmp_path / "sdk"
+    (workspace / "app/build/outputs/apk").mkdir(parents=True)
+    # Not APKs: the files Gradle writes next to them.
+    (workspace / "app/build/outputs/apk/output-metadata.json").write_text("{}")
     for name in apks:
         path = workspace / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("apk")
-    workspace.mkdir(exist_ok=True)
     for version in ("35.0.0", "36.1.0", "9.0.0"):
         (sdk / "build-tools" / version).mkdir(parents=True)
-        executable(sdk / "build-tools" / version / "aapt2", AAPT2_STUB.replace("16", version))
+        executable(sdk / "build-tools" / version / "aapt2", AAPT2_STUB)
     output = tmp_path / "output"
     output.write_text("")
     env = {
-        "APK_PATH": "app/build/outputs/apk/release/*.apk",
+        "APK_DIRECTORY": "app/build/outputs/apk",
         "VERSION_NAME": "1.13.1",
         "VERSION_CODE": "101350001",
         "BUILD_TOOLS_VERSION": "",
@@ -579,85 +639,114 @@ def check_apk(build, tmp_path, apks=("app/build/outputs/apk/release/App_1.13.1.a
         **overrides,
     }
     result = run_script(step_by_id(build, "apk")["run"], env, workspace)
-    return result, dict(line.split("=", 1) for line in output.read_text().splitlines())
+    lines = output.read_text().splitlines()
+    paths = lines[1:-1] if lines else None
+    if lines:
+        assert (lines[0], lines[-1]) == ("paths<<android-release-apks", "android-release-apks")
+    return result, paths
 
 
 def test_the_one_apk_with_the_planned_version_passes(build, tmp_path):
-    result, outputs = check_apk(build, tmp_path)
+    result, paths = check_apks(build, tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert outputs == {"path": "app/build/outputs/apk/release/App_1.13.1.apk", "name": "App_1.13.1.apk"}
+    assert paths == list(ONE_APK)
+
+
+def test_every_flavor_s_apk_is_checked_and_listed(build, tmp_path):
+    result, paths = check_apks(build, tmp_path, apks=FLAVOR_APKS)
+    assert result.returncode == 0, result.stdout + result.stderr
+    # One path per line, a space in a flavor directory included.
+    assert paths == list(FLAVOR_APKS)
+    for name in FLAVOR_APKS:
+        assert f"{name}: versionName=1.13.1 versionCode=101350001" in result.stdout
 
 
 @pytest.mark.parametrize(
     ("built", "message"),
     [
-        ({"APK_NAME": "0.0.0-dev", "APK_CODE": "1"}, "The APK is version 0.0.0-dev (1), and the release is 1.13.1 (101350001)."),
-        ({"APK_CODE": "101300001"}, "The APK is version 1.13.1 (101300001)"),
-        ({"APK_NAME": "1.13.1-qa.3"}, "The APK is version 1.13.1-qa.3 (101350001)"),
+        ({"APK_NAME": "0.0.0-dev", "APK_CODE": "1"}, "App_1.13.1.apk is version 0.0.0-dev (1), and the release is 1.13.1 (101350001)."),
+        ({"APK_CODE": "101300001"}, "App_1.13.1.apk is version 1.13.1 (101300001)"),
+        ({"APK_NAME": "1.13.1-qa.3"}, "App_1.13.1.apk is version 1.13.1-qa.3 (101350001)"),
     ],
 )
 def test_an_apk_with_another_version_is_refused(build, tmp_path, built, message):
-    result, outputs = check_apk(build, tmp_path, **built)
+    result, paths = check_apks(build, tmp_path, **built)
     assert result.returncode == 1
     assert message in result.stdout
     assert "-PciVersionName and -PciVersionCode" in result.stdout
-    assert outputs == {}
+    assert paths is None
 
 
-@pytest.mark.parametrize(
-    ("apks", "count"),
-    [((), 0), (("app/build/outputs/apk/release/a.apk", "app/build/outputs/apk/release/b.apk"), 2)],
-)
-def test_the_pattern_has_to_match_exactly_one_apk(build, tmp_path, apks, count):
-    result, outputs = check_apk(build, tmp_path, apks=apks)
+def test_one_flavor_with_another_version_refuses_the_release(build, tmp_path):
+    result, paths = check_apks(build, tmp_path, apks=FLAVOR_APKS, APK_OTHER="SweetSleep_release_1.13.1_101350001.apk")
     assert result.returncode == 1
-    assert f"matches {count} files; it has to match exactly one." in result.stdout
-    assert outputs == {}
+    assert "SweetSleep_release_1.13.1_101350001.apk is version 0.0.0-dev (1)" in result.stdout
+    assert result.stdout.count("::error::") == 1
+    assert paths is None
 
 
-def test_a_flavored_apk_path_with_a_space(build, tmp_path):
-    name = "app/build/outputs/apk/sweet sleep/release/SweetSleep_release_1.13.1_101350001.apk"
-    result, outputs = check_apk(build, tmp_path, apks=(name,), APK_PATH="app/build/outputs/apk/sweet sleep/release/*.apk")
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert outputs["path"] == name
+def test_a_build_that_left_no_apk_is_refused(build, tmp_path):
+    result, paths = check_apks(build, tmp_path, apks=())
+    assert result.returncode == 1
+    assert "::error::ciRelease left no APK under app/build/outputs/apk." in result.stdout
+    assert paths is None
+
+
+@pytest.mark.parametrize("directory", ["app/build/outputs/elsewhere", "", "-delete"])
+def test_the_apk_directory_has_to_exist(build, tmp_path, directory):
+    result, paths = check_apks(build, tmp_path, APK_DIRECTORY=directory)
+    assert result.returncode == 1
+    assert "is not a directory after the build" in result.stdout
+    assert paths is None
+    assert (tmp_path / "workspace" / ONE_APK[0]).exists()
+
+
+def test_apks_that_would_collide_as_release_assets_are_refused(build, tmp_path):
+    apks = ("app/build/outputs/apk/one/release/app-release.apk", "app/build/outputs/apk/two/release/app-release.apk")
+    result, paths = check_apks(build, tmp_path, apks=apks)
+    assert result.returncode == 1
+    assert "share a file name: app-release.apk" in result.stdout
+    assert paths is None
 
 
 def test_aapt2_comes_from_the_named_build_tools_version(build, tmp_path):
-    result, _ = check_apk(build, tmp_path, BUILD_TOOLS_VERSION="35.0.0")
+    result, _ = check_apks(build, tmp_path, BUILD_TOOLS_VERSION="35.0.0")
     assert result.returncode == 0, result.stdout + result.stderr
-    result, _ = check_apk(build, tmp_path / "missing", BUILD_TOOLS_VERSION="34.0.0")
+    result, _ = check_apks(build, tmp_path / "missing", BUILD_TOOLS_VERSION="34.0.0")
     assert result.returncode == 1
     assert "aapt2 was not found" in result.stdout and "(version 34.0.0)" in result.stdout
 
 
-def test_without_an_sdk_the_apk_is_not_passed_unchecked(build, tmp_path):
-    result, outputs = check_apk(build, tmp_path, ANDROID_HOME=str(tmp_path / "no-sdk"))
+def test_without_an_sdk_the_apks_are_not_passed_unchecked(build, tmp_path):
+    result, paths = check_apks(build, tmp_path, ANDROID_HOME=str(tmp_path / "no-sdk"))
     assert result.returncode == 1
     assert "No Android SDK with build-tools" in result.stdout
-    assert outputs == {}
+    assert paths is None
 
 
-def test_the_apk_is_verified_uploaded_and_the_secrets_deleted(build):
+def test_the_apks_are_verified_uploaded_and_the_secrets_deleted(build):
     names = [item.get("name") for item in build["steps"]]
     order = [
         "Run Gradle",
-        "Check the APK",
-        "Verify the APK signature",
-        "Upload the signed APK",
+        "Check the APKs",
+        "Verify the APK signatures",
+        "Upload the signed APKs",
         "Delete the keystore and local.properties",
         "Empty the work folder again",
         "Report the verdict",
     ]
     assert names[-len(order) :] == order
-    verify = step(build, "Verify the APK signature")["with"]
+    # Every APK that was checked is verified and uploaded: both steps take the same list.
+    verify = step(build, "Verify the APK signatures")["with"]
     assert verify == {
         "operation": "verify",
-        "apk-file": "${{ steps.apk.outputs.path }}",
+        "apk-file": "${{ steps.apk.outputs.paths }}",
         "expected-cert-sha256": "${{ inputs.expected-cert-sha256 }}",
         "build-tools-version": "${{ inputs.build-tools-version }}",
     }
-    upload = step(build, "Upload the signed APK")
+    upload = step(build, "Upload the signed APKs")
     assert upload["with"]["name"] == "android-release-apk-${{ inputs.attempt }}"
+    assert upload["with"]["path"] == "${{ steps.apk.outputs.paths }}"
     assert upload["with"]["if-no-files-found"] == "error"
     cleanup = step(build, "Delete the keystore and local.properties")
     assert cleanup["if"] == "${{ always() }}"
@@ -675,9 +764,9 @@ def test_the_verdict_covers_every_step_before_the_build(build):
     steps = build["steps"]
     verdict = steps[-1]
     assert verdict["id"] == "verdict"
-    assert verdict["if"] == "${{ always() && steps.values.outcome == 'success' }}"
+    assert verdict["if"] == "${{ always() && steps.values.outcome != 'failure' }}"
     ids = [item.get("id") for item in steps]
-    before = ids[ids.index("values") + 1 : ids.index("build")]
+    before = [identifier for identifier in ids[: ids.index("build")] if identifier != "values"]
     assert None not in before, "a step before the build without an id cannot be reported"
     reported = re.findall(r"\$\{\{ steps\.([a-z-]+)\.outcome \}\}", verdict["with"]["setup-outcome"])
     assert reported == before
@@ -687,13 +776,12 @@ def test_the_verdict_covers_every_step_before_the_build(build):
     # A step that may be skipped would read as a failed setup.
     for item in steps[: ids.index("build") + 1]:
         assert "if" not in item, item.get("name")
-    # A missing secret is final: the other runner would miss it too.
-    assert build["outputs"]["verdict"] == (
-        "${{ steps.values.outcome == 'failure' && 'code' || steps.verdict.outputs.verdict }}"
-    )
-    assert build["outputs"]["artifact"] == (
-        "${{ steps.upload.outcome == 'success' && format('android-release-apk-{0}', inputs.attempt) || '' }}"
-    )
+    # A missing secret is final: the other runner would miss it too. The verdict is the only output:
+    # the runner drops a job output that contains a secret's value, and a file or artifact name can.
+    assert build["outputs"] == {
+        "verdict": "${{ steps.values.outcome == 'failure' && 'code' || steps.verdict.outputs.verdict }}"
+    }
+    assert set(trigger(load(BUILD))["outputs"]) == {"verdict"}
 
 
 def test_the_build_job_reads_its_secrets_from_the_environment(build):
@@ -756,26 +844,99 @@ def test_publish_takes_the_apk_of_the_build_that_passed(entry):
     assert publish["permissions"] == {"contents": "write", "pull-requests": "read"}
     assert entry["permissions"] == {"contents": "read", "packages": "read"}
     assert entry["jobs"]["plan"]["permissions"] == {"contents": "read"}
-    download = step(publish, "Download the signed APK")["with"]
-    assert download["name"] == (
-        "${{ needs.primary.result == 'success' && needs.primary.outputs.artifact || needs.fallback.outputs.artifact }}"
-    )
+    download = step(publish, "Download the signed APKs")["with"]
+    # The name the build job uploads under, built from the results and not read from an output.
+    assert download["name"] == "android-release-apk-${{ needs.primary.result == 'success' && 'primary' || 'fallback' }}"
+    assert "outputs.artifact" not in (WORKFLOWS / ENTRY).read_text()
     checkout = publish["steps"][0]["with"]
     assert checkout == {"ref": "refs/tags/${{ needs.plan.outputs.tag }}", "fetch-depth": 0, "persist-credentials": False}
     notes = step(publish, "Write the release notes")
     assert notes["uses"] == "asleep-ai/actions/release-notes@release-notes/v1"
     assert notes["if"] == "${{ steps.release.outputs.exists == 'false' }}"
-    assert notes["with"]["previous-tag"] == "${{ needs.plan.outputs.previous-tag }}"
+    previous = step(publish, "Find the previous release of the line")
+    assert previous["id"] == "previous" and previous["if"] == notes["if"]
+    assert notes["with"]["previous-tag"] == "${{ steps.previous.outputs.tag }}"
     assert notes["with"]["openai-api-key"] == "${{ secrets.OPENAI_API_KEY }}"
-    assert notes["with"]["output-file"] == step(publish, "Create or update the GitHub Release")["env"]["NOTES_FILE"]
+    create = step(publish, "Create or update the GitHub Release")
+    assert notes["with"]["output-file"] == create["env"]["NOTES_FILE"]
+    assert create["env"]["LATEST"] == "${{ needs.plan.outputs.latest }}"
 
 
-def publish_release(entry, tmp_path, exists: str, apks=("SleepHub_release_1.13.1_101350001.apk",), built_on="primary"):
+def previous_release(entry, tmp_path, repo: Path, tag: str, released: list[str]) -> str:
+    directory = gh_directory(tmp_path, [], released=released)
+    output = tmp_path / "previous-output"
+    output.write_text("")
+    env = {
+        "PATH": f"{directory}{os.pathsep}{os.environ['PATH']}",
+        "GH_DIR": str(directory),
+        "GH_REPO": "acme/app",
+        "TAG": tag,
+        "GITHUB_OUTPUT": str(output),
+    }
+    script = step(entry["jobs"]["publish"], "Find the previous release of the line")["run"]
+    result = run_script(script, env, repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return output.read_text()
+
+
+def test_the_notes_start_at_the_previous_release_of_the_same_line(entry, tmp_path):
+    from test_pr_check import commit, git, new_repository
+
+    # main line:    base(v1.13.0) ── a(v2.0.0) ── b(v2.0.1, tagged, never published) ── c(v2.0.2)
+    # release/1.x:    └── h1(v1.13.1) ── h2(v1.13.2)
+    repo = new_repository(tmp_path / "repo")
+    git(repo, "tag", "v1.13.0")
+    git(repo, "tag", "v1.13.0-handok-reset-off.84")
+    git(repo, "checkout", "-q", "-b", "release/1.x")
+    commit(repo, {"hotfix.kt": "1"}, "hotfix one")
+    git(repo, "tag", "-a", "v1.13.1", "-m", "v1.13.1")
+    commit(repo, {"hotfix.kt": "2"}, "hotfix two")
+    git(repo, "tag", "v1.13.2")
+    git(repo, "checkout", "-q", "main")
+    for number, tag in enumerate(("v2.0.0", "v2.0.1", "v2.0.2")):
+        commit(repo, {"app.kt": str(number)}, f"change {number}")
+        git(repo, "tag", tag)
+    released = ["v2.0.0", "v1.13.1", "v1.13.0-handok-reset-off.84", "v1.13.0"]
+
+    def previous(tag: str, name: str) -> str:
+        return previous_release(entry, tmp_path / name, repo, tag, released)
+
+    # A maintenance release starts at the release before it on its own branch, not at 2.0.0.
+    assert previous("v1.13.2", "maintenance") == "tag=v1.13.1\n"
+    # The first release of a new major starts where its line left the old one.
+    assert previous("v2.0.0", "major") == "tag=v1.13.0\n"
+    # v2.0.1 was never published: its changes belong in the notes of v2.0.2.
+    assert previous("v2.0.2", "unpublished") == "tag=v2.0.0\n"
+    assert previous("v1.13.0", "first") == "tag=\n"
+
+
+def test_an_unreadable_release_list_stops_the_notes(entry, tmp_path):
+    from test_pr_check import new_repository
+
+    repo = new_repository(tmp_path / "repo")
+    directory = gh_directory(tmp_path, [])
+    (directory / "release-error").write_text("gh: Server Error (HTTP 502)\n")
+    env = {
+        "PATH": f"{directory}{os.pathsep}{os.environ['PATH']}",
+        "GH_DIR": str(directory),
+        "GH_REPO": "acme/app",
+        "TAG": "v1.0.0",
+        "GITHUB_OUTPUT": str(tmp_path / "previous-output"),
+    }
+    result = run_script(step(entry["jobs"]["publish"], "Find the previous release of the line")["run"], env, repo)
+    assert result.returncode == 1
+    assert "::error::Cannot list the releases of acme/app." in result.stdout
+
+
+def publish_release(
+    entry, tmp_path, exists: str, apks=("SleepHub_release_1.13.1_101350001.apk",), built_on="primary", latest="true"
+):
     directory = gh_directory(tmp_path, [])
     apk_directory = tmp_path / "apk"
-    apk_directory.mkdir()
     for name in apks:
+        (apk_directory / name).parent.mkdir(parents=True, exist_ok=True)
         (apk_directory / name).write_text("apk")
+    apk_directory.mkdir(exist_ok=True)
     summary = tmp_path / "summary"
     env = {
         "PATH": f"{directory}{os.pathsep}{os.environ['PATH']}",
@@ -785,6 +946,7 @@ def publish_release(entry, tmp_path, exists: str, apks=("SleepHub_release_1.13.1
         "TAG": "v1.13.1",
         "VERSION": "1.13.1",
         "VERSION_CODE": "101350001",
+        "LATEST": latest,
         "EXISTS": exists,
         "APK_DIRECTORY": str(apk_directory),
         "NOTES_FILE": str(tmp_path / "notes.md"),
@@ -802,19 +964,43 @@ def test_a_new_release_is_created_with_the_notes_and_the_apk(entry, tmp_path):
     result, calls, summary = publish_release(entry, tmp_path, "false")
     assert result.returncode == 0, result.stdout + result.stderr
     apk = tmp_path / "apk" / "SleepHub_release_1.13.1_101350001.apk"
-    assert calls == [f"release create v1.13.1 --verify-tag --title v1.13.1 --notes-file {tmp_path / 'notes.md'} {apk}"]
+    assert calls == [
+        f"release create v1.13.1 --verify-tag --title v1.13.1 --notes-file {tmp_path / 'notes.md'} --latest=true {apk}"
+    ]
     text = summary.read_text()
     assert "Created the release with SleepHub_release_1.13.1_101350001.apk: <https://github.invalid/acme/app/releases/tag/v1.13.1>" in text
-    assert "| 1.13.1 | 101350001 | a self-hosted runner |" in text
+    assert "| 1.13.1 | 101350001 | true | a self-hosted runner |" in text
     assert "::warning" not in result.stdout
+
+
+def test_a_release_of_a_lower_line_is_not_marked_latest(entry, tmp_path):
+    result, calls, summary = publish_release(entry, tmp_path, "false", latest="false")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert " --latest=false " in calls[0]
+    assert "| 1.13.1 | 101350001 | false | a self-hosted runner |" in summary.read_text()
+
+
+def test_every_apk_of_the_build_is_attached(entry, tmp_path):
+    # As the artifact arrives: the directories of the flavors, one with a space.
+    apks = ("sleephub/release/SleepHub_release_1.13.1_101350001.apk", "sweet sleep/release/SweetSleep_release_1.13.1_101350001.apk")
+    result, calls, summary = publish_release(entry, tmp_path, "false", apks=apks)
+    assert result.returncode == 0, result.stdout + result.stderr
+    first, second = (str(tmp_path / "apk" / name) for name in apks)
+    assert calls == [
+        f"release create v1.13.1 --verify-tag --title v1.13.1 --notes-file {tmp_path / 'notes.md'} --latest=true {first} {second}"
+    ]
+    assert "Created the release with SleepHub_release_1.13.1_101350001.apk, SweetSleep_release_1.13.1_101350001.apk" in summary.read_text()
 
 
 def test_an_existing_release_keeps_its_notes_and_gets_the_apk(entry, tmp_path):
     result, calls, summary = publish_release(entry, tmp_path, "true", apks=("SweetSleep_release_1.13.1_101350001.apk",))
     assert result.returncode == 0, result.stdout + result.stderr
     apk = tmp_path / "apk" / "SweetSleep_release_1.13.1_101350001.apk"
+    # Neither the notes nor the latest mark of an existing release are touched.
     assert calls == [f"release upload v1.13.1 {apk} --clobber"]
-    assert "Added SweetSleep_release_1.13.1_101350001.apk to the existing release" in summary.read_text()
+    text = summary.read_text()
+    assert "Added SweetSleep_release_1.13.1_101350001.apk to the existing release" in text
+    assert "| 1.13.1 | 101350001 | unchanged | a self-hosted runner |" in text
 
 
 def test_a_release_built_on_the_fallback_runner_says_so(entry, tmp_path):
@@ -824,11 +1010,10 @@ def test_a_release_built_on_the_fallback_runner_says_so(entry, tmp_path):
     assert "the GitHub-hosted runner, after the self-hosted build did not pass" in summary.read_text()
 
 
-@pytest.mark.parametrize("apks", [(), ("a.apk", "b.apk")])
-def test_publish_needs_exactly_one_apk(entry, tmp_path, apks):
-    result, calls, _ = publish_release(entry, tmp_path, "false", apks=apks)
+def test_publish_needs_an_apk(entry, tmp_path):
+    result, calls, _ = publish_release(entry, tmp_path, "false", apks=())
     assert result.returncode == 1
-    assert f"holds {len(apks)} APK files" in result.stdout
+    assert "::error::The build artifact holds no APK." in result.stdout
     assert calls == []
 
 
@@ -836,7 +1021,7 @@ def test_look_for_the_release_tells_missing_from_unreachable(entry, tmp_path):
     script = step(entry["jobs"]["publish"], "Look for the GitHub Release")["run"]
     states = {"missing": ("false", 0), "present": ("true", 0), "unreachable": ("", 1)}
     for name, (exists, code) in states.items():
-        directory = gh_directory(tmp_path / name, [], released=name == "present")
+        directory = gh_directory(tmp_path / name, [], release_exists=name == "present")
         if name == "unreachable":
             (directory / "release-error").write_text("gh: Bad credentials (HTTP 401)\n")
         output = tmp_path / name / "output"

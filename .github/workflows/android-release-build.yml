@@ -3,8 +3,8 @@ name: Android release build
 # The build job of android-release.yml, which calls this file once on the
 # runner it picked and, after an infrastructure failure on a self-hosted
 # runner, once more on a GitHub-hosted runner. The job builds the tag with
-# ./gradlew ciRelease, signs with the caller's keystore, checks the APK and
-# uploads it as an artifact for the publish job.
+# ./gradlew ciRelease, signs with the caller's keystore, checks every APK the
+# build left and uploads them as one artifact for the publish job.
 #
 # This file is internal to android-release.yml: call that workflow, not this
 # one. The inputs are documented there and in android-ci/README.md.
@@ -16,7 +16,9 @@ on:
         required: true
         type: string
       attempt:
-        description: 'primary or fallback. Both calls share one workflow run, so the artifact name carries it.'
+        description: >-
+          primary or fallback. Both calls share one workflow run, so the
+          artifact with the signed APKs is named android-release-apk-<attempt>.
         required: true
         type: string
       environment:
@@ -56,7 +58,7 @@ on:
         required: false
         type: string
         default: ''
-      apk-path:
+      apk-directory:
         required: true
         type: string
       expected-cert-sha256:
@@ -89,12 +91,6 @@ on:
           went away). code also stands for a missing secret or variable: no
           other runner has it either.
         value: ${{ jobs.build.outputs.verdict }}
-      artifact:
-        description: 'Name of the artifact that holds the signed APK; empty when none was uploaded.'
-        value: ${{ jobs.build.outputs.artifact }}
-      apk-name:
-        description: 'File name of the signed APK.'
-        value: ${{ jobs.build.outputs.apk-name }}
 
 permissions:
   contents: read
@@ -112,13 +108,36 @@ jobs:
     # there. Its protection rules (reviewers, allowed branches and tags) apply
     # to this job.
     environment: ${{ inputs.environment }}
+    # No output of this job may hold text that could equal a secret: the runner
+    # drops an output that contains the value of one, a key alias for instance.
     outputs:
       verdict: ${{ steps.values.outcome == 'failure' && 'code' || steps.verdict.outputs.verdict }}
-      artifact: ${{ steps.upload.outcome == 'success' && format('android-release-apk-{0}', inputs.attempt) || '' }}
-      apk-name: ${{ steps.apk.outputs.name }}
     steps:
-      # First, so a release that cannot be built stops before anything is
-      # checked out, and names everything that is missing at once. The four
+      # A self-hosted runner keeps its work folder between jobs, and the jobs
+      # before this one may have built a pull request: files in the folder, git
+      # hooks and git configuration are all theirs. Nothing of that is trusted
+      # by a job that signs, so the folder is emptied before any other step
+      # runs in it, and the checkout below is a fresh clone. A GitHub-hosted
+      # runner starts empty.
+      - name: Empty the work folder
+        id: workspace
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_KIND" != self-hosted ]]; then
+            echo "Not a self-hosted runner: the work folder is new."
+            exit 0
+          fi
+          if [[ -z "${GITHUB_WORKSPACE:-}" || ! -d "$GITHUB_WORKSPACE" ]]; then
+            echo "::error::GITHUB_WORKSPACE is not a directory."
+            exit 1
+          fi
+          find "$GITHUB_WORKSPACE" -mindepth 1 -delete
+          echo "Emptied $GITHUB_WORKSPACE."
+
+      # Before anything is checked out, so a release that cannot be built
+      # stops here and names everything that is missing at once. The four
       # signing values are always needed; the caller lists the rest. A name is
       # looked up among the secrets and then among the variables this job can
       # read. Only names are printed, never a value.
@@ -126,6 +145,9 @@ jobs:
       # The values that go to local.properties are written here, to a file in
       # the job's temp directory, so that this is the only step that sees
       # every secret. The step that needs the file moves it into place.
+      #
+      # python3 -I: the script comes from standard input, and without -I
+      # Python would look for the modules it imports in the work folder first.
       - name: Check the secrets and variables
         id: values
         env:
@@ -135,7 +157,7 @@ jobs:
           REQUIRED_SECRETS: ${{ inputs.required-secrets }}
         run: |
           set -euo pipefail
-          python3 - <<'VALUES'
+          python3 -I - <<'VALUES'
           import json
           import os
           import re
@@ -215,28 +237,6 @@ jobs:
           print(f"All {len(wanted)} values are present: {', '.join(wanted)}.")
           print(f"Prepared {len(written)} local.properties entries: {', '.join(written)}.")
           VALUES
-
-      # A self-hosted runner keeps its work folder between jobs, and the jobs
-      # before this one may have built a pull request: files in the folder, git
-      # hooks and git configuration are all theirs. Nothing of that is trusted
-      # by a job that signs, so the folder is emptied and the checkout below is
-      # a fresh clone. A GitHub-hosted runner starts empty.
-      - name: Empty the work folder
-        id: workspace
-        env:
-          RUNNER_KIND: ${{ runner.environment }}
-        run: |
-          set -euo pipefail
-          if [[ "$RUNNER_KIND" != self-hosted ]]; then
-            echo "Not a self-hosted runner: the work folder is new."
-            exit 0
-          fi
-          if [[ -z "${GITHUB_WORKSPACE:-}" || ! -d "$GITHUB_WORKSPACE" ]]; then
-            echo "::error::GITHUB_WORKSPACE is not a directory."
-            exit 1
-          fi
-          find "$GITHUB_WORKSPACE" -mindepth 1 -delete
-          echo "Emptied $GITHUB_WORKSPACE."
 
       # GIT_TOKEN is used only when submodules are checked out: it reaches
       # private ones, and the job token reads the repository itself. No token
@@ -379,30 +379,38 @@ jobs:
           ./gradlew ciRelease "-PciVersionName=$VERSION_NAME" "-PciVersionCode=$VERSION_CODE" $GRADLE_ARGS \
             --no-daemon --no-build-cache ${extra[@]+"${extra[@]}"} 2>&1 | tee "$RUNNER_TEMP/gradle.log"
 
-      # Exactly one APK, and it has to carry the version it was built for: a
-      # build that ignores -PciVersionName or -PciVersionCode would otherwise
-      # be released under the wrong version.
-      - name: Check the APK
+      # ciRelease leaves the APKs of the release under apk-directory: one, or
+      # one per flavor. The work folder was empty before the checkout, so
+      # every APK there was built by this job. Each has to carry the version
+      # it was built for: a build that ignores -PciVersionName or
+      # -PciVersionCode would otherwise be released under the wrong version.
+      - name: Check the APKs
         id: apk
         env:
-          APK_PATH: ${{ inputs.apk-path }}
+          APK_DIRECTORY: ${{ inputs.apk-directory }}
           VERSION_NAME: ${{ inputs.version-name }}
           VERSION_CODE: ${{ inputs.version-code }}
           BUILD_TOOLS_VERSION: ${{ inputs.build-tools-version }}
         run: |
           set -euo pipefail
-          apks=()
-          while IFS= read -r match; do
-            apks+=("$match")
-          done < <(compgen -G "$APK_PATH" || true)
-          if [[ "${#apks[@]}" != 1 ]]; then
-            echo "::error::apk-path ($APK_PATH) matches ${#apks[@]} files; it has to match exactly one."
-            for apk in ${apks[@]+"${apks[@]}"}; do
-              echo "  $apk"
-            done
+          if [[ -z "$APK_DIRECTORY" || "$APK_DIRECTORY" == -* || ! -d "$APK_DIRECTORY" ]]; then
+            echo "::error::apk-directory ($APK_DIRECTORY) is not a directory after the build."
             exit 1
           fi
-          apk="${apks[0]}"
+          apks=()
+          while IFS= read -r found; do
+            apks+=("$found")
+          done < <(find "$APK_DIRECTORY" -type f -name '*.apk' | sort)
+          if [[ "${#apks[@]}" == 0 ]]; then
+            echo "::error::ciRelease left no APK under $APK_DIRECTORY."
+            exit 1
+          fi
+          # The APKs become assets of one release, which names them by file name.
+          duplicates=$(for apk in "${apks[@]}"; do basename "$apk"; done | sort | uniq -d)
+          if [[ -n "$duplicates" ]]; then
+            echo "::error::Several APKs under $APK_DIRECTORY share a file name: ${duplicates//$'\n'/, }. Give each flavor's APK its own name."
+            exit 1
+          fi
 
           sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
           if [[ -z "$sdk" || ! -d "$sdk/build-tools" ]]; then
@@ -419,42 +427,50 @@ jobs:
             exit 1
           fi
 
-          package=$("$aapt2" dump badging "$apk" | grep -m1 '^package: ' || true)
           name_pattern="versionName='([^']*)'"
           code_pattern="versionCode='([0-9]+)'"
-          built_name=""
-          built_code=""
-          if [[ "$package" =~ $name_pattern ]]; then
-            built_name="${BASH_REMATCH[1]}"
-          fi
-          if [[ "$package" =~ $code_pattern ]]; then
-            built_code="${BASH_REMATCH[1]}"
-          fi
-          echo "$apk: versionName=$built_name versionCode=$built_code"
-          if [[ "$built_name" != "$VERSION_NAME" || "$built_code" != "$VERSION_CODE" ]]; then
-            echo "::error::The APK is version $built_name ($built_code), and the release is $VERSION_NAME ($VERSION_CODE). The build has to take its version from -PciVersionName and -PciVersionCode."
+          wrong=0
+          for apk in "${apks[@]}"; do
+            package=$("$aapt2" dump badging "$apk" | grep -m1 '^package: ' || true)
+            built_name=""
+            built_code=""
+            if [[ "$package" =~ $name_pattern ]]; then
+              built_name="${BASH_REMATCH[1]}"
+            fi
+            if [[ "$package" =~ $code_pattern ]]; then
+              built_code="${BASH_REMATCH[1]}"
+            fi
+            echo "$apk: versionName=$built_name versionCode=$built_code"
+            if [[ "$built_name" != "$VERSION_NAME" || "$built_code" != "$VERSION_CODE" ]]; then
+              echo "::error::$apk is version $built_name ($built_code), and the release is $VERSION_NAME ($VERSION_CODE). The build has to take its version from -PciVersionName and -PciVersionCode."
+              wrong=1
+            fi
+          done
+          if [[ "$wrong" != 0 ]]; then
             exit 1
           fi
+          # One path per line. No path can be the closing line: each ends in .apk.
           {
-            echo "path=$apk"
-            echo "name=$(basename "$apk")"
+            echo "paths<<android-release-apks"
+            printf '%s\n' "${apks[@]}"
+            echo "android-release-apks"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Verify the APK signature
+      - name: Verify the APK signatures
         id: signature
         uses: asleep-ai/actions/android-signing@android-ci/v1
         with:
           operation: verify
-          apk-file: ${{ steps.apk.outputs.path }}
+          apk-file: ${{ steps.apk.outputs.paths }}
           expected-cert-sha256: ${{ inputs.expected-cert-sha256 }}
           build-tools-version: ${{ inputs.build-tools-version }}
 
-      - name: Upload the signed APK
+      - name: Upload the signed APKs
         id: upload
         uses: actions/upload-artifact@v7
         with:
           name: android-release-apk-${{ inputs.attempt }}
-          path: ${{ steps.apk.outputs.path }}
+          path: ${{ steps.apk.outputs.paths }}
           retention-days: 90
           if-no-files-found: error
           # A re-run of the job uploads under the same name.
@@ -494,7 +510,7 @@ jobs:
       # signature, the upload): when one of them fails, the verdict is infra.
       - name: Report the verdict
         id: verdict
-        if: ${{ always() && steps.values.outcome == 'success' }}
+        if: ${{ always() && steps.values.outcome != 'failure' }}
         uses: asleep-ai/actions/gradle-log-verdict@android-ci/v1
         with:
           log-file: ${{ runner.temp }}/gradle.log

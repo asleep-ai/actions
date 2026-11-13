@@ -41,6 +41,7 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
         "PREVIOUS_TAG": "v1.13.0",
         "VERSION_CODE": "101350001",
         "TARGET_SHA": "3ff9b1a3" + "0" * 32,
+        "LINE_BRANCH": "develop",
         "PRS": prs,
         "PR": "858",
         "DRY_RUN": "false",
@@ -55,6 +56,7 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
     assert text.startswith("### v1.13.0 → v1.13.1\n")
     assert "- Commit: [`3ff9b1a`](https://github.invalid/acme/app/commit/3ff9b1a3" in text
     assert ", the merge commit of #858\n" in text
+    assert "- Release line: `develop`\n" in text
     assert "- versionCode: 101350001\n" in text
     # The titles are written as they are.
     assert prs + "\n" in text
@@ -240,11 +242,20 @@ def remote(clone: Path, *args: str) -> str:
     return git(clone.parent / "origin.git", *args)
 
 
-def check_branch(jobs, clone: Path, target: str, branch: str = "main"):
-    summary = clone.parent / "summary"
+def check_branch(jobs, clone: Path, target: str, branch: str = "main", line: str = "develop"):
+    summary, output = clone.parent / "summary", clone.parent / "main-output"
     summary.write_text("")
-    env = {"MAIN_BRANCH": branch, "TARGET_SHA": target, "GITHUB_STEP_SUMMARY": str(summary)}
+    output.write_text("")
+    env = {
+        "MAIN_BRANCH": branch,
+        "LINE_BRANCH": line,
+        "SOURCE_BRANCH": "develop",
+        "TARGET_SHA": target,
+        "GITHUB_STEP_SUMMARY": str(summary),
+        "GITHUB_OUTPUT": str(output),
+    }
     result = run_script(step(jobs["plan"], "Check that the main branch can move")["run"], env, clone)
+    check_branch.moved = output.read_text()
     return result, summary.read_text()
 
 
@@ -255,12 +266,28 @@ def test_main_moves_forward_to_the_commit(jobs, clone):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "`main` moves forward by 2 commit(s), from `" in summary
     assert "main moves forward by 2 commit(s)" in result.stdout
+    assert check_branch.moved == "main-branch=main\n"
 
 
 def test_main_at_the_commit_already(jobs, clone):
     result, summary = check_branch(jobs, clone, git(clone, "rev-parse", "HEAD"))
     assert result.returncode == 0, result.stdout + result.stderr
     assert "`main` is at the commit already." in summary
+    assert check_branch.moved == "main-branch=main\n"
+
+
+def test_a_release_from_a_maintenance_branch_leaves_main_where_it_is(jobs, clone):
+    # main is ahead on the 2.x line, and the release is a hotfix on release/1.x: main could never
+    # move forward to it, and that is no reason to refuse the release.
+    base = git(clone, "rev-parse", "HEAD")
+    commit(clone, {"a.kt": "2"}, "2.0 work (#30)")
+    git(clone, "push", "-q", "origin", "develop:develop", "develop:main")
+    git(clone, "checkout", "-q", "-b", "release/1.x", base)
+    target = commit(clone, {"hotfix.kt": "1"}, "hotfix (#21)")
+    result, summary = check_branch(jobs, clone, target, line="release/1.x")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "`main` is not moved: it follows the releases of `develop`, and this one is cut from `release/1.x`." in summary
+    assert check_branch.moved == "main-branch=\n"
 
 
 def test_main_with_a_commit_the_release_lacks_refuses(jobs, clone):
@@ -418,13 +445,31 @@ def test_the_version_is_planned_again_before_the_push(jobs):
     assert ids.index("state") < ids.index("version") < ids.index("push")
     again = tag["steps"][ids.index("version")]
     assert again["if"] == "${{ steps.state.outputs.exists == 'false' }}"
-    assert again["with"] == {"sha": "${{ needs.plan.outputs.target-sha }}", "bump": "${{ inputs.bump }}"}
+    source = "${{ inputs.source-branch || github.event.repository.default_branch }}"
+    assert again["with"] == {
+        "sha": "${{ needs.plan.outputs.target-sha }}",
+        "bump": "${{ inputs.bump }}",
+        "source-branch": source,
+    }
     env = tag["steps"][ids.index("push")]["env"]
     assert env["TAG"] == "${{ needs.plan.outputs.tag }}" and env["TAG_NOW"] == "${{ steps.version.outputs.tag }}"
     assert env["PREVIOUS_TAG_NOW"] == "${{ steps.version.outputs.previous-tag }}"
+    # The branch the plan decided to move, which is none for a release from a maintenance branch.
+    assert env["MAIN_BRANCH"] == "${{ needs.plan.outputs.main-branch }}"
+    assert jobs["plan"]["outputs"]["main-branch"] == "${{ steps.main.outputs.main-branch }}"
     planned = jobs["plan"]["steps"][1]
     assert planned["uses"] == again["uses"]
-    assert planned["with"] == {"pr": "${{ inputs.pr }}", "sha": "${{ inputs.sha }}", "bump": "${{ inputs.bump }}"}
+    # The source branch is always passed: without it the action checks tags only, and a commit of an
+    # open pull request could be released.
+    assert planned["with"] == {
+        "pr": "${{ inputs.pr }}",
+        "sha": "${{ inputs.sha }}",
+        "bump": "${{ inputs.bump }}",
+        "source-branch": source,
+    }
+    main = step(jobs["plan"], "Check that the main branch can move")
+    assert main["env"]["SOURCE_BRANCH"] == source
+    assert main["env"]["LINE_BRANCH"] == "${{ steps.version.outputs.branch }}"
 
 
 # --- tag: the release workflow --------------------------------------------------------------
@@ -493,7 +538,11 @@ def test_only_the_tag_job_writes_and_only_after_the_plan(jobs):
     assert tag["steps"][0]["with"] == {
         "fetch-depth": 0,
         "token": "${{ secrets.RELEASE_PUSH_TOKEN || github.token }}",
+        # Stated, not left to the default: the push needs the token in the clone.
+        "persist-credentials": True,
     }
+    # The inline script does not import from the checkout.
+    assert "python3 -I - <<'CHECKS'" in step(plan, "Check the commit's checks")["run"]
     # The release workflow is started with the job token, whatever token pushed.
     assert step(tag, "Start the release workflow")["env"]["GH_TOKEN"] == "${{ github.token }}"
     names = [item.get("name") for item in plan["steps"][1:]]
@@ -508,7 +557,8 @@ def test_only_the_tag_job_writes_and_only_after_the_plan(jobs):
 def test_inputs_secrets_and_outputs(jobs):
     call = trigger(load(ENTRY))
     assert list(call["inputs"]) == [
-        "pr", "sha", "bump", "dry_run", "required-checks", "main-branch", "release-workflow", "environment",
+        "pr", "sha", "bump", "dry_run", "source-branch", "required-checks", "main-branch", "release-workflow",
+        "environment",
     ]
     assert call["inputs"]["dry_run"] == {**call["inputs"]["dry_run"], "type": "boolean", "default": False}
     assert call["secrets"]["RELEASE_PUSH_TOKEN"]["required"] is False
