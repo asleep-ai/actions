@@ -24,7 +24,14 @@ inputs:
       as hex with or without colons, in any case. Several digests may be
       given, separated by whitespace or commas; every signer certificate of
       the APK must then be one of them. When empty, only the validity of the
-      signature is checked.
+      signature is checked, and a notice says so.
+    required: false
+    default: ''
+  build-tools-version:
+    description: >-
+      For verify, optional. The build-tools version whose apksigner is used,
+      as the directory is named under build-tools, for example 36.0.0. When
+      empty, the highest installed version is used.
     required: false
     default: ''
   keystore-file:
@@ -37,8 +44,8 @@ inputs:
     description: >-
       For cleanup. Newline-separated files to delete besides the keystore,
       such as local.properties. Relative paths are resolved against the step's
-      working directory. Files that do not exist are ignored; directories are
-      refused.
+      working directory. Files that do not exist are ignored; directories and
+      patterns fail the step.
     required: false
     default: ''
 
@@ -58,6 +65,7 @@ runs:
         KEYSTORE_BASE64: ${{ inputs.keystore-base64 }}
         APK_FILE: ${{ inputs.apk-file }}
         EXPECTED_CERT_SHA256: ${{ inputs.expected-cert-sha256 }}
+        BUILD_TOOLS_VERSION: ${{ inputs.build-tools-version }}
         KEYSTORE_FILE: ${{ inputs.keystore-file }}
         CLEANUP_PATHS: ${{ inputs.paths }}
       run: python3 "$GITHUB_ACTION_PATH/signing.py"

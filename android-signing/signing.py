@@ -8,11 +8,12 @@ Operations:
   the runner's user only, and report its path. The runner empties RUNNER_TEMP
   at the start and the end of every job, so a runner killed mid-job keeps the
   keystore only until its next job.
-- verify: run `apksigner verify` from the highest build-tools version of the
-  Android SDK. With expected certificate digests, every signer certificate of
-  the APK must be one of them.
+- verify: run `apksigner verify` from the Android SDK, by default from its
+  highest build-tools version. With expected certificate digests, every signer
+  certificate of the APK must be one of them.
 - cleanup: delete the keystore and the other files named by the caller. A file
-  that is not there is fine; anything that could not be deleted fails the step.
+  that is not there is fine; anything that could not be deleted fails the step,
+  and so does a path that is not there and looks like a pattern.
 
 Whatever cannot be confirmed fails the step: an empty or undecodable keystore,
 a missing apksigner, a certificate list that cannot be read.
@@ -31,15 +32,21 @@ from typing import Mapping
 
 KEYSTORE_NAME = "release.jks"
 
-# One line of `apksigner verify --print-certs`. The text before "certificate"
-# names the signer and has changed between build-tools versions ("Signer #1",
-# "Signer (minSdkVersion=24, maxSdkVersion=32)"), so it is not matched exactly.
-# "Signer #1 public key SHA-256 digest" is another value and does not match.
-CERT_DIGEST = re.compile(
-    r"(?P<signer>.+?)\s+certificate\s+SHA-?\s?256(?:\s+digest)?\s*:\s*(?P<digest>\S.*)",
-    re.IGNORECASE,
-)
+# What follows a signer's name on its certificate line in the output of
+# `apksigner verify --print-certs`. The name itself differs between build-tools
+# versions and kinds of APK, so only this part is matched:
+#   up to 36.1.0  Signer #1 certificate SHA-256 digest: <hex>
+#                 Signer (minSdkVersion=24, maxSdkVersion=32) certificate SHA-256 digest: <hex>
+#                 Source Stamp Signer certificate SHA-256 digest: <hex>
+#   37.0.0        V3.0 Signer: certificate SHA-256 digest: <hex>
+#                 V3.1 Signer: (minSdkVersion=33, maxSdkVersion=2147483647) certificate SHA-256 digest: <hex>
+#                 Source Stamp Signer: certificate SHA-256 digest: <hex>
+# The "public key SHA-256 digest" lines of --verbose are another value and do
+# not contain this text.
+CERT_DIGEST = " certificate SHA-256 digest: "
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+# In a cleanup path, a sign that the caller expected a pattern to be expanded.
+PATTERN_CHARACTERS = "*?["
 
 
 class Failure(Exception):
@@ -49,6 +56,10 @@ class Failure(Exception):
 def escape(text: str) -> str:
     """Escape workflow-command data so a message cannot end the command early."""
     return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def annotate(level: str, message: str) -> None:
+    print(f"::{level} title=android-signing::{escape(message)}")
 
 
 def set_output(env: Mapping[str, str], name: str, value: str) -> None:
@@ -109,12 +120,11 @@ def signer_digests(output: str) -> list[str]:
     """Return the SHA-256 digest of each signer certificate in `--print-certs` output."""
     digests = []
     for line in output.splitlines():
-        match = CERT_DIGEST.fullmatch(line.strip())
+        signer, found, digest = line.strip().partition(CERT_DIGEST)
         # "Source Stamp Signer" is the stamp of the distributing store, not a signer of the APK.
-        if not match or not match.group("signer").lower().startswith("signer"):
+        if not found or "signer" not in signer.lower() or "source stamp" in signer.lower():
             continue
-        digest = normalize_digest(match.group("digest"))
-        if digest is None:
+        if not SHA256_HEX.fullmatch(digest):
             raise Failure(f"apksigner printed a signer certificate SHA-256 that is not 64 hex digits: {line.strip()}")
         digests.append(digest)
     return digests
@@ -139,7 +149,8 @@ def sdk_root(env: Mapping[str, str]) -> Path:
     return Path(root)
 
 
-def find_apksigner(root: Path) -> Path:
+def find_apksigner(root: Path, version: str = "") -> Path:
+    """Return apksigner of the build-tools `version`, or of the highest installed one."""
     build_tools = root / "build-tools"
     versions = []
     if build_tools.is_dir():
@@ -147,7 +158,14 @@ def find_apksigner(root: Path) -> Path:
                     if (path / "apksigner").is_file() and os.access(path / "apksigner", os.X_OK)]
     if not versions:
         raise Failure(f"apksigner not found under {build_tools}; install an Android SDK build-tools package")
-    return max(versions, key=lambda path: version_key(path.name)) / "apksigner"
+    if not version:
+        return max(versions, key=lambda path: version_key(path.name)) / "apksigner"
+    # Compared with the directory names, so the value can never leave build-tools.
+    installed = sorted((path.name for path in versions), key=version_key)
+    if version not in installed:
+        raise Failure(f"build-tools-version {version!r} has no apksigner under {build_tools}; "
+                      f"installed: {', '.join(installed)}")
+    return build_tools / version / "apksigner"
 
 
 def apksigner_run(command: list[str], env: Mapping[str, str], capture: bool) -> subprocess.CompletedProcess:
@@ -168,20 +186,24 @@ def verify(env: Mapping[str, str]) -> int:
     if not os.path.isfile(apk):
         raise Failure(f"apk-file does not exist: {apk_input}")
     expected = parse_expected(env.get("EXPECTED_CERT_SHA256", ""))
-    apksigner = str(find_apksigner(sdk_root(env)))
+    apksigner = str(find_apksigner(sdk_root(env), env.get("BUILD_TOOLS_VERSION", "").strip()))
     print(f"Using {apksigner}")
 
-    result = apksigner_run([apksigner, "verify", "--verbose", apk], env, capture=False)
-    if result.returncode != 0:
-        raise Failure(f"apksigner verify failed for {apk_input} (exit status {result.returncode})")
     if not expected:
-        print("The signature is valid. No expected-cert-sha256 was given, so the signer certificate is not compared.")
+        result = apksigner_run([apksigner, "verify", "--verbose", apk], env, capture=False)
+        if result.returncode != 0:
+            raise Failure(f"apksigner verify failed for {apk_input} (exit status {result.returncode})")
+        # An annotation, not a log line: a misspelt or deleted variable gives an
+        # empty input too, and the step is green either way.
+        annotate("notice", "The APK signature is valid. The signer certificate was not compared, because "
+                           "expected-cert-sha256 is empty.")
         return 0
 
-    result = apksigner_run([apksigner, "verify", "--print-certs", apk], env, capture=True)
+    # One run gives both the exit status and the certificates.
+    result = apksigner_run([apksigner, "verify", "--verbose", "--print-certs", apk], env, capture=True)
     print(result.stdout, end="")
     if result.returncode != 0:
-        raise Failure(f"apksigner verify --print-certs failed for {apk_input} (exit status {result.returncode})")
+        raise Failure(f"apksigner verify failed for {apk_input} (exit status {result.returncode})")
     found = signer_digests(result.stdout)
     if not found:
         raise Failure("no signer certificate SHA-256 could be read from the apksigner output above; "
@@ -214,11 +236,18 @@ def cleanup(env: Mapping[str, str]) -> int:
                 raise IsADirectoryError("it is a directory, and only files are deleted")
             os.unlink(target)
         except (FileNotFoundError, NotADirectoryError):
-            print(f"Not present: {target}")
+            if any(character in target for character in PATTERN_CHARACTERS):
+                # Patterns are not expanded. Passing this by would report success
+                # while the files the caller meant are still there.
+                failed = True
+                annotate("error", f"{target} does not exist and looks like a pattern; "
+                                  "patterns are not expanded, so list each file")
+            else:
+                print(f"Not present: {target}")
         except OSError as exc:
             # Keep going: one file that cannot be deleted must not leave the rest behind.
             failed = True
-            print(f"::error title=android-signing::{escape(f'could not delete {target}: {exc}')}")
+            annotate("error", f"could not delete {target}: {exc}")
         else:
             print(f"Deleted: {target}")
     return 1 if failed else 0
@@ -234,9 +263,9 @@ def main(env: Mapping[str, str] = os.environ) -> int:
             raise Failure(f"operation must be one of {', '.join(OPERATIONS)}, got {operation!r}")
         return OPERATIONS[operation](env)
     except Failure as exc:
-        print(f"::error title=android-signing::{escape(str(exc))}")
+        annotate("error", str(exc))
     except OSError as exc:
-        print(f"::error title=android-signing::{escape(f'{operation} failed: {exc}')}")
+        annotate("error", f"{operation} failed: {exc}")
     return 1
 
 

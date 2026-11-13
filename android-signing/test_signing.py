@@ -1,10 +1,12 @@
 """Tests for signing.py.
 
-The unit tests replace apksigner with a stub that records its arguments. One
-test signs and verifies a real APK when an Android SDK (ANDROID_HOME or
-ANDROID_SDK_ROOT, with build-tools and a platform), java and keytool are
-available, and is skipped otherwise; ANDROID_SIGNING_INTEGRATION=1 makes a
-missing tool a failure instead of a skip.
+The unit tests replace apksigner with a stub that records its arguments, and
+read certificates from testdata/, which holds what real apksigner versions
+printed. One test signs real APKs and verifies them with every installed
+build-tools version when an Android SDK (ANDROID_HOME or ANDROID_SDK_ROOT,
+with build-tools and a platform), java and keytool are available, and is
+skipped otherwise; ANDROID_SIGNING_INTEGRATION=1 makes a missing tool a
+failure instead of a skip.
 
 Run from the repository root:
     uv run --with pytest python -m pytest android-signing -q
@@ -32,9 +34,26 @@ signing = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = signing
 _spec.loader.exec_module(signing)
 
+TESTDATA = Path(__file__).with_name("testdata")
 DIGEST = "3f" * 32
 OTHER = "a0" * 32
 KEYSTORE = bytes(range(256)) * 9  # long enough for `base64` to wrap it
+
+# testdata/<build-tools version>-<kind of APK>.txt is the output of
+# `apksigner verify --verbose --print-certs`, unedited, for APKs signed with
+# throwaway keys. Versions 34.0.0 to 36.1.0 print the same certificate lines, so
+# 36.1.0 stands for them; 37.0.0 names the signers differently.
+FIRST_KEY = "85490f329b6951f13e181db041fcae77c507b7fd0b54084b39f8f6fa3afb997a"
+SECOND_KEY = "0bc46f6596db902902f15620cc61d332c51ec7ba74e1845de9ccebedb050e084"
+STAMP_KEY = "7dcd89d2adde570df49e2f267c0aac5504314f0f8adf59e836a152bdcd1deca1"
+SIGNERS = {
+    "default": [FIRST_KEY],  # v2 and v3, what apksigner signs with by default
+    "v1v2": [FIRST_KEY],
+    "v1only": [FIRST_KEY],
+    "rotated": [SECOND_KEY, FIRST_KEY],  # v3.1: the new key from API 33, the old key below it
+    "stamp": [FIRST_KEY],  # the source stamp's certificate is not a signer of the APK
+}
+REAL_OUTPUTS = [f"{version}-{kind}" for version in ("36.1.0", "37.0.0") for kind in SIGNERS]
 
 # Stands in for apksigner: records its arguments and answers from the environment.
 FAKE_APKSIGNER = r'''
@@ -43,17 +62,21 @@ import json, os, sys
 args = sys.argv[1:]
 with open(os.environ["FAKE_APKSIGNER_LOG"], "a") as log:
     log.write(json.dumps(args) + "\n")
-if len(args) != 3 or args[0] != "verify" or args[1] not in ("--verbose", "--print-certs"):
+if len(args) < 3 or args[0] != "verify" or args[1:-1] not in (["--verbose"], ["--verbose", "--print-certs"]):
     sys.exit(f"fake apksigner: unexpected arguments {args}")
-if args[1] == "--verbose":
-    print("Verifies")
-    sys.exit(int(os.environ.get("FAKE_VERIFY_EXIT", "0")))
-sys.stdout.write(os.environ.get("FAKE_PRINT_CERTS", ""))
-sys.exit(int(os.environ.get("FAKE_PRINT_CERTS_EXIT", "0")))
+print("Verifies" if os.environ.get("FAKE_VERIFY_EXIT", "0") == "0" else "DOES NOT VERIFY")
+if "--print-certs" in args:
+    sys.stdout.write(os.environ.get("FAKE_PRINT_CERTS", ""))
+sys.exit(int(os.environ.get("FAKE_VERIFY_EXIT", "0")))
 '''
 
 
+def real_output(name: str) -> str:
+    return (TESTDATA / f"{name}.txt").read_text()
+
+
 def print_certs(digest: str = DIGEST, signer: str = "Signer #1") -> str:
+    """Certificate lines as build-tools up to 36.1.0 print them, for a digest of the test's choosing."""
     return (f"{signer} certificate DN: CN=Test, O=Example\n"
             f"{signer} certificate SHA-256 digest: {digest}\n"
             f"{signer} certificate SHA-1 digest: {'1b' * 20}\n"
@@ -200,6 +223,28 @@ def test_apksigner_that_is_not_executable_does_not_count(tmp_path: Path) -> None
     assert signing.find_apksigner(tmp_path) == tmp_path / "build-tools" / "35.0.0" / "apksigner"
 
 
+def test_named_build_tools_version_is_used_instead_of_the_highest(runner: Runner) -> None:
+    for version in ("35.0.0", "36.0.0", "37.0.0"):
+        install_apksigner(runner.sdk, version)
+
+    assert signing.find_apksigner(runner.sdk, "36.0.0") == runner.sdk / "build-tools" / "36.0.0" / "apksigner"
+    assert runner.verify(BUILD_TOOLS_VERSION=" 35.0.0\n") == 0
+
+
+@pytest.mark.parametrize("version", ["36.1.0", "36", "../build-tools/36.0.0", "36.0.0/", "/", "."])
+def test_named_build_tools_version_must_be_installed(
+        runner: Runner, capsys: pytest.CaptureFixture[str], version: str) -> None:
+    install_apksigner(runner.sdk, "35.0.0")
+    install_apksigner(runner.sdk, "36.0.0")
+
+    assert runner.verify(BUILD_TOOLS_VERSION=version) == 1
+
+    printed = errors(capsys)
+    assert f"build-tools-version {version!r} has no apksigner" in printed
+    assert printed.endswith("installed: 35.0.0, 36.0.0")
+    assert runner.calls() == []
+
+
 def test_sdk_root_prefers_android_home(tmp_path: Path) -> None:
     assert signing.sdk_root({"ANDROID_HOME": "/home-sdk", "ANDROID_SDK_ROOT": "/root-sdk"}) == Path("/home-sdk")
     assert signing.sdk_root({"ANDROID_HOME": " ", "ANDROID_SDK_ROOT": "/root-sdk"}) == Path("/root-sdk")
@@ -231,38 +276,59 @@ def test_verify_fails_without_apksigner(runner: Runner, capsys: pytest.CaptureFi
 # Reading the certificate digests
 
 
+@pytest.mark.parametrize("name", REAL_OUTPUTS)
+def test_signer_digests_are_read_from_real_apksigner_output(name: str) -> None:
+    output = real_output(name)
+    # The file is what the test says it is: it holds the keys' digests and, for
+    # the stamped APK, the stamp's, which must not come back as a signer.
+    assert ("Source Stamp" in output) == name.endswith("-stamp") == (STAMP_KEY in output)
+
+    assert signing.signer_digests(output) == SIGNERS[name.split("-", 1)[1]]
+
+
+def test_real_output_names_signers_differently_across_versions() -> None:
+    # Why the signer's name is not matched: the same APK, two build-tools versions.
+    assert f"Signer #1{signing.CERT_DIGEST}{FIRST_KEY}\n" in real_output("36.1.0-default")
+    assert f"V3.0 Signer:{signing.CERT_DIGEST}{FIRST_KEY}\n" in real_output("37.0.0-default")
+    assert f"Source Stamp Signer{signing.CERT_DIGEST}{STAMP_KEY}\n" in real_output("36.1.0-stamp")
+    assert f"Source Stamp Signer:{signing.CERT_DIGEST}{STAMP_KEY}\n" in real_output("37.0.0-stamp")
+
+
+def test_line_endings_do_not_matter() -> None:
+    assert signing.signer_digests(real_output("37.0.0-rotated").replace("\n", "\r\n")) == [SECOND_KEY, FIRST_KEY]
+
+
 @pytest.mark.parametrize("output", [
-    print_certs(),
-    print_certs(DIGEST.upper()),
-    print_certs(":".join(re.findall("..", DIGEST.upper()))),
-    print_certs().replace("\n", "\r\n"),
-    print_certs().replace("SHA-256 digest", "SHA256 digest"),
-    print_certs(signer="Signer (minSdkVersion=24, maxSdkVersion=2147483647)"),
-    "WARNING: META-INF/com/android/build/gradle/app-metadata.properties not protected by signature.\n" + print_certs(),
-    # --verbose adds the key: its digest is not the certificate's.
-    print_certs() + f"Signer #1 key algorithm: RSA\nSigner #1 key size (bits): 2048\n"
-                    f"Signer #1 public key SHA-256 digest: {OTHER}\nSigner #1 public key SHA-1 digest: {'4d' * 20}\n",
-    # The stamp of a distributing store is not a signer of the APK.
-    print_certs() + print_certs(OTHER, signer="Source Stamp Signer"),
-], ids=["plain", "uppercase", "colons", "crlf", "sha256", "sdk-range", "warning", "verbose", "source-stamp"])
-def test_signer_digest_is_read_from_every_known_output(output: str) -> None:
-    assert signing.signer_digests(output) == [DIGEST]
-
-
-def test_every_signer_is_read() -> None:
-    output = (print_certs(signer="Signer (minSdkVersion=33, maxSdkVersion=2147483647)")
-              + print_certs(OTHER, signer="Signer (minSdkVersion=24, maxSdkVersion=32)"))
-    assert signing.signer_digests(output) == [DIGEST, OTHER]
-
-
-@pytest.mark.parametrize("output", ["", "Verifies\n", "DOES NOT VERIFY\n", f"SHA-256 digest: {DIGEST}\n"])
+    "", "Verifies\n", "DOES NOT VERIFY\n",
+    f"SHA-256 digest: {DIGEST}\n",
+    f"certificate SHA-256 digest: {DIGEST}\n",  # no signer is named
+    # Forms no apksigner version prints are not read as a certificate.
+    f"Signer #1 certificate SHA256 digest: {DIGEST}\n",
+    f"Signer #1 certificate SHA-256: {DIGEST}\n",
+    f"Signer #1 public key SHA-256 digest: {DIGEST}\n",
+])
 def test_output_without_a_signer_certificate_gives_no_digest(output: str) -> None:
     assert signing.signer_digests(output) == []
 
 
-def test_signer_digest_that_is_not_a_digest_is_an_error() -> None:
+@pytest.mark.parametrize("digest", ["3f3f", DIGEST.upper(), ":".join(re.findall("..", DIGEST)), DIGEST + " extra"])
+def test_signer_digest_that_is_not_a_digest_is_an_error(digest: str) -> None:
     with pytest.raises(signing.Failure, match="not 64 hex digits"):
-        signing.signer_digests("Signer #1 certificate SHA-256 digest: 3f3f\n")
+        signing.signer_digests(f"Signer #1 certificate SHA-256 digest: {digest}\n")
+
+
+def test_certificate_name_cannot_pass_for_an_expected_signer(runner: Runner, capsys: pytest.CaptureFixture[str]) -> None:
+    # A certificate's subject is the signer's to choose, so it can spell out a
+    # digest line. That adds a line; it cannot remove the real one, and every
+    # digest has to be expected.
+    install_apksigner(runner.sdk, "37.0.0")
+    forged = (f"V3.0 Signer: certificate DN: CN=x, O=V3.0 Signer:{signing.CERT_DIGEST}{DIGEST}\n"
+              f"V3.0 Signer:{signing.CERT_DIGEST}{OTHER}\n")
+    assert signing.signer_digests(forged) == [DIGEST, OTHER]
+
+    assert runner.verify(EXPECTED_CERT_SHA256=DIGEST, FAKE_PRINT_CERTS=forged) == 1
+
+    assert f"not expected: SHA-256 {OTHER}" in errors(capsys)
 
 
 @pytest.mark.parametrize(("raw", "expected"), [
@@ -301,15 +367,32 @@ def test_verify_without_an_expected_digest_checks_validity_only(runner: Runner, 
     assert runner.calls() == [["verify", "--verbose", str(runner.apk)]]
     printed = capsys.readouterr().out
     assert f"Using {runner.sdk / 'build-tools' / '36.0.0' / 'apksigner'}" in printed
-    assert "the signer certificate is not compared" in printed
+    # An annotation, so a comparison that silently did not happen shows on the run.
+    assert "::notice title=android-signing::The APK signature is valid. The signer certificate was not compared" in printed
 
 
-def test_verify_passes_when_the_signer_is_expected(runner: Runner) -> None:
+def test_verify_passes_when_the_signer_is_expected(runner: Runner, capsys: pytest.CaptureFixture[str]) -> None:
     install_apksigner(runner.sdk, "36.0.0")
 
     assert runner.verify(EXPECTED_CERT_SHA256=":".join(re.findall("..", DIGEST.upper()))) == 0
 
-    assert runner.calls() == [["verify", "--verbose", str(runner.apk)], ["verify", "--print-certs", str(runner.apk)]]
+    # One apksigner run gives the exit status and the certificates.
+    assert runner.calls() == [["verify", "--verbose", "--print-certs", str(runner.apk)]]
+    assert "::notice" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("name", REAL_OUTPUTS)
+def test_verify_compares_every_signer_of_real_output(runner: Runner, name: str) -> None:
+    install_apksigner(runner.sdk, name.split("-")[0])
+    signers = SIGNERS[name.split("-", 1)[1]]
+    output = real_output(name)
+
+    assert runner.verify(EXPECTED_CERT_SHA256=" ".join(signers), FAKE_PRINT_CERTS=output) == 0
+    for missing in signers:
+        others = [digest for digest in signers if digest != missing] or [OTHER]
+        assert runner.verify(EXPECTED_CERT_SHA256=" ".join(others), FAKE_PRINT_CERTS=output) == 1
+    # The stamp's certificate is not a signer, expected or not.
+    assert runner.verify(EXPECTED_CERT_SHA256=STAMP_KEY, FAKE_PRINT_CERTS=output) == 1
 
 
 def test_verify_fails_when_the_signer_is_not_expected(runner: Runner, capsys: pytest.CaptureFixture[str]) -> None:
@@ -334,22 +417,23 @@ def test_verify_fails_on_an_invalid_signature_before_comparing(runner: Runner, c
 
     assert runner.verify(EXPECTED_CERT_SHA256=DIGEST, FAKE_VERIFY_EXIT="1") == 1
 
+    # The certificates are printed and expected, and the APK still does not verify.
     assert "apksigner verify failed" in errors(capsys)
-    assert runner.calls() == [["verify", "--verbose", str(runner.apk)]]
+    assert runner.calls() == [["verify", "--verbose", "--print-certs", str(runner.apk)]]
 
 
-@pytest.mark.parametrize("env", [
-    {"FAKE_PRINT_CERTS": "Signer #1 certificate fingerprint (SHA2): abc\n"},
-    {"FAKE_PRINT_CERTS": ""},
-    {"FAKE_PRINT_CERTS_EXIT": "1"},
-], ids=["unknown-format", "empty", "failed"])
-def test_verify_fails_when_the_certificates_cannot_be_read(
-        runner: Runner, capsys: pytest.CaptureFixture[str], env: dict[str, str]) -> None:
+@pytest.mark.parametrize("output", [
+    "Signer #1 certificate fingerprint (SHA2): abc\n",
+    "",
+    print_certs(signer="Source Stamp Signer"),
+], ids=["unknown-format", "empty", "stamp-only"])
+def test_verify_fails_when_no_signer_certificate_can_be_read(
+        runner: Runner, capsys: pytest.CaptureFixture[str], output: str) -> None:
     install_apksigner(runner.sdk, "36.0.0")
 
-    assert runner.verify(EXPECTED_CERT_SHA256=DIGEST, **env) == 1
+    assert runner.verify(EXPECTED_CERT_SHA256=DIGEST, FAKE_PRINT_CERTS=output) == 1
 
-    assert "::error title=android-signing::" in errors(capsys)
+    assert "no signer certificate SHA-256 could be read" in errors(capsys)
 
 
 def test_verify_passes_apksigner_an_absolute_path(runner: Runner, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -424,6 +508,31 @@ def test_cleanup_refuses_a_directory_and_still_deletes_the_rest(
     assert not secret.exists()
 
 
+@pytest.mark.parametrize("pattern", ["*.properties", "local.propertie?", "[kl]ocal.properties", "app/*/secrets.xml"])
+def test_cleanup_fails_on_a_pattern_and_still_deletes_the_rest(
+        runner: Runner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+        pattern: str) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "local.properties").write_text("secret")
+    (tmp_path / "other.properties").write_text("secret")
+
+    # Patterns are not expanded: passing this by would leave local.properties behind with a green step.
+    assert runner.run("cleanup", CLEANUP_PATHS=f"{pattern}\nother.properties\n") == 1
+
+    assert f"{pattern} does not exist and looks like a pattern" in errors(capsys)
+    assert (tmp_path / "local.properties").exists()
+    assert not (tmp_path / "other.properties").exists()
+
+
+def test_cleanup_deletes_a_file_whose_name_only_looks_like_a_pattern(runner: Runner, tmp_path: Path) -> None:
+    odd = tmp_path / "notes [draft]?.txt"
+    odd.write_text("secret")
+
+    assert runner.run("cleanup", CLEANUP_PATHS=str(odd)) == 0
+
+    assert not odd.exists()
+
+
 def test_cleanup_deletes_a_symlink_not_its_target(runner: Runner, tmp_path: Path) -> None:
     target = tmp_path / "target.txt"
     target.write_text("kept")
@@ -473,7 +582,19 @@ def test_action_yml_expressions_only_where_evaluated_on_purpose() -> None:
     assert offending == []
 
 
-# A real APK, signed and verified with the real tools
+def test_action_yml_passes_every_input_to_the_script() -> None:
+    # CI runs decode and cleanup through action.yml but verify only through
+    # main(), so a misspelt variable in the env block would go unnoticed there.
+    text = Path(__file__).with_name("action.yml").read_text()
+    declared = set(re.findall(r"^  ([a-z0-9-]+):$", text.split("\ninputs:\n")[1].split("\noutputs:\n")[0], re.MULTILINE))
+    passed = dict(re.findall(r"^        ([A-Z0-9_]+): \$\{\{ inputs\.([a-z0-9-]+) \}\}$", text, re.MULTILINE))
+    script = SCRIPT.read_text()
+
+    assert set(passed.values()) == declared
+    assert [name for name in passed if f'env.get("{name}"' not in script] == []
+
+
+# Real APKs, signed and verified with the real tools
 
 
 def real_tools() -> dict[str, Path]:
@@ -500,47 +621,79 @@ def tool(*command: object) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_real_apk_is_signed_with_the_decoded_keystore_and_verified(tmp_path: Path) -> None:
+def test_real_apks_are_signed_with_the_decoded_keystore_and_verified_by_every_version(tmp_path: Path) -> None:
     tools = real_tools()
     runner = Runner(tmp_path)
     env = {**os.environ, "RUNNER_TEMP": str(runner.temp), "GITHUB_OUTPUT": str(runner.output)}
+    password = "throwaway-test-password"
 
     def run(operation: str, **inputs: str) -> int:
         return signing.main({**env, "OPERATION": operation, **inputs})
 
+    def new_key(name: str) -> tuple[Path, str]:
+        """Create a keystore holding one key, and return it with its certificate's SHA-256."""
+        keystore, certificate = tmp_path / f"{name}.jks", tmp_path / f"{name}.der"
+        tool(tools["keytool"], "-genkeypair", "-keystore", keystore, "-alias", "test", "-keyalg", "RSA",
+             "-keysize", "2048", "-validity", "2", "-dname", f"CN={name} key, O=Example", "-storepass", password,
+             "-keypass", password)
+        tool(tools["keytool"], "-exportcert", "-keystore", keystore, "-alias", "test", "-storepass", password,
+             "-file", certificate)
+        return keystore, hashlib.sha256(certificate.read_bytes()).hexdigest()
+
+    def signer(keystore: object) -> list[object]:
+        return ["--ks", keystore, "--ks-key-alias", "test", "--ks-pass", f"pass:{password}",
+                "--key-pass", f"pass:{password}"]
+
     manifest = tmp_path / "AndroidManifest.xml"
     manifest.write_text('<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.example.app">'
                         '<uses-sdk android:minSdkVersion="24"/><application android:hasCode="false"/></manifest>\n')
-    unsigned, signed = tmp_path / "unsigned.apk", tmp_path / "signed.apk"
+    unsigned = tmp_path / "unsigned.apk"
     tool(tools["aapt2"], "link", "-o", unsigned, "--manifest", manifest, "-I", tools["platform"])
-    original, certificate = tmp_path / "original.jks", tmp_path / "certificate.der"
-    password = "throwaway-test-password"
-    tool(tools["keytool"], "-genkeypair", "-keystore", original, "-alias", "test", "-keyalg", "RSA", "-keysize", "2048",
-         "-validity", "2", "-dname", "CN=android-signing test", "-storepass", password, "-keypass", password)
-    tool(tools["keytool"], "-exportcert", "-keystore", original, "-alias", "test", "-storepass", password,
-         "-file", certificate)
-    digest = hashlib.sha256(certificate.read_bytes()).hexdigest()
+    (original, first), (second_keystore, second), (stamp_keystore, stamp) = (
+        new_key("first"), new_key("second"), new_key("stamp"))
 
     # decode: the file a build would sign with.
     assert run("decode", KEYSTORE_BASE64=base64.encodebytes(original.read_bytes()).decode()) == 0
     keystore = runner.outputs()["keystore-file"]
-    tool(tools["apksigner"], "sign", "--ks", keystore, "--ks-key-alias", "test", "--ks-pass", f"pass:{password}",
-         "--key-pass", f"pass:{password}", "--out", signed, unsigned)
 
-    # verify: validity alone, then against the certificate, in the forms a caller may paste.
-    assert run("verify", APK_FILE=str(signed)) == 0
-    assert run("verify", APK_FILE=str(signed), EXPECTED_CERT_SHA256=digest) == 0
-    assert run("verify", APK_FILE=str(signed), EXPECTED_CERT_SHA256=":".join(re.findall("..", digest.upper()))) == 0
-    assert run("verify", APK_FILE=str(signed), EXPECTED_CERT_SHA256=OTHER) == 1
+    # The kinds of APK whose certificates apksigner prints differently, and the signers of each.
+    lineage = tmp_path / "lineage"
+    tool(tools["apksigner"], "rotate", "--out", lineage, "--old-signer", *signer(keystore),
+         "--new-signer", *signer(second_keystore))
+    kinds: dict[str, tuple[list[object], list[str]]] = {
+        "default": ([], [first]),
+        "v1v2": (["--v1-signing-enabled", "true", "--v3-signing-enabled", "false"], [first]),
+        "v1only": (["--v1-signing-enabled", "true", "--v2-signing-enabled", "false", "--v3-signing-enabled", "false"],
+                   [first]),
+        "rotated": (["--next-signer", *signer(second_keystore), "--lineage", lineage,
+                     "--rotation-min-sdk-version", "33"], [first, second]),
+        "stamp": (["--stamp-signer", *signer(stamp_keystore)], [first]),
+    }
+    for kind, (options, _) in kinds.items():
+        tool(tools["apksigner"], "sign", *signer(keystore), *options, "--out", tmp_path / f"{kind}.apk", unsigned)
+    signed = str(tmp_path / "default.apk")
+
+    # verify with the highest version: validity alone, then against the
+    # certificate in the forms a caller may paste, then what must fail.
+    assert run("verify", APK_FILE=signed) == 0
+    assert run("verify", APK_FILE=signed, EXPECTED_CERT_SHA256=first) == 0
+    assert run("verify", APK_FILE=signed, EXPECTED_CERT_SHA256=":".join(re.findall("..", first.upper()))) == 0
+    assert run("verify", APK_FILE=signed, EXPECTED_CERT_SHA256=second) == 1
     assert run("verify", APK_FILE=str(unsigned)) == 1
-    assert run("verify", APK_FILE=str(unsigned), EXPECTED_CERT_SHA256=digest) == 1
+    assert run("verify", APK_FILE=str(unsigned), EXPECTED_CERT_SHA256=first) == 1
 
-    # The certificate list of every installed build-tools version is readable, not just the highest one's.
-    for apksigner in sorted(tools["apksigner"].parent.parent.glob("*/apksigner")):
-        result = subprocess.run([str(apksigner), "verify", "--print-certs", str(signed)], text=True,
-                                capture_output=True, check=False)
-        assert result.returncode == 0, f"{apksigner}: {result.stdout}{result.stderr}"
-        assert signing.signer_digests(result.stdout) == [digest], f"{apksigner}: {result.stdout}"
+    # Every installed build-tools version, every kind of APK: the action reads
+    # each signer, and neither a missing signer nor the stamp's certificate passes.
+    versions = sorted(path.parent.name for path in tools["apksigner"].parent.parent.glob("*/apksigner"))
+    for version in versions:
+        for kind, (_, signers) in kinds.items():
+            apk = str(tmp_path / f"{kind}.apk")
+            where = f"build-tools {version}, {kind} APK"
+            assert run("verify", APK_FILE=apk, BUILD_TOOLS_VERSION=version) == 0, where
+            assert run("verify", APK_FILE=apk, BUILD_TOOLS_VERSION=version,
+                       EXPECTED_CERT_SHA256=" ".join(signers)) == 0, where
+            assert run("verify", APK_FILE=apk, BUILD_TOOLS_VERSION=version,
+                       EXPECTED_CERT_SHA256=" ".join([*signers[1:], stamp])) == 1, where
 
     # cleanup: the keystore and a file next to it.
     assert run("cleanup", KEYSTORE_FILE=keystore, CLEANUP_PATHS=str(manifest)) == 0
