@@ -8,11 +8,15 @@ Shared GitHub Actions, local lint hooks, and adoption templates for `asleep-ai` 
 |------|-------------|
 | [`release-notes/`](./release-notes/) | AI-drafted markdown release notes from a git tag range, with a deterministic commit-list fallback. |
 | [`pre-commit-changed/`](./pre-commit-changed/) | Run the caller's pre-commit hooks against event-specific changes, with full scans for lint configuration changes. |
+| [`android-signing/`](./android-signing/) | Keystore and signature steps of a signed Android build: decode the keystore, verify the APK with `apksigner`, delete the keystore and secret files. |
+| [`gradle-log-verdict/`](./gradle-log-verdict/) | Report how a Gradle job ended (`pass`, `code` or `infra`) from step outcomes and the Gradle log, so only infrastructure failures are re-run elsewhere. |
 | [`pick-runner/`](./pick-runner/) | Decide `runs-on` before jobs are queued: self-hosted labels when a matching runner is online, else a GitHub-hosted fallback. |
 
 ## Local hooks
 
 [`ktfmt/`](./ktfmt/) provides a shared pre-commit hook using KotlinLang style and the caller's `.editorconfig`. Its optional content-hash baseline supports gradual adoption: untouched legacy files stay exempt, edited files must pass, and routine refreshes cannot add exemptions.
+
+[`detekt/`](./detekt/) provides a shared pre-commit hook that runs `detekt-cli` on the selected Kotlin files with the caller's configuration, baseline and plugin jars.
 
 The CI action runs the same `.pre-commit-config.yaml` used locally. Formatting rules, tool versions, detekt configuration, and Gradle task selection remain caller-owned. See each component's README for setup and migration examples.
 

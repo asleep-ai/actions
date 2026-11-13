@@ -45,3 +45,13 @@
   always_run: true
   require_serial: true
   stages: [manual]
+
+- id: detekt
+  name: detekt
+  description: Check Kotlin files with detekt-cli, using the caller's config/detekt.yml on top of detekt's defaults and config/detekt-baseline.xml when it exists.
+  entry: detekt/detekt.sh
+  language: unsupported_script
+  minimum_pre_commit_version: '4.4.0'
+  files: '\.kts?$'
+  types: [file]
+  require_serial: true
