@@ -24,6 +24,14 @@ inputs:
       success and skipped give pass; failure and cancelled are decided from
       the log.
     required: true
+  job-status:
+    description: >-
+      Optional. The status of the job so far, taken from the job context. When
+      given, a build that passed or was skipped gives pass only if the job
+      status is success, and infra otherwise: a step named in neither outcome
+      input did not succeed. When empty, the job status is not considered.
+    required: false
+    default: ''
 
 outputs:
   verdict:
@@ -40,4 +48,5 @@ runs:
         LOG_FILE: ${{ inputs.log-file }}
         SETUP_OUTCOME: ${{ inputs.setup-outcome }}
         BUILD_OUTCOME: ${{ inputs.build-outcome }}
+        JOB_STATUS: ${{ inputs.job-status }}
       run: python3 "$GITHUB_ACTION_PATH/verdict.py"

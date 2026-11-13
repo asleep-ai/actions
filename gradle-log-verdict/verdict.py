@@ -16,11 +16,18 @@ ever interpolated into a shell command.
 
 Order:
 - Any setup outcome other than success -> infra.
-- The build outcome is success or skipped -> pass.
-- Otherwise the Gradle log decides (see classify).
+- The build outcome is success or skipped -> pass, unless the job status was
+  given and is not success: then a step named in neither input kept the build
+  from running, or failed after it, and the verdict is infra.
+- Otherwise the Gradle log decides (see classify). A log that is missing or
+  cannot be read is infra.
 - Invalid inputs fail the step: they are caller bugs, not a verdict. An outcome
   that is not one GitHub reports is most often a misspelt step id, which reads
   as an empty string.
+
+The verdict speaks for the steps it was given. Without the job status, a step
+outside both inputs that fails leaves the build skipped or successful, and the
+verdict is pass while the job failed.
 """
 from __future__ import annotations
 
@@ -32,10 +39,16 @@ from typing import Mapping
 
 # What steps.<id>.outcome can be.
 OUTCOMES = ("success", "failure", "cancelled", "skipped")
+# What job.status can be.
+JOB_STATUSES = ("success", "failure", "cancelled")
+
+# Colour and cursor sequences of a console that was not plain. With them in
+# place no line would start with "BUILD FAILED", and every failure would be infra.
+ANSI_SEQUENCE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 INFRA_PATTERNS = [
-    # Memory
-    r"OutOfMemoryError",
+    # Memory. A whole word: a class of the project may be called OutOfMemoryErrorHandler.
+    r"\bOutOfMemoryError\b",
     r"Java heap space",
     r"GC overhead limit exceeded",
     r"Gradle build daemon disappeared unexpectedly",
@@ -47,7 +60,8 @@ INFRA_PATTERNS = [
     # Host SDK
     r"SDK location not found",
     r"Failed to find (target with hash string|Build Tools revision)",
-    r"have not been accepted",
+    # With the noun: "have not been accepted" alone is also what the name of a failed test may say about terms.
+    r"licen[cs]es have not been accepted",
 ]
 
 # A coordinate that every repository answered "not found" for: a misspelled or nonexistent dependency the change
@@ -88,6 +102,8 @@ def first_match(patterns: list[str], text: str) -> str | None:
 
 def classify(text: str) -> tuple[str, str]:
     """Return `code` or `infra` for the log of a failed Gradle run, and the rule that decided."""
+    # A carriage return starts a line too: a rich console redraws lines with it.
+    text = ANSI_SEQUENCE.sub("", text).replace("\r", "\n")
     pattern = first_match(INFRA_PATTERNS, text)
     if pattern:
         return "infra", f"the log matches {pattern!r}"
@@ -114,14 +130,23 @@ def parse_outcomes(raw: str, name: str) -> list[str]:
     return values
 
 
-def decide(setup: list[str], build: str, log: Path) -> tuple[str, str]:
+def decide(setup: list[str], build: str, log: Path, job_status: str = "") -> tuple[str, str]:
     if any(outcome != "success" for outcome in setup):
         return "infra", "a setup step did not succeed"
     if build in ("success", "skipped"):
+        if job_status and job_status != "success":
+            # Not the build and not a setup step the caller named. Which step,
+            # and why, is unknown, so the doubtful case leans to infra.
+            return "infra", (f"the build step was {build} but the job status is {job_status}: "
+                             "a step named in neither setup-outcome nor build-outcome did not succeed")
         return "pass", f"the build step was {build}"
     if not log.is_file():
         return "infra", "there is no Gradle log: the job failed before Gradle wrote anything"
-    return classify(log.read_text(errors="replace"))
+    try:
+        text = log.read_text(errors="replace")
+    except OSError as exc:
+        return "infra", f"the Gradle log could not be read ({type(exc).__name__})"
+    return classify(text)
 
 
 def escape(text: str) -> str:
@@ -138,12 +163,17 @@ def main(env: Mapping[str, str] = os.environ) -> int:
         log_file = env.get("LOG_FILE", "")
         if not log_file.strip():
             raise InputError("log-file must not be empty")
+        # Optional: an empty value means the caller did not pass it.
+        job_status = env.get("JOB_STATUS", "").strip()
+        if job_status and job_status not in JOB_STATUSES:
+            raise InputError(f"job-status must be one of {', '.join(JOB_STATUSES)}, or empty, got {job_status!r}")
     except InputError as exc:
         print(f"::error title=gradle-log-verdict::{escape(str(exc))}")
         return 1
 
-    verdict, reason = decide(setup, build[0], Path(log_file))
-    print(f"verdict={verdict} (setup: {' '.join(setup)}, build: {build[0]}): {reason}")
+    verdict, reason = decide(setup, build[0], Path(log_file), job_status)
+    job = f", job: {job_status}" if job_status else ""
+    print(f"verdict={verdict} (setup: {' '.join(setup)}, build: {build[0]}{job}): {reason}")
 
     output_path = env.get("GITHUB_OUTPUT")
     if output_path:

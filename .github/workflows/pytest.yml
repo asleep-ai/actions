@@ -32,24 +32,53 @@ jobs:
       - name: Run tests
         run: uv run --with pytest --with openai python -m pytest release-notes -q
 
-      - name: Run gradle-log-verdict tests
+  # One job per component: a failure in one does not hide the others.
+  gradle-log-verdict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Validate composite action metadata
+        run: uvx check-jsonschema --schemafile https://json.schemastore.org/github-action.json gradle-log-verdict/action.yml
+
+      - name: Run tests
         run: uv run --with pytest python -m pytest gradle-log-verdict -q
 
       # Load the action the way a caller does: an action.yml GitHub cannot load
       # passes actionlint and the unit tests. The log file does not exist, so a
       # failed build is infra.
-      - name: Run the gradle-log-verdict action
-        id: verdict
+      - name: Run the action on a failed build
+        id: failed
         uses: ./gradle-log-verdict
         with:
           log-file: ${{ runner.temp }}/no-gradle.log
           setup-outcome: success success
           build-outcome: failure
 
-      - name: Check the gradle-log-verdict output
+      # A skipped build in a job that has succeeded so far is pass.
+      - name: Run the action on a skipped build with the job status
+        id: skipped
+        uses: ./gradle-log-verdict
+        with:
+          log-file: ${{ runner.temp }}/no-gradle.log
+          setup-outcome: success
+          build-outcome: skipped
+          job-status: ${{ job.status }}
+
+      - name: Check the verdicts
         env:
-          VERDICT: ${{ steps.verdict.outputs.verdict }}
+          FAILED: ${{ steps.failed.outputs.verdict }}
+          SKIPPED: ${{ steps.skipped.outputs.verdict }}
         run: |
           set -euo pipefail
-          echo "verdict=$VERDICT"
-          [[ "$VERDICT" == infra ]]
+          echo "failed=$FAILED skipped=$SKIPPED"
+          [[ "$FAILED" == infra ]]
+          [[ "$SKIPPED" == pass ]]

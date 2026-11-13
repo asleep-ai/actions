@@ -104,6 +104,17 @@ def test_missing_dependency_is_code():
     assert classify(log) == "code"
 
 
+def test_missing_dependency_next_to_network_messages_is_code():
+    # The repositories that answered "not found" decide, even when another one was unreachable in the same run.
+    log = ("> Could not resolve all files for configuration ':app:debugRuntimeClasspath'.\n"
+           "   > Could not find com.example:no-such-lib:1.0.0.\n"
+           "   > Could not resolve com.example:other-lib:2.0.0.\n"
+           "      > Could not GET 'https://repo.example.com/other-lib-2.0.0.pom'. Received status code 503 from server\n"
+           "      > Read timed out\n"
+           "\nBUILD FAILED in 1m 5s\n")
+    assert classify(log) == "code"
+
+
 def test_other_resolution_failure_is_infra():
     # No missing coordinate and no network message: the dependency cache of the host, not the change.
     log = ("> Could not resolve all files for configuration ':app:debugRuntimeClasspath'.\n"
@@ -122,6 +133,31 @@ def test_failing_test_that_prints_a_network_exception_is_code():
     assert classify(log) == "code"
 
 
+def test_failed_test_task_alone_counts_as_a_failed_test():
+    # No "FooTest > bar FAILED" and no test count in the log: the failed test task is enough.
+    log = ("> Task :data:testDebugUnitTest FAILED\n"
+           "java.net.UnknownHostException: api.example.com\n\nBUILD FAILED in 2m\n")
+    assert classify(log) == "code"
+    # The same message from a task that is not a test task is the host's.
+    assert classify(log.replace(":data:testDebugUnitTest", ":data:generateApiClient")) == "infra"
+
+
+def test_failed_test_named_after_unaccepted_terms_is_code():
+    # Only the SDK licence message is infra, not every "have not been accepted".
+    log = ("> Task :feature:terms:testDebugUnitTest FAILED\n\n"
+           "TermsViewModelTest > blocks sign-up when terms have not been accepted FAILED\n"
+           "    java.lang.AssertionError at TermsViewModelTest.kt:31\n\n"
+           "4 tests completed, 1 failed\n\nBUILD FAILED in 3m\n")
+    assert classify(log) == "code"
+
+
+def test_identifier_that_contains_an_error_name_is_code():
+    log = ("> Task :app:compileDebugKotlin FAILED\n"
+           "e: file:///src/OutOfMemoryErrorHandler.kt:12:9 Unresolved reference: OutOfMemoryErrorHandler\n"
+           "\nBUILD FAILED in 50s\n")
+    assert classify(log) == "code"
+
+
 def test_failing_test_with_heap_exhaustion_is_infra():
     # Memory, disk and SDK messages stay infra even next to a failed test.
     log = "FooTest > bar FAILED\n    java.lang.OutOfMemoryError: Java heap space\n\nBUILD FAILED in 4m\n"
@@ -136,8 +172,9 @@ def test_missing_sdk_is_infra():
     assert classify("SDK location not found. Define a valid SDK location\n\nBUILD FAILED\n") == "infra"
 
 
-def test_unaccepted_sdk_licence_is_infra():
-    log = ("> Failed to install the following Android SDK packages as some licences have not been accepted.\n"
+@pytest.mark.parametrize("word", ["licences", "licenses"])
+def test_unaccepted_sdk_licence_is_infra(word):
+    log = (f"> Failed to install the following Android SDK packages as some {word} have not been accepted.\n"
            "\nBUILD FAILED in 12s\n")
     assert classify(log) == "infra"
 
@@ -153,6 +190,29 @@ def test_unfinished_run_is_infra():
 
 def test_verdict_must_start_a_line():
     assert classify("> Task :app:check\nthe words BUILD FAILED inside a test name\n") == "infra"
+
+
+@pytest.mark.parametrize(("log", "expected"), [
+    # Colours around the verdict line: without stripping them no line starts with BUILD.
+    ("> Task :app:compileDebugKotlin FAILED\ne: Unresolved reference: foo\n\n\x1b[31mBUILD FAILED\x1b[0m in 2m 3s\n", "code"),
+    ("\x1b[1;32mBUILD SUCCESSFUL\x1b[0;39m in 5m 33s\n", "code"),
+    # A coloured failed-test line still guards the network messages.
+    ("\x1b[0K\x1b[1mRetryPolicyTest > maps unknown host\x1b[m \x1b[31mFAILED\x1b[39m\n"
+     "    java.net.UnknownHostException at RetryPolicyTest.kt:42\n\n\x1b[31mBUILD FAILED\x1b[0m in 3m\n", "code"),
+    # A rich console redraws the progress line with a carriage return before the verdict.
+    ("<===========--> 87% EXECUTING [2m 1s]\r\x1b[2K\x1b[31;1mBUILD FAILED\x1b[0;39m in 2m 3s\n", "code"),
+    ("\x1b[31mjava.io.IOException: No space left on device\x1b[0m\n\n\x1b[31mBUILD FAILED\x1b[0m in 3m\n", "infra"),
+    ("\x1b[33m> Task :app:lintAnalyzeDebug\x1b[0m\n", "infra"),
+])
+def test_console_colours_do_not_change_the_verdict(log, expected):
+    assert classify(log) == expected
+
+
+def test_windows_line_endings_do_not_change_the_verdict():
+    log = ("> Task :feature:home:testDebugUnitTest FAILED\n\nRetryPolicyTest > maps unknown host FAILED\n"
+           "    java.net.UnknownHostException at RetryPolicyTest.kt:42\n\nBUILD FAILED in 3m\n")
+    assert classify(log.replace("\n", "\r\n")) == "code"
+    assert classify(COMPILE_ERROR.replace("\n", "\r\n")) == "code"
 
 
 def test_classify_names_the_rule_that_decided():
@@ -197,6 +257,49 @@ def test_missing_log_is_infra(tmp_path, capsys):
     assert "there is no Gradle log" in capsys.readouterr().out
 
 
+def test_log_that_cannot_be_read_is_infra(tmp_path, capsys):
+    if os.geteuid() == 0:
+        pytest.skip("root reads any file")
+    log = tmp_path / "gradle.log"
+    log.write_text(COMPILE_ERROR)
+    log.chmod(0)
+
+    # No traceback and no missing output: what cannot be read cannot be blamed on the change.
+    assert run_main(tmp_path) == (0, {"verdict": "infra"})
+    assert "the Gradle log could not be read (PermissionError)" in capsys.readouterr().out
+
+
+# The job status: steps the caller named in neither outcome input.
+
+
+@pytest.mark.parametrize("build", ["success", "skipped"])
+@pytest.mark.parametrize("job", ["failure", "cancelled"])
+def test_build_that_passed_in_a_job_that_did_not_is_infra(tmp_path, capsys, build, job):
+    # A step outside setup-outcome failed before the build, which was then
+    # skipped, or a step after the build failed. The job failed either way.
+    assert run_main(tmp_path, COMPILE_ERROR, build=build, JOB_STATUS=job) == (0, {"verdict": "infra"})
+    printed = capsys.readouterr().out
+    assert f"verdict=infra (setup: success success, build: {build}, job: {job})" in printed
+    assert "a step named in neither setup-outcome nor build-outcome did not succeed" in printed
+
+
+@pytest.mark.parametrize("build", ["success", "skipped"])
+@pytest.mark.parametrize("job", ["success", "", " \n"])
+def test_build_that_passed_is_pass_when_the_job_succeeded_or_was_not_given(tmp_path, build, job):
+    # Without job-status the verdict is pass even if the job failed elsewhere:
+    # the caller then has to list every step or look at the job result.
+    assert run_main(tmp_path, OUT_OF_MEMORY, build=build, JOB_STATUS=job) == (0, {"verdict": "pass"})
+
+
+@pytest.mark.parametrize("job", ["failure", "cancelled", "success"])
+def test_job_status_does_not_change_a_verdict_read_from_the_log(tmp_path, job):
+    assert run_main(tmp_path, COMPILE_ERROR, JOB_STATUS=job) == (0, {"verdict": "code"})
+    (tmp_path / "output").unlink()
+    assert run_main(tmp_path, OUT_OF_MEMORY, JOB_STATUS=job) == (0, {"verdict": "infra"})
+    (tmp_path / "output").unlink()
+    assert run_main(tmp_path, COMPILE_ERROR, setup="failure", JOB_STATUS=job) == (0, {"verdict": "infra"})
+
+
 def test_cancelled_build_is_decided_from_the_log(tmp_path):
     # A build cut off by the job timeout has no verdict line; one that failed first has.
     assert run_main(tmp_path, "> Task :app:lintAnalyzeDebug\n", build="cancelled")[1] == {"verdict": "infra"}
@@ -233,6 +336,10 @@ def test_the_decision_is_printed(tmp_path, capsys):
     ({"BUILD_OUTCOME": "success failure"}, "build-outcome must be a single outcome"),
     ({"LOG_FILE": ""}, "log-file must not be empty"),
     ({"LOG_FILE": "  "}, "log-file must not be empty"),
+    # job.status is never skipped; steps.<id>.outcome is.
+    ({"JOB_STATUS": "skipped"}, "job-status must be one of success, failure, cancelled, or empty"),
+    ({"JOB_STATUS": "Success"}, "job-status must be one of"),
+    ({"JOB_STATUS": "success failure"}, "job-status must be one of"),
 ])
 def test_invalid_inputs_fail_the_step(tmp_path, capsys, overrides, message):
     code, out = run_main(tmp_path, COMPILE_ERROR, **overrides)
@@ -266,7 +373,17 @@ def test_script_runs_as_the_action_runs_it(tmp_path):
 def test_action_yml_expressions_only_where_evaluated_on_purpose():
     # GitHub evaluates ${{ }} anywhere in action.yml, descriptions included, and
     # refuses to load the action when one does not parse.
-    allowed = re.compile(r"^\s*(default|value|[A-Z_]+):\s*\$\{\{")
+    allowed = re.compile(r"^\s*(default|value|[A-Z_0-9]+):\s*\$\{\{")
     text = Path(__file__).with_name("action.yml").read_text()
     offending = [line for line in text.splitlines() if "${{" in line and not allowed.match(line)]
     assert offending == []
+
+
+def test_action_yml_passes_every_input_to_the_script():
+    text = Path(__file__).with_name("action.yml").read_text()
+    declared = set(re.findall(r"^  ([a-z0-9-]+):$", text.split("\ninputs:\n")[1].split("\noutputs:\n")[0], re.MULTILINE))
+    passed = dict(re.findall(r"^        ([A-Z0-9_]+): \$\{\{ inputs\.([a-z0-9-]+) \}\}$", text, re.MULTILINE))
+    script = SCRIPT.read_text()
+
+    assert set(passed.values()) == declared
+    assert [name for name in passed if f'env.get("{name}"' not in script] == []
