@@ -32,8 +32,8 @@ inputs:
 outputs:
   runs-on:
     description: >-
-      runs-on as JSON, for `runs-on: ${{ fromJSON(...) }}`: the labels array or
-      the fallback.
+      runs-on as JSON, to pass through fromJSON() into a job's runs-on: the
+      labels array or the fallback.
     value: ${{ steps.pick.outputs.runs-on }}
   self-hosted:
     description: "'true' when the self-hosted labels were picked, else 'false'."

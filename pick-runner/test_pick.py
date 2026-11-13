@@ -169,3 +169,14 @@ def test_warning_text_cannot_break_out_of_the_command():
 def test_summary_written(tmp_path):
     run_main(tmp_path, pages({"runners": [runner()]}))
     assert "pick-runner: **self-hosted**" in (tmp_path / "summary").read_text()
+
+
+def test_action_yml_expressions_only_where_evaluated_on_purpose():
+    # GitHub evaluates ${{ }} anywhere in action.yml, descriptions included, and
+    # refuses to load the action when one does not parse.
+    import re
+
+    allowed = re.compile(r"^\s*(default|value|[A-Z_]+):\s*\$\{\{")
+    text = (Path(__file__).with_name("action.yml")).read_text()
+    offending = [line for line in text.splitlines() if "${{" in line and not allowed.match(line)]
+    assert offending == []
