@@ -168,6 +168,16 @@ def test_full_disk_is_infra():
     assert classify("java.io.IOException: No space left on device\n\nBUILD FAILED in 3m\n") == "infra"
 
 
+def test_build_cache_entry_that_went_away_is_infra():
+    # Two builds on one host share the local build cache; the entry one of them reads can be gone when it opens it.
+    log = ("> Task :domain:generateDebugResValues FAILED\n\n* What went wrong:\n"
+           "Execution failed for task ':domain:generateDebugResValues'.\n"
+           "> Failed to load cache entry 3117925651ee944da25f09355b203ccd for task ':domain:generateDebugResValues': "
+           "Could not load from local cache: /home/runner/.gradle/caches/build-cache-1/"
+           "3117925651ee944da25f09355b203ccd (No such file or directory)\n\nBUILD FAILED in 1m 10s\n")
+    assert classify(log) == "infra"
+
+
 def test_missing_sdk_is_infra():
     assert classify("SDK location not found. Define a valid SDK location\n\nBUILD FAILED\n") == "infra"
 

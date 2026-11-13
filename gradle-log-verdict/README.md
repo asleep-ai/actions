@@ -100,13 +100,14 @@ The log of a failed build, again first match first:
 |------------------|---------|
 | Memory exhaustion (`OutOfMemoryError`, `Java heap space`, `GC overhead limit exceeded`), a Gradle daemon that disappeared, a worker process killed with exit value 137 | `infra` |
 | `No space left on device` | `infra` |
+| `Failed to load cache entry`: a build cache entry that could not be read, as when builds on one host share the local build cache | `infra` |
 | A missing Android SDK, platform or build-tools revision, or SDK `licences have not been accepted` (either spelling) | `infra` |
 | `Could not find <group>:<name>:<version>`: a dependency no repository has | `code` |
 | No failed test, and a dependency resolution failure (`Could not resolve all`), a failed download (`Could not GET`, `HEAD` or `download`), a timeout, a reset connection, an unknown host, an HTTP 5xx status, or `command not found` | `infra` |
 | A line starting with `BUILD FAILED` or `BUILD SUCCESSFUL` | `code` |
 | None of the above: Gradle never finished | `infra` |
 
-- Network and tool messages count only when no test failed, because a failing unit test can print them too: a test may exercise network errors, and Gradle prints a failed test's exception class. Memory, disk and SDK messages are `infra` even next to a failed test.
+- Network and tool messages count only when no test failed, because a failing unit test can print them too: a test may exercise network errors, and Gradle prints a failed test's exception class. Memory, disk, build cache and SDK messages are `infra` even next to a failed test.
 - `BUILD SUCCESSFUL` in the log of a failed step is `code`: Gradle finished on this host, and the step failed in a check that ran after it.
 - A dependency resolution failure that names no missing coordinate is `infra`. It is an outage or a damaged or locked dependency cache far more often than the change; when it is the change (a variant no dependency offers, a version conflict), the cost is one extra run.
 - The messages are searched in the whole log, so the name of a failed test or an identifier in a compile error can match one. `OutOfMemoryError` is matched as a whole word and the licence message with its noun to keep that rare; when it still happens, the cost is again one extra run.
