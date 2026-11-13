@@ -228,6 +228,71 @@ def test_result_reads_every_job_of_both_runs(entry):
             assert env[name] == f"${{{{ needs.{run}.outputs.{job}-verdict }}}}"
 
 
+# --- checkout -----------------------------------------------------------------
+
+
+def checkout_step(job: dict) -> dict:
+    (checkout,) = [item for item in job["steps"] if item.get("id") == "checkout"]
+    return checkout
+
+
+@pytest.mark.parametrize("job", ["code-style", "verify", "release-build"])
+def test_stale_git_locks_are_removed_before_checkout_on_self_hosted_runners(jobs, job):
+    first, second = jobs[job]["steps"][:2]
+    assert first["name"] == "Remove stale git lock files"
+    assert first["if"] == "${{ runner.environment == 'self-hosted' }}"
+    assert second is checkout_step(jobs[job])
+    assert first["run"] == jobs["verify"]["steps"][0]["run"]
+
+
+def test_stale_git_locks_of_the_repository_and_its_submodules_are_removed(jobs, tmp_path):
+    workspace = tmp_path / "work folder"
+    git = workspace / ".git"
+    submodule = git / "modules" / "external" / "content assets"
+    locks = [
+        git / "index.lock",
+        git / "shallow.lock",
+        git / "refs" / "heads" / "main.lock",
+        submodule / "index.lock",
+        submodule / "config.lock",
+        submodule / "modules" / "nested" / "HEAD.lock",
+    ]
+    kept = [
+        git / "index",
+        git / "config",
+        submodule / "index",
+        submodule / "HEAD",
+        # Lock files of package managers are part of the checkout, not git's.
+        workspace / "yarn.lock",
+        workspace / "external" / "content assets" / "Podfile.lock",
+    ]
+    for path in locks + kept:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+    # A directory is never a lock.
+    (git / "modules" / "odd.lock").mkdir()
+    script = jobs["verify"]["steps"][0]["run"]
+    result = run_script(script, {"GITHUB_WORKSPACE": str(workspace)}, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert [path for path in locks if path.exists()] == []
+    assert [path for path in kept if not path.exists()] == []
+    assert (git / "modules" / "odd.lock").is_dir()
+    assert "Removing .git/modules/external/content assets/index.lock, left by an earlier job" in result.stdout
+    assert result.stdout.count("Removing ") == len(locks)
+
+
+def test_stale_git_lock_removal_does_nothing_in_a_fresh_work_folder(jobs, tmp_path):
+    script = jobs["verify"]["steps"][0]["run"]
+    for workspace in (tmp_path / "empty", tmp_path / "clean"):
+        workspace.mkdir()
+    (tmp_path / "clean" / ".git").mkdir()
+    (tmp_path / "clean" / ".git" / "index").write_text("")
+    for workspace in (tmp_path / "empty", tmp_path / "clean"):
+        result = run_script(script, {"GITHUB_WORKSPACE": str(workspace)}, tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == ""
+
+
 # --- the Gradle jobs' steps ---------------------------------------------------
 
 
@@ -427,7 +492,9 @@ def run_gradle(jobs, tmp_path, job: str, runner: str, outcome: str = "SUCCESSFUL
     env = {
         "GRADLE_TASK": overrides.pop("task", "ciVerify" if job == "verify" else "ciReleaseBuild"),
         "GRADLE_ARGS": arguments,
+        "GITHUB_ACTOR": "octocat",
         "GITHUB_TOKEN": "token-for-packages",
+        "TOKEN_SOURCE": "GIT_TOKEN",
         "RUNNER_KIND": runner,
         "MAX_WORKERS": "32",
         "GRADLE_JVMARGS": "-Xmx16g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8",
@@ -445,10 +512,23 @@ def test_gradle_on_a_github_hosted_runner_adds_nothing(jobs, tmp_path):
     result, arguments, log = run_gradle(jobs, tmp_path, "verify", "github-hosted")
     assert result.returncode == 0, result.stderr
     assert arguments == ["ciVerify", "--continue"]
-    # gradle-log-verdict reads the copy; the job log shows the same lines.
-    assert log.read_text() == result.stdout
+    # gradle-log-verdict reads the copy; the job log shows the same lines after the step's own.
+    assert result.stdout.endswith(log.read_text())
     assert "BUILD SUCCESSFUL" in log.read_text()
     assert "token=token-for-packages" in log.read_text()
+
+
+@pytest.mark.parametrize("job", ["verify", "release-build"])
+def test_gradle_gets_git_token_and_the_log_names_the_token_source(jobs, tmp_path, job):
+    env = step(jobs[job], "Run Gradle")["env"]
+    # Gradle reads GITHUB_ACTOR and GITHUB_TOKEN as GitHub Packages credentials.
+    assert env["GITHUB_TOKEN"] == "${{ secrets.GIT_TOKEN || github.token }}"
+    assert env["TOKEN_SOURCE"].startswith("${{ secrets.GIT_TOKEN != '' && 'GIT_TOKEN' || 'the job token")
+    result, _, log = run_gradle(jobs, tmp_path, job, "github-hosted")
+    line = "GitHub Packages credentials for Gradle: GITHUB_ACTOR=octocat, GITHUB_TOKEN from GIT_TOKEN.\n"
+    assert result.stdout.startswith(line)
+    # The token itself is printed only by the gradlew stand-in.
+    assert "token-for-packages" not in line and line not in log.read_text()
 
 
 def test_gradle_on_a_self_hosted_runner_limits_workers_and_memory(jobs, tmp_path):
@@ -547,7 +627,7 @@ def test_code_style_reports_a_verdict_for_every_ending(jobs, tmp_path):
         "SETUP": "${{ steps.checkout.outcome }} ${{ steps.mise.outcome }}",
         "CHECK": "${{ steps.pre-commit.outcome }}",
     }
-    assert [item.get("id") for item in job["steps"]] == ["checkout", "mise", "pre-commit", "verdict"]
+    assert [item.get("id") for item in job["steps"][1:]] == ["checkout", "mise", "pre-commit", "verdict"]
     expected = {
         ("success success", "success"): "pass",
         ("success success", "failure"): "code",
@@ -653,11 +733,11 @@ def test_secrets_are_optional_and_reach_only_the_steps_that_need_them(entry, job
             assert name in ("verify", "release-build")
             assert item.get("id") in ("checkout", "build"), item
     for job in ("verify", "release-build"):
-        checkout = jobs[job]["steps"][0]["with"]
+        checkout = checkout_step(jobs[job])["with"]
         # paths-filter needs git credentials on a push only; a pull request's code must not find the token.
         assert checkout["persist-credentials"] == "${{ github.event_name == 'push' }}"
         assert checkout["token"] == "${{ secrets.GIT_TOKEN || github.token }}"
-    assert jobs["code-style"]["steps"][0]["with"]["persist-credentials"] is False
+    assert checkout_step(jobs["code-style"])["with"]["persist-credentials"] is False
     assert "secrets." not in str(jobs["code-style"])
 
 

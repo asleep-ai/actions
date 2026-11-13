@@ -115,7 +115,7 @@ Both are optional, and the workflow runs without either.
 | `RUNNER_READ_TOKEN` | `pick-runner`'s token: the organization permission **Self-hosted runners: Read**. Without it the self-hosted labels are used unchecked, with a warning. |
 | `GIT_TOKEN` | Checkout of private submodules, and `GITHUB_TOKEN` for the Gradle step so private GitHub Packages of other repositories resolve. Without it both use the job token, which reads only the calling repository. |
 
-`GIT_TOKEN` is passed to `actions/checkout` in the Gradle jobs and to the step that runs Gradle. No other step sees it. The clone keeps the checkout token only on a `push` event, where the path filter fetches the previous commit with git; on a pull request the token is not left in the clone for the pull request's code to read.
+`GIT_TOKEN` is passed to `actions/checkout` in the Gradle jobs and to the step that runs Gradle. No other step sees it. `secrets: inherit` reaches only the workflow it is written on, so `android-pr-check.yml` hands `GIT_TOKEN` on to its jobs by name. The Gradle step prints which token it was given (`GITHUB_TOKEN from GIT_TOKEN` or `from the job token`), which is the first thing to read when a private package does not resolve. The clone keeps the checkout token only on a `push` event, where the path filter fetches the previous commit with git; on a pull request the token is not left in the clone for the pull request's code to read.
 
 No signing secret is used. Pull requests from forks and from Dependabot receive no secrets, and they build the same way; a repository that needs `GIT_TOKEN` to resolve its dependencies has to provide it as a Dependabot secret as well.
 
@@ -152,6 +152,7 @@ Steps that differ on a self-hosted runner (`runner.environment == 'self-hosted'`
 
 - **Memory.** Gradle starts one worker per core by default, and a `gradle.properties` heap is sized for a small machine. On a host with many cores, that combination runs out of heap. The Gradle jobs therefore pass `--max-workers`, `org.gradle.jvmargs` and `kotlin.daemon.jvmargs` from the three `self-hosted-*` inputs. Size them for the number of runners that share one host: each concurrent build takes the Gradle heap plus the Kotlin daemon heap plus its test workers.
 - **Daemon.** `--no-daemon`. Runners on one host share a Gradle user home, so a build could attach to another job's idle daemon, which that job's runner kills when the job ends.
+- **Work folder.** The runner keeps its work folder between jobs, and a job cancelled while git is writing leaves a lock file behind, in the repository or in a submodule. Every later checkout in that folder would fail on it (`index.lock: File exists`). Each job therefore deletes the `*.lock` files under the work folder's `.git` before checkout; a runner runs one job at a time, so a lock found there has no owner. `actions/checkout` itself clears only the repository's own `index.lock` and `shallow.lock`.
 - **Caches.** `setup-gradle` and `mise-action` skip the Actions cache: the runner keeps its Gradle user home and installed tools between jobs, so restoring and saving them only costs time. On GitHub-hosted runners both caches are read and written.
 
 `pick-runner` and `result` always run on `ubuntu-latest`, so the choice and the outcome are reported even when the self-hosted host is down.

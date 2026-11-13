@@ -118,6 +118,23 @@ jobs:
     outputs:
       verdict: ${{ steps.verdict.outputs.verdict }}
     steps:
+      # A self-hosted runner keeps its work folder between jobs. A job that is
+      # cancelled while git is writing leaves a lock file behind, in the
+      # repository or in a submodule, and every later checkout in that folder
+      # fails on it ("index.lock: File exists"). A runner runs one job at a
+      # time, so a lock found before checkout has no owner. actions/checkout
+      # clears only the repository's own index.lock and shallow.lock.
+      - name: Remove stale git lock files
+        if: ${{ runner.environment == 'self-hosted' }}
+        run: |
+          set -euo pipefail
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            while IFS= read -r -d '' lock; do
+              echo "Removing ${lock#"$GITHUB_WORKSPACE/"}, left by an earlier job on this runner."
+              rm -f -- "$lock"
+            done < <(find "$GITHUB_WORKSPACE/.git" -type f -name '*.lock' -print0)
+          fi
+
       # The pull request head, not the merge commit, with full history:
       # pre-commit-changed compares the head with its merge base.
       - uses: actions/checkout@v7
@@ -180,6 +197,17 @@ jobs:
     outputs:
       verdict: ${{ steps.verdict.outputs.verdict }}
     steps:
+      - name: Remove stale git lock files
+        if: ${{ runner.environment == 'self-hosted' }}
+        run: |
+          set -euo pipefail
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            while IFS= read -r -d '' lock; do
+              echo "Removing ${lock#"$GITHUB_WORKSPACE/"}, left by an earlier job on this runner."
+              rm -f -- "$lock"
+            done < <(find "$GITHUB_WORKSPACE/.git" -type f -name '*.lock' -print0)
+          fi
+
       # GIT_TOKEN reaches private submodules; the job token is used when the
       # caller has none. The token stays in the clone only on a push, where
       # paths-filter fetches the previous commit with git; for a pull request
@@ -345,6 +373,7 @@ jobs:
           # GitHub Packages credentials. The job token cannot read packages of
           # other repositories, so GIT_TOKEN wins when the caller has it.
           GITHUB_TOKEN: ${{ secrets.GIT_TOKEN || github.token }}
+          TOKEN_SOURCE: ${{ secrets.GIT_TOKEN != '' && 'GIT_TOKEN' || 'the job token (GIT_TOKEN did not reach this job)' }}
           RUNNER_KIND: ${{ runner.environment }}
           MAX_WORKERS: ${{ inputs.self-hosted-max-workers }}
           GRADLE_JVMARGS: ${{ inputs.self-hosted-gradle-jvmargs }}
@@ -370,6 +399,9 @@ jobs:
               extra+=("-Pkotlin.daemon.jvmargs=$KOTLIN_DAEMON_JVMARGS")
             fi
           fi
+          # Which token Gradle gets decides whether private packages resolve,
+          # so the log of a failed resolution says which one it was.
+          echo "GitHub Packages credentials for Gradle: GITHUB_ACTOR=$GITHUB_ACTOR, GITHUB_TOKEN from $TOKEN_SOURCE."
           # The copy in the temp directory is what gradle-log-verdict reads.
           set -f
           # shellcheck disable=SC2086 # word splitting is intended: both are argument lists
@@ -414,6 +446,17 @@ jobs:
     outputs:
       verdict: ${{ steps.verdict.outputs.verdict }}
     steps:
+      - name: Remove stale git lock files
+        if: ${{ runner.environment == 'self-hosted' }}
+        run: |
+          set -euo pipefail
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            while IFS= read -r -d '' lock; do
+              echo "Removing ${lock#"$GITHUB_WORKSPACE/"}, left by an earlier job on this runner."
+              rm -f -- "$lock"
+            done < <(find "$GITHUB_WORKSPACE/.git" -type f -name '*.lock' -print0)
+          fi
+
       - uses: actions/checkout@v7
         id: checkout
         with:
@@ -558,6 +601,7 @@ jobs:
           GRADLE_TASK: ${{ inputs.release-build-task }}
           GRADLE_ARGS: ${{ inputs.release-build-args }}
           GITHUB_TOKEN: ${{ secrets.GIT_TOKEN || github.token }}
+          TOKEN_SOURCE: ${{ secrets.GIT_TOKEN != '' && 'GIT_TOKEN' || 'the job token (GIT_TOKEN did not reach this job)' }}
           RUNNER_KIND: ${{ runner.environment }}
           MAX_WORKERS: ${{ inputs.self-hosted-max-workers }}
           GRADLE_JVMARGS: ${{ inputs.self-hosted-gradle-jvmargs }}
@@ -583,6 +627,9 @@ jobs:
               extra+=("-Pkotlin.daemon.jvmargs=$KOTLIN_DAEMON_JVMARGS")
             fi
           fi
+          # Which token Gradle gets decides whether private packages resolve,
+          # so the log of a failed resolution says which one it was.
+          echo "GitHub Packages credentials for Gradle: GITHUB_ACTOR=$GITHUB_ACTOR, GITHUB_TOKEN from $TOKEN_SOURCE."
           # The copy in the temp directory is what gradle-log-verdict reads.
           set -f
           # shellcheck disable=SC2086 # word splitting is intended: both are argument lists
