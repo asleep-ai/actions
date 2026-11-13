@@ -10,6 +10,7 @@ Shared GitHub Actions, local lint hooks, and adoption templates for `asleep-ai` 
 | [`pre-commit-changed/`](./pre-commit-changed/) | Run the caller's pre-commit hooks against event-specific changes, with full scans for lint configuration changes. |
 | [`android-signing/`](./android-signing/) | Keystore and signature steps of a signed Android build: decode the keystore, verify the APK with `apksigner`, delete the keystore and secret files. |
 | [`gradle-log-verdict/`](./gradle-log-verdict/) | Report how a Gradle job ended (`pass`, `code` or `infra`) from step outcomes and the Gradle log, so only infrastructure failures are re-run elsewhere. |
+| [`pick-runner/`](./pick-runner/) | Decide `runs-on` before jobs are queued: self-hosted labels when a matching runner is online, else a GitHub-hosted fallback. |
 
 ## Local hooks
 

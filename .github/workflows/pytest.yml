@@ -6,6 +6,7 @@ on:
       - '.github/workflows/pytest.yml'
       - 'android-signing/**'
       - 'gradle-log-verdict/**'
+      - 'pick-runner/**'
       - 'release-notes/**'
   push:
     branches: [main]
@@ -13,6 +14,7 @@ on:
       - '.github/workflows/pytest.yml'
       - 'android-signing/**'
       - 'gradle-log-verdict/**'
+      - 'pick-runner/**'
       - 'release-notes/**'
   # The android-signing job verifies real APKs with every build-tools version
   # on the runner image. The image gains versions without a change here, and a
@@ -151,3 +153,46 @@ jobs:
           echo "failed=$FAILED skipped=$SKIPPED"
           [[ "$FAILED" == infra ]]
           [[ "$SKIPPED" == pass ]]
+
+  pick-runner:
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Validate composite action metadata
+        run: uvx check-jsonschema --schemafile https://json.schemastore.org/github-action.json pick-runner/action.yml
+
+      - name: Run tests
+        run: uv run --with pytest python -m pytest pick-runner -q
+
+      # Load the action the way a caller does: an action.yml GitHub cannot load
+      # passes actionlint and the unit tests. With no token the check is skipped
+      # (hence the "Runner check skipped" warning on this job), so no secret is
+      # needed.
+      - name: Run the pick-runner action
+        id: pick
+        uses: ./pick-runner
+        with:
+          labels: '["self-hosted","Linux","X64"]'
+          token: ''
+
+      - name: Check the pick-runner outputs
+        env:
+          RUNS_ON: ${{ steps.pick.outputs.runs-on }}
+          SELF_HOSTED: ${{ steps.pick.outputs.self-hosted }}
+          ONLINE_COUNT: ${{ steps.pick.outputs.online-count }}
+        run: |
+          set -euo pipefail
+          echo "runs-on=$RUNS_ON self-hosted=$SELF_HOSTED online-count=$ONLINE_COUNT"
+          [[ "$RUNS_ON" == '["self-hosted","Linux","X64"]' ]]
+          [[ "$SELF_HOSTED" == true ]]
+          [[ -z "$ONLINE_COUNT" ]]
