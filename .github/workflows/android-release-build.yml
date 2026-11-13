@@ -1,0 +1,536 @@
+name: Android release build
+
+# The build job of android-release.yml, which calls this file once on the
+# runner it picked and, after an infrastructure failure on a self-hosted
+# runner, once more on a GitHub-hosted runner. The job builds the tag with
+# ./gradlew ciRelease, signs with the caller's keystore, checks every APK the
+# build left and uploads them as one artifact for the publish job.
+#
+# This file is internal to android-release.yml: call that workflow, not this
+# one. The inputs are documented there and in android-ci/README.md.
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: 'runs-on as JSON: a label array, or a quoted runner label such as "ubuntu-latest"'
+        required: true
+        type: string
+      attempt:
+        description: >-
+          primary or fallback. Both calls share one workflow run, so the
+          artifact with the signed APKs is named android-release-apk-<attempt>.
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      tag:
+        required: true
+        type: string
+      sha:
+        description: 'The commit the tag named when the release was planned.'
+        required: true
+        type: string
+      version-name:
+        required: true
+        type: string
+      version-code:
+        required: true
+        type: string
+      java-version:
+        required: true
+        type: string
+      java-distribution:
+        required: true
+        type: string
+      checkout-submodules:
+        required: true
+        type: string
+      local-properties-secrets:
+        required: false
+        type: string
+        default: ''
+      required-secrets:
+        required: false
+        type: string
+        default: ''
+      gradle-args:
+        required: false
+        type: string
+        default: ''
+      apk-directory:
+        required: true
+        type: string
+      expected-cert-sha256:
+        required: false
+        type: string
+        default: ''
+      build-tools-version:
+        required: false
+        type: string
+        default: ''
+      build-timeout-minutes:
+        required: true
+        type: number
+      self-hosted-max-workers:
+        required: false
+        type: string
+        default: ''
+      self-hosted-gradle-jvmargs:
+        required: false
+        type: string
+        default: ''
+      self-hosted-kotlin-daemon-jvmargs:
+        required: false
+        type: string
+        default: ''
+    outputs:
+      verdict:
+        description: >-
+          pass, code or infra; empty when the job never reported (its runner
+          went away). code also stands for a missing secret or variable and
+          for APKs that cannot be released: another runner would end the same
+          way.
+        value: ${{ jobs.build.outputs.verdict }}
+
+permissions:
+  contents: read
+  packages: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.build-timeout-minutes }}
+    # The signing secrets are read from this environment when they are kept
+    # there. Its protection rules (reviewers, allowed branches and tags) apply
+    # to this job.
+    environment: ${{ inputs.environment }}
+    # No output of this job may hold text that could equal a secret: the runner
+    # drops an output that contains the value of one, a key alias for instance.
+    #
+    # code without asking gradle-log-verdict in two cases, because another
+    # runner would end the same way: a missing secret, and APKs the build left
+    # that cannot be released as they are.
+    outputs:
+      verdict: ${{ (steps.values.outcome == 'failure' || steps.apk.outputs.refused == 'true') && 'code' || steps.verdict.outputs.verdict }}
+    steps:
+      # A self-hosted runner keeps its work folder between jobs, and the jobs
+      # before this one may have built a pull request: files in the folder, git
+      # hooks and git configuration are all theirs. Nothing of that is trusted
+      # by a job that signs, so the folder is emptied before any other step
+      # runs in it, and the checkout below is a fresh clone. A GitHub-hosted
+      # runner starts empty.
+      - name: Empty the work folder
+        id: workspace
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_KIND" != self-hosted ]]; then
+            echo "Not a self-hosted runner: the work folder is new."
+            exit 0
+          fi
+          if [[ -z "${GITHUB_WORKSPACE:-}" || ! -d "$GITHUB_WORKSPACE" ]]; then
+            echo "::error::GITHUB_WORKSPACE is not a directory."
+            exit 1
+          fi
+          find "$GITHUB_WORKSPACE" -mindepth 1 -delete
+          echo "Emptied $GITHUB_WORKSPACE."
+
+      # Before anything is checked out, so a release that cannot be built
+      # stops here and names everything that is missing at once. The four
+      # signing values are always needed; the caller lists the rest. A name is
+      # looked up among the secrets and then among the variables this job can
+      # read. Only names are printed, never a value.
+      #
+      # The values that go to local.properties are written here, to a file in
+      # the job's temp directory, so that this is the only step that sees
+      # every secret. The step that needs the file moves it into place.
+      #
+      # python3 -I: the script comes from standard input, and without -I
+      # Python would look for the modules it imports in the work folder first.
+      - name: Check the secrets and variables
+        id: values
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+          VARS_JSON: ${{ toJSON(vars) }}
+          LOCAL_PROPERTIES_SECRETS: ${{ inputs.local-properties-secrets }}
+          REQUIRED_SECRETS: ${{ inputs.required-secrets }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'VALUES'
+          import json
+          import os
+          import re
+          import sys
+
+          SIGNING = ["KEYSTORE_BASE64", "KEYSTORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD"]
+          # KEYSTORE_FILE is the path of the decoded keystore, which a later step writes.
+          RESERVED = set(SIGNING) | {"KEYSTORE_FILE"}
+          NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+          def names(variable):
+              return os.environ.get(variable, "").replace(",", " ").split()
+
+
+          def escape(value):
+              # java.util.Properties reads the file as ISO-8859-1, takes a backslash as the start of
+              # an escape and drops the whitespace a value starts with. Written this way, the build
+              # reads back exactly the value that was stored.
+              escaped = []
+              for index, character in enumerate(value):
+                  if character == "\\":
+                      escaped.append("\\\\")
+                  elif character in "\n\r\t\f":
+                      escaped.append({"\n": "\\n", "\r": "\\r", "\t": "\\t", "\f": "\\f"}[character])
+                  elif character == " " and index == 0:
+                      escaped.append("\\ ")
+                  elif " " <= character <= "~":
+                      escaped.append(character)
+                  else:
+                      code = character.encode("utf-16-be").hex()
+                      escaped.append("".join("\\u" + code[i:i + 4] for i in range(0, len(code), 4)))
+              return "".join(escaped)
+
+
+          secrets = json.loads(os.environ.get("SECRETS_JSON") or "{}")
+          variables = json.loads(os.environ.get("VARS_JSON") or "{}")
+          listed = names("LOCAL_PROPERTIES_SECRETS")
+          required = names("REQUIRED_SECRETS")
+
+          invalid = [name for name in listed + required if not NAME.fullmatch(name)]
+          if invalid:
+              # A value pasted where a name belongs must not reach the log.
+              print(f"::error title=Invalid input::{len(invalid)} entr{'y is' if len(invalid) == 1 else 'ies are'} "
+                    "not the name of a secret or variable. local-properties-secrets and required-secrets take "
+                    "names, separated by whitespace or commas.")
+              sys.exit(1)
+          reserved = sorted(set(listed) & RESERVED)
+          if reserved:
+              print(f"::error title=Invalid input::local-properties-secrets lists {', '.join(reserved)}, which this "
+                    "workflow writes itself.")
+              sys.exit(1)
+
+
+          def value(name):
+              found = secrets.get(name) or variables.get(name) or ""
+              return found if isinstance(found, str) else ""
+
+
+          wanted = list(dict.fromkeys(SIGNING + listed + required))
+          missing = [name for name in wanted if not value(name)]
+          if missing:
+              print(f"::error title=Missing secrets or variables::{', '.join(missing)}. Each has to be a secret or a "
+                    "variable of the repository, its organization or the environment of this job, and the calling "
+                    "workflow has to pass its secrets with `secrets: inherit`.")
+              sys.exit(1)
+
+          written = ["KEYSTORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD"] + list(dict.fromkeys(listed))
+          path = os.path.join(os.environ["RUNNER_TEMP"], "android-release.properties")
+          try:
+              os.unlink(path)
+          except FileNotFoundError:
+              pass
+          with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="ascii") as file:
+              for name in written:
+                  file.write(f"{name}={escape(value(name))}\n")
+          print(f"All {len(wanted)} values are present: {', '.join(wanted)}.")
+          print(f"Prepared {len(written)} local.properties entries: {', '.join(written)}.")
+          VALUES
+
+      # GIT_TOKEN is used only when submodules are checked out: it reaches
+      # private ones, and the job token reads the repository itself. No token
+      # stays in the clone.
+      - uses: actions/checkout@v7
+        id: checkout
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          token: ${{ inputs.checkout-submodules != 'false' && secrets.GIT_TOKEN || github.token }}
+          submodules: ${{ inputs.checkout-submodules }}
+          persist-credentials: false
+
+      # The version and the release were planned for one commit. A tag that
+      # was moved since then is another release.
+      - name: Check the commit
+        id: commit
+        env:
+          TAG: ${{ inputs.tag }}
+          PLANNED_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          head=$(git rev-parse HEAD)
+          if [[ "$head" != "$PLANNED_SHA" ]]; then
+            echo "::error::Tag $TAG is at $head, and this release was planned for $PLANNED_SHA. The tag was moved; start the release again."
+            exit 1
+          fi
+          echo "Building $TAG at $head."
+
+      - name: Set up the JDK
+        id: java
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ inputs.java-distribution }}
+          java-version: ${{ inputs.java-version }}
+
+      # The temp directory is emptied by the runner before and after every
+      # job. A Gradle user home there starts without init scripts, dependency
+      # cache, build cache or daemons of any other job, and what this build
+      # leaves in it, values of local.properties included, is gone when the
+      # job ends.
+      - name: Use a Gradle user home of this job
+        id: gradle-home
+        run: |
+          set -euo pipefail
+          home="$RUNNER_TEMP/gradle-user-home"
+          rm -rf "$home"
+          mkdir -p "$home"
+          echo "GRADLE_USER_HOME=$home" >> "$GITHUB_ENV"
+          echo "Gradle user home: $home"
+
+      # For the wrapper validation and the job summary. The Actions cache is
+      # off on every runner: nothing is restored into a build that signs, and
+      # nothing it produced is saved for other builds to restore.
+      - name: Set up Gradle
+        id: gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-disabled: true
+
+      - name: Decode the keystore
+        id: keystore
+        uses: asleep-ai/actions/android-signing@android-ci/v1
+        with:
+          operation: decode
+          keystore-base64: ${{ secrets.KEYSTORE_BASE64 }}
+
+      - name: Write local.properties
+        id: properties
+        env:
+          KEYSTORE_FILE: ${{ steps.keystore.outputs.keystore-file }}
+        run: |
+          set -euo pipefail
+          prepared="$RUNNER_TEMP/android-release.properties"
+          if [[ -z "$KEYSTORE_FILE" || ! -f "$KEYSTORE_FILE" ]]; then
+            echo "::error::The keystore was not decoded."
+            exit 1
+          fi
+          # The path is written as it is: java.util.Properties would read a backslash as an escape.
+          if [[ "$KEYSTORE_FILE" == *\\* ]]; then
+            echo "::error::The keystore path contains a backslash, which local.properties cannot hold as written."
+            exit 1
+          fi
+          rm -f local.properties
+          (
+            umask 077
+            {
+              printf 'KEYSTORE_FILE=%s\n' "$KEYSTORE_FILE"
+              cat "$prepared"
+            } > local.properties
+          )
+          rm -f "$prepared"
+          echo "Wrote local.properties: $(wc -l < local.properties | tr -d ' ') entries."
+
+      - name: Run Gradle
+        id: build
+        env:
+          VERSION_NAME: ${{ inputs.version-name }}
+          VERSION_CODE: ${{ inputs.version-code }}
+          GRADLE_ARGS: ${{ inputs.gradle-args }}
+          # Scoped to this step: Gradle reads GITHUB_ACTOR and GITHUB_TOKEN as
+          # GitHub Packages credentials. The job token cannot read packages of
+          # other repositories, so GIT_TOKEN wins when the caller has it.
+          GITHUB_TOKEN: ${{ secrets.GIT_TOKEN || github.token }}
+          TOKEN_SOURCE: ${{ secrets.GIT_TOKEN != '' && 'GIT_TOKEN' || 'the job token (GIT_TOKEN did not reach this job)' }}
+          # Only this step sees the token. Its presence is what turns the
+          # mapping upload on in the caller's build.
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          RUNNER_KIND: ${{ runner.environment }}
+          MAX_WORKERS: ${{ inputs.self-hosted-max-workers }}
+          GRADLE_JVMARGS: ${{ inputs.self-hosted-gradle-jvmargs }}
+          KOTLIN_DAEMON_JVMARGS: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
+        run: |
+          set -euo pipefail
+          # Memory settings as in android-pr-check-jobs.yml: a self-hosted
+          # host has far more cores than a build has memory for.
+          extra=()
+          if [[ "$RUNNER_KIND" == self-hosted ]]; then
+            if [[ -n "$MAX_WORKERS" ]]; then
+              extra+=("--max-workers=$MAX_WORKERS")
+            fi
+            if [[ -n "$GRADLE_JVMARGS" ]]; then
+              extra+=("-Dorg.gradle.jvmargs=$GRADLE_JVMARGS")
+            fi
+            if [[ -n "$KOTLIN_DAEMON_JVMARGS" ]]; then
+              extra+=("-Pkotlin.daemon.jvmargs=$KOTLIN_DAEMON_JVMARGS")
+            fi
+          fi
+          echo "GitHub Packages credentials for Gradle: GITHUB_ACTOR=$GITHUB_ACTOR, GITHUB_TOKEN from $TOKEN_SOURCE."
+          if [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
+            echo "SENTRY_AUTH_TOKEN is set for this step."
+          else
+            echo "SENTRY_AUTH_TOKEN is not set: the build uploads nothing to Sentry."
+          fi
+          echo "Version: $VERSION_NAME ($VERSION_CODE). Gradle user home: $GRADLE_USER_HOME"
+          # A release is built from its sources alone: no daemon of an earlier
+          # build, no build cache entry from anywhere. The copy in the temp
+          # directory is what gradle-log-verdict reads.
+          set -f
+          # shellcheck disable=SC2086 # word splitting is intended: the value is an argument list
+          ./gradlew ciRelease "-PciVersionName=$VERSION_NAME" "-PciVersionCode=$VERSION_CODE" $GRADLE_ARGS \
+            --no-daemon --no-build-cache ${extra[@]+"${extra[@]}"} 2>&1 | tee "$RUNNER_TEMP/gradle.log"
+
+      # ciRelease leaves the APKs of the release under apk-directory: one, or
+      # one per flavor. The work folder was empty before the checkout, so
+      # every APK there was built by this job. Each has to carry the version
+      # it was built for: a build that ignores -PciVersionName or
+      # -PciVersionCode would otherwise be released under the wrong version.
+      #
+      # What the build left is the same on every runner, so a refusal of the
+      # APKs themselves sets the output `refused`, and the job reports code: a
+      # second cold build on the GitHub-hosted runner would end the same way.
+      # A runner without the SDK tool is a failure of the runner, and is not.
+      - name: Check the APKs
+        id: apk
+        env:
+          APK_DIRECTORY: ${{ inputs.apk-directory }}
+          VERSION_NAME: ${{ inputs.version-name }}
+          VERSION_CODE: ${{ inputs.version-code }}
+          BUILD_TOOLS_VERSION: ${{ inputs.build-tools-version }}
+        run: |
+          set -euo pipefail
+          refuse() {
+            echo "::error::$1"
+            echo "refused=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          }
+          if [[ -z "$APK_DIRECTORY" || "$APK_DIRECTORY" == -* || ! -d "$APK_DIRECTORY" ]]; then
+            refuse "apk-directory ($APK_DIRECTORY) is not a directory after the build."
+          fi
+          apks=()
+          while IFS= read -r found; do
+            apks+=("$found")
+          done < <(find "$APK_DIRECTORY" -type f -name '*.apk' | sort)
+          if [[ "${#apks[@]}" == 0 ]]; then
+            refuse "ciRelease left no APK under $APK_DIRECTORY."
+          fi
+          # The APKs become assets of one release, which names them by file name.
+          duplicates=$(for apk in "${apks[@]}"; do basename "$apk"; done | sort | uniq -d)
+          if [[ -n "$duplicates" ]]; then
+            refuse "Several APKs under $APK_DIRECTORY share a file name: ${duplicates//$'\n'/, }. Give each flavor's APK its own name."
+          fi
+
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [[ -z "$sdk" || ! -d "$sdk/build-tools" ]]; then
+            echo "::error::No Android SDK with build-tools: ANDROID_HOME and ANDROID_SDK_ROOT name none."
+            exit 1
+          fi
+          if [[ -n "$BUILD_TOOLS_VERSION" ]]; then
+            aapt2="$sdk/build-tools/$BUILD_TOOLS_VERSION/aapt2"
+          else
+            aapt2=$( (find "$sdk/build-tools" -mindepth 2 -maxdepth 2 -name aapt2 -type f || true) | sort -V | tail -1)
+          fi
+          if [[ -z "$aapt2" || ! -x "$aapt2" ]]; then
+            echo "::error::aapt2 was not found under $sdk/build-tools${BUILD_TOOLS_VERSION:+ (version $BUILD_TOOLS_VERSION)}."
+            exit 1
+          fi
+
+          name_pattern="versionName='([^']*)'"
+          code_pattern="versionCode='([0-9]+)'"
+          wrong=0
+          for apk in "${apks[@]}"; do
+            package=$("$aapt2" dump badging "$apk" | grep -m1 '^package: ' || true)
+            built_name=""
+            built_code=""
+            if [[ "$package" =~ $name_pattern ]]; then
+              built_name="${BASH_REMATCH[1]}"
+            fi
+            if [[ "$package" =~ $code_pattern ]]; then
+              built_code="${BASH_REMATCH[1]}"
+            fi
+            echo "$apk: versionName=$built_name versionCode=$built_code"
+            if [[ "$built_name" != "$VERSION_NAME" || "$built_code" != "$VERSION_CODE" ]]; then
+              echo "::error::$apk is version $built_name ($built_code), and the release is $VERSION_NAME ($VERSION_CODE). The build has to take its version from -PciVersionName and -PciVersionCode."
+              wrong=1
+            fi
+          done
+          if [[ "$wrong" != 0 ]]; then
+            echo "refused=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          # One path per line. No path can be the closing line: each ends in .apk.
+          {
+            echo "paths<<android-release-apks"
+            printf '%s\n' "${apks[@]}"
+            echo "android-release-apks"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify the APK signatures
+        id: signature
+        uses: asleep-ai/actions/android-signing@android-ci/v1
+        with:
+          operation: verify
+          apk-file: ${{ steps.apk.outputs.paths }}
+          expected-cert-sha256: ${{ inputs.expected-cert-sha256 }}
+          build-tools-version: ${{ inputs.build-tools-version }}
+
+      - name: Upload the signed APKs
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-release-apk-${{ inputs.attempt }}
+          path: ${{ steps.apk.outputs.paths }}
+          retention-days: 90
+          if-no-files-found: error
+          # A re-run of the job uploads under the same name.
+          overwrite: true
+
+      - name: Delete the keystore and local.properties
+        if: ${{ always() }}
+        uses: asleep-ai/actions/android-signing@android-ci/v1
+        with:
+          operation: cleanup
+          keystore-file: ${{ steps.keystore.outputs.keystore-file }}
+          paths: |
+            local.properties
+            ${{ runner.temp }}/android-release.properties
+
+      # The build outputs hold the values of local.properties (generated
+      # sources, the APK), and a self-hosted runner would keep them for the
+      # jobs that follow. The Gradle user home is in the temp directory, which
+      # the runner empties itself.
+      - name: Empty the work folder again
+        if: ${{ always() }}
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_KIND" != self-hosted ]]; then
+            exit 0
+          fi
+          if [[ -n "${GITHUB_WORKSPACE:-}" && -d "$GITHUB_WORKSPACE" ]]; then
+            find "$GITHUB_WORKSPACE" -mindepth 1 -delete
+            echo "Emptied $GITHUB_WORKSPACE."
+          fi
+
+      # The secrets check is left out of setup-outcome: a missing secret is
+      # reported as code by the job output, because no other runner has it.
+      # job-status covers the steps after the build (the APK check, the
+      # signature, the upload): when one of them fails, the verdict is infra,
+      # which the job output turns into code when the APKs were refused.
+      - name: Report the verdict
+        id: verdict
+        if: ${{ always() && steps.values.outcome != 'failure' }}
+        uses: asleep-ai/actions/gradle-log-verdict@android-ci/v1
+        with:
+          log-file: ${{ runner.temp }}/gradle.log
+          setup-outcome: >-
+            ${{ steps.workspace.outcome }} ${{ steps.checkout.outcome }} ${{ steps.commit.outcome }}
+            ${{ steps.java.outcome }} ${{ steps.gradle-home.outcome }} ${{ steps.gradle.outcome }}
+            ${{ steps.keystore.outcome }} ${{ steps.properties.outcome }}
+          build-outcome: ${{ steps.build.outcome }}
+          job-status: ${{ job.status }}

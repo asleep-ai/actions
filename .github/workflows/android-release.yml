@@ -1,0 +1,702 @@
+name: Android release
+
+# Reusable release of an Android app repository: builds the release tag
+# vX.Y.Z with ./gradlew ciRelease, signed with the caller's keystore, checks
+# the APK and publishes it as a GitHub Release. The build runs on a
+# self-hosted runner when one is online and on a GitHub-hosted runner
+# otherwise, and a self-hosted build that fails for an infrastructure reason
+# runs again on a GitHub-hosted runner.
+#
+# The caller's contract, every input and the secrets are in
+# android-ci/README.md.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: >-
+          The release tag to build, vX.Y.Z. Empty means the ref the workflow
+          run started for, which is the tag on a tag push and on a manual run
+          started for a tag.
+        required: false
+        type: string
+        default: ''
+      runner-labels:
+        description: >-
+          Self-hosted runs-on labels as a JSON array of strings, for example
+          '["self-hosted","Linux","X64"]'. Empty builds on fallback-runs-on.
+        required: false
+        type: string
+        default: ''
+      fallback-runs-on:
+        description: >-
+          GitHub-hosted runs-on, used when no self-hosted runner is online and
+          for the re-run after an infrastructure failure. Exactly one of two
+          forms: a bare label (ubuntu-latest, no quotes) or a JSON array of
+          labels.
+        required: false
+        type: string
+        default: ubuntu-latest
+      environment:
+        description: >-
+          The environment of the build job. Its secrets are the ones the job
+          reads first, and its protection rules apply to the job. A repository
+          that has not created it gets an empty one without rules, and the job
+          reads the repository's and the organization's secrets.
+        required: false
+        type: string
+        default: release
+      java-version:
+        description: JDK version for the build.
+        required: false
+        type: string
+        default: '17'
+      java-distribution:
+        description: JDK distribution for actions/setup-java.
+        required: false
+        type: string
+        default: temurin
+      checkout-submodules:
+        description: >-
+          The submodules input of actions/checkout for the build: false, true
+          or recursive. Anything but false checks out with GIT_TOKEN.
+        required: false
+        type: string
+        default: 'false'
+      local-properties-secrets:
+        description: >-
+          Names of secrets and variables, separated by whitespace or commas.
+          Each is written to local.properties under its own name, after the
+          four signing keys. A name is looked up among the secrets first, then
+          among the variables. The build fails at its start when one is empty.
+        required: false
+        type: string
+        default: ''
+      required-secrets:
+        description: >-
+          Names of secrets and variables that must not be empty but are not
+          written to local.properties, such as SENTRY_AUTH_TOKEN. Separated by
+          whitespace or commas.
+        required: false
+        type: string
+        default: ''
+      gradle-args:
+        description: >-
+          Extra Gradle arguments for ./gradlew ciRelease, split on whitespace.
+        required: false
+        type: string
+        default: ''
+      apk-directory:
+        description: >-
+          The directory ciRelease leaves the release APKs in, relative to the
+          repository root. Every .apk file below it is checked, verified and
+          attached to the release: one APK, or one per flavor.
+        required: false
+        type: string
+        default: app/build/outputs/apk
+      expected-cert-sha256:
+        description: >-
+          Optional SHA-256 digest of the signing certificate the APK must
+          carry, as android-signing takes it. Empty checks only that the
+          signature is valid.
+        required: false
+        type: string
+        default: ''
+      build-tools-version:
+        description: >-
+          Optional build-tools version whose apksigner and aapt2 check the
+          APK, as the directory is named under build-tools. Empty uses the
+          highest installed version.
+        required: false
+        type: string
+        default: ''
+      source-branch:
+        description: >-
+          The branch releases are cut from; empty means the default branch of
+          the repository. The tagged commit has to be in its first-parent
+          history, or in that of release/<major>.x, the maintenance branch of
+          the tag's major version.
+        required: false
+        type: string
+        default: ''
+      required-checks:
+        description: >-
+          Names of the checks that must have succeeded on the tagged commit,
+          one per line, as the commit's checks list shows them. They are
+          checked for every tag, whoever pushed it. Empty requires none.
+        required: false
+        type: string
+        default: pr-check / result
+      release-notes-prompt:
+        description: >-
+          System prompt for release-notes, replacing its built-in one.
+        required: false
+        type: string
+        default: ''
+      build-timeout-minutes:
+        description: >-
+          Timeout of the build job, on either kind of runner. The build never
+          uses a cache, so size it for a cold build.
+        required: false
+        type: number
+        default: 60
+      self-hosted-max-workers:
+        description: >-
+          Gradle --max-workers on a self-hosted runner. Empty leaves Gradle's
+          default, one worker per core.
+        required: false
+        type: string
+        default: '32'
+      self-hosted-gradle-jvmargs:
+        description: >-
+          org.gradle.jvmargs on a self-hosted runner, replacing the value in
+          the caller's gradle.properties. Empty keeps the caller's value.
+        required: false
+        type: string
+        default: -Xmx16g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8
+      self-hosted-kotlin-daemon-jvmargs:
+        description: >-
+          kotlin.daemon.jvmargs on a self-hosted runner. Empty keeps the
+          caller's value.
+        required: false
+        type: string
+        default: -Xmx6g
+    # The workflow reads these by name. None is required here: the four
+    # signing secrets may live in the environment of the build job, where the
+    # caller cannot pass them from, and the build job itself fails when one is
+    # empty. The secrets and variables named in local-properties-secrets
+    # and required-secrets are read by name as well, which is why the caller
+    # passes `secrets: inherit`.
+    secrets:
+      KEYSTORE_BASE64:
+        description: The signing keystore, base64-encoded.
+        required: false
+      KEYSTORE_PASSWORD:
+        description: Password of the keystore.
+        required: false
+      KEY_ALIAS:
+        description: Alias of the signing key.
+        required: false
+      KEY_PASSWORD:
+        description: Password of the signing key.
+        required: false
+      RUNNER_READ_TOKEN:
+        description: >-
+          Token with the organization permission "Self-hosted runners" (read),
+          for pick-runner. Without it the self-hosted labels are used
+          unchecked.
+        required: false
+      GIT_TOKEN:
+        description: >-
+          Optional. Token that can read the caller's private submodules and
+          private GitHub Packages; the job token is used when it is absent.
+        required: false
+      SENTRY_AUTH_TOKEN:
+        description: >-
+          Optional. Given to the Gradle step only, as an environment variable.
+        required: false
+      OPENAI_API_KEY:
+        description: >-
+          Optional. For release-notes; without it the notes are a list of
+          commits.
+        required: false
+    outputs:
+      tag:
+        description: The release tag.
+        value: ${{ jobs.plan.outputs.tag }}
+      version-code:
+        description: The versionCode the APK was built with.
+        value: ${{ jobs.plan.outputs.version-code }}
+
+permissions:
+  contents: read
+  packages: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Everything that can stop a release before a build starts, decided on a
+  # GitHub-hosted runner: the tag, its place among the releases, the branch
+  # and the checks of its commit, the version to build, and where the build
+  # runs. A job queued for self-hosted labels while every matching runner is
+  # offline would wait instead of failing.
+  #
+  # The branch and the checks are what android-version-bump.yml requires
+  # before it tags. They are required here again because this workflow also
+  # builds a tag that a person pushed, and it is the build job that reads the
+  # signing key.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.tag.outputs.sha }}
+      latest: ${{ steps.tag.outputs.latest }}
+      version: ${{ steps.code.outputs.version }}
+      version-code: ${{ steps.code.outputs.version-code }}
+      runs-on: ${{ steps.pick.outputs.runs-on }}
+      self-hosted: ${{ steps.pick.outputs.self-hosted }}
+    steps:
+      - name: Check the tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Only vX.Y.Z is a release. A tag with a suffix, a branch, or a
+          # number with a leading zero is not.
+          pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ ! "$TAG" =~ $pattern ]]; then
+            echo "::error::'$TAG' is not a release tag. Start the release for a tag of the form vX.Y.Z."
+            exit 1
+          fi
+
+          names=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/v" --jq '.[].ref | ltrimstr("refs/tags/")')
+          tags=$(grep -E "$pattern" <<< "$names" | sort -V || true)
+          if ! grep -qxF "$TAG" <<< "$tags"; then
+            echo "::error::Tag $TAG does not exist in $GH_REPO."
+            exit 1
+          fi
+          sha=$(gh api "repos/$GH_REPO/commits/tags/$TAG" --jq '.sha')
+
+          # A major version is a release line: 1.x may still be released from
+          # its maintenance branch after 2.0.0 exists.
+          major="${TAG#v}"
+          major="${major%%.*}"
+          highest=$(tail -1 <<< "$tags")
+          line_highest=$(grep -E "^v${major}\." <<< "$tags" | tail -1)
+
+          # The published releases, read in a statement of its own: a request
+          # that failed must not read as "nothing is published".
+          if ! published=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.draft | not) | .tag_name'); then
+            echo "::error::Cannot list the releases of $GH_REPO."
+            exit 1
+          fi
+
+          # The release of this tag may exist already: a re-run, or another
+          # APK for the same release.
+          if grep -qxF "$TAG" <<< "$published"; then
+            exists=true
+          else
+            exists=false
+          fi
+
+          # A version below the highest one of its line would be a lower
+          # versionCode than the devices of that line already have, which no
+          # device can install. Building an older release again, for its
+          # existing GitHub Release, is fine.
+          if [[ "$exists" == false && "$TAG" != "$line_highest" ]]; then
+            echo "::error::$TAG is below $line_highest, the highest release tag of major $major, and has no GitHub Release yet. A new release has to be the highest version of its line."
+            exit 1
+          fi
+
+          # Only the highest version of all is the repository's latest
+          # release. A release of a lower line, or an older one built again,
+          # must not take that mark.
+          if [[ "$TAG" == "$highest" ]]; then
+            latest=true
+          else
+            latest=false
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "sha=$sha"
+            echo "latest=$latest"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release $TAG at $sha. Latest: $latest. GitHub Release exists: $exists."
+
+      # Every branch and the whole history, for the step below. The tag was
+      # checked above, so the ref is a release tag that exists. Nothing of the
+      # checkout is run.
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The tagged commit has to be a commit its branch pointed at: in the
+      # first-parent history of the source branch, or of release/<major>.x,
+      # the maintenance branch of its line. A tag on a commit of an open pull
+      # request, of an unmerged branch or of another line is not built, and
+      # neither is one on the head of a pull request that was merged with a
+      # merge commit: its green check is the pull request's, which built the
+      # merge with the base branch and not this commit.
+      - name: Check the branch of the tagged commit
+        id: line
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          SHA: ${{ steps.tag.outputs.sha }}
+          SOURCE_BRANCH: ${{ inputs.source-branch || github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SOURCE_BRANCH" || "$SOURCE_BRANCH" == -* ]] || ! git check-ref-format "refs/heads/$SOURCE_BRANCH"; then
+            echo "::error::source-branch is not a branch name: $SOURCE_BRANCH"
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet "refs/remotes/origin/$SOURCE_BRANCH^{commit}" > /dev/null; then
+            echo "::error::Branch $SOURCE_BRANCH does not exist in this repository."
+            exit 1
+          fi
+          major="${TAG#v}"
+          major="${major%%.*}"
+          maintenance="release/$major.x"
+          history="$RUNNER_TEMP/android-release-first-parents"
+          on=""
+          for branch in "$SOURCE_BRANCH" "$maintenance"; do
+            # A branch that does not exist holds no commit.
+            if tip=$(git rev-parse --verify --quiet "refs/remotes/origin/$branch^{commit}"); then
+              git rev-list --first-parent "$tip" > "$history"
+              if grep -qxF "$SHA" "$history"; then
+                on="$branch"
+                break
+              fi
+            fi
+          done
+          rm -f "$history"
+          if [[ -z "$on" ]]; then
+            echo "::error title=The tag is not on a release branch::The commit of $TAG (${SHA:0:7}) is in the first-parent history of neither $SOURCE_BRANCH nor $maintenance. A release is built from a commit that was merged into one of them: the merge commit of a pull request, not a commit of the pull request itself."
+            exit 1
+          fi
+          echo "The commit of $TAG (${SHA:0:7}) is on $on."
+
+      # The same script as in android-version-bump.yml, on the tagged commit:
+      # a tag that the version bump created passes again, and a tag that a
+      # person pushed is held to the same checks. android-ci's tests fail when
+      # the two copies differ.
+      #
+      # python3 -I: the script comes from standard input, and without -I
+      # Python would look for the modules it imports in the checkout first.
+      - name: Check the commit's checks
+        env:
+          TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.tag.outputs.sha }}
+          REQUIRED_CHECKS: ${{ inputs.required-checks }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'CHECKS'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          sha = os.environ["TARGET_SHA"]
+          token = os.environ.get("TOKEN", "").strip()
+          required = [line.strip() for line in os.environ.get("REQUIRED_CHECKS", "").splitlines() if line.strip()]
+
+
+          def check_runs(name):
+              query = urllib.parse.urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+              request = urllib.request.Request(
+                  f"{api}/repos/{repository}/commits/{sha}/check-runs?{query}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "asleep-ai-actions-android-ci",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      document = json.load(response)
+              except urllib.error.HTTPError as error:
+                  detail = error.read(300).decode(errors="replace").strip()
+                  sys.exit(f"::error::Cannot read the checks of {sha}: HTTP {error.code}: {detail}")
+              except (OSError, ValueError) as error:
+                  sys.exit(f"::error::Cannot read the checks of {sha}: {error}")
+              runs = document.get("check_runs") if isinstance(document, dict) else None
+              if not isinstance(runs, list):
+                  sys.exit(f"::error::Cannot read the checks of {sha}: the response has no check_runs list")
+              return [run for run in runs if isinstance(run, dict) and run.get("name") == name]
+
+
+          rows = []
+          refused = []
+          for name in required:
+              runs = check_runs(name)
+              if not runs:
+                  rows.append((name, "not run", ""))
+                  refused.append(f"'{name}' did not run on the commit")
+                  continue
+              newest = max(runs, key=lambda run: (str(run.get("started_at") or ""), run.get("id") or 0))
+              state = newest.get("conclusion") or newest.get("status") or "unknown"
+              rows.append((name, state, newest.get("html_url") or ""))
+              if newest.get("status") != "completed" or newest.get("conclusion") != "success":
+                  refused.append(f"'{name}' is {state}")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("#### Checks on the commit\n\n")
+              if not rows:
+                  summary.write("No check is required (`required-checks` is empty).\n\n")
+              else:
+                  summary.write("| check | result |\n|-------|--------|\n")
+                  for name, state, url in rows:
+                      summary.write(f"| {name} | {f'[{state}]({url})' if url else state} |\n")
+                  summary.write("\n")
+
+          if not required:
+              print("::notice::No check is required: required-checks is empty.")
+          for name, state, _ in rows:
+              print(f"{name}: {state}")
+          if refused:
+              print(f"::error title=The commit has not passed its checks::{sha[:7]}: {'; '.join(refused)}. "
+                    "Release a commit whose checks succeeded, or run them again on this one.")
+              sys.exit(1)
+          CHECKS
+
+      - name: Compute the versionCode
+        id: code
+        uses: asleep-ai/actions/release-version@android-ci/v1
+        with:
+          operation: code
+          kind: release
+          version: ${{ steps.tag.outputs.tag }}
+
+      - name: Pick the runner
+        id: pick
+        if: ${{ inputs.runner-labels != '' }}
+        uses: asleep-ai/actions/pick-runner@pick-runner/v1
+        with:
+          labels: ${{ inputs.runner-labels }}
+          token: ${{ secrets.RUNNER_READ_TOKEN }}
+          fallback: ${{ inputs.fallback-runs-on }}
+
+  primary:
+    needs: plan
+    uses: ./.github/workflows/android-release-build.yml
+    with:
+      runs-on: ${{ needs.plan.outputs.runs-on || (startsWith(inputs.fallback-runs-on, '[') && inputs.fallback-runs-on) || toJSON(inputs.fallback-runs-on || 'ubuntu-latest') }}
+      attempt: primary
+      environment: ${{ inputs.environment }}
+      tag: ${{ needs.plan.outputs.tag }}
+      sha: ${{ needs.plan.outputs.sha }}
+      version-name: ${{ needs.plan.outputs.version }}
+      version-code: ${{ needs.plan.outputs.version-code }}
+      java-version: ${{ inputs.java-version }}
+      java-distribution: ${{ inputs.java-distribution }}
+      checkout-submodules: ${{ inputs.checkout-submodules }}
+      local-properties-secrets: ${{ inputs.local-properties-secrets }}
+      required-secrets: ${{ inputs.required-secrets }}
+      gradle-args: ${{ inputs.gradle-args }}
+      apk-directory: ${{ inputs.apk-directory }}
+      expected-cert-sha256: ${{ inputs.expected-cert-sha256 }}
+      build-tools-version: ${{ inputs.build-tools-version }}
+      build-timeout-minutes: ${{ inputs.build-timeout-minutes }}
+      self-hosted-max-workers: ${{ inputs.self-hosted-max-workers }}
+      self-hosted-gradle-jvmargs: ${{ inputs.self-hosted-gradle-jvmargs }}
+      self-hosted-kotlin-daemon-jvmargs: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
+    secrets: inherit
+
+  # Only after a build on a self-hosted runner, and never after a code
+  # verdict. A build that never reported (its runner went away) has an empty
+  # verdict, which is not code. A primary result of cancelled while the run
+  # itself is not cancelled means the build hit its timeout.
+  fallback:
+    needs: [plan, primary]
+    if: >-
+      ${{
+        !cancelled()
+        && needs.plan.result == 'success'
+        && needs.plan.outputs.self-hosted == 'true'
+        && (needs.primary.result == 'failure' || needs.primary.result == 'cancelled')
+        && needs.primary.outputs.verdict != 'code'
+      }}
+    uses: ./.github/workflows/android-release-build.yml
+    with:
+      runs-on: ${{ (startsWith(inputs.fallback-runs-on, '[') && inputs.fallback-runs-on) || toJSON(inputs.fallback-runs-on || 'ubuntu-latest') }}
+      attempt: fallback
+      environment: ${{ inputs.environment }}
+      tag: ${{ needs.plan.outputs.tag }}
+      sha: ${{ needs.plan.outputs.sha }}
+      version-name: ${{ needs.plan.outputs.version }}
+      version-code: ${{ needs.plan.outputs.version-code }}
+      java-version: ${{ inputs.java-version }}
+      java-distribution: ${{ inputs.java-distribution }}
+      checkout-submodules: ${{ inputs.checkout-submodules }}
+      local-properties-secrets: ${{ inputs.local-properties-secrets }}
+      required-secrets: ${{ inputs.required-secrets }}
+      gradle-args: ${{ inputs.gradle-args }}
+      apk-directory: ${{ inputs.apk-directory }}
+      expected-cert-sha256: ${{ inputs.expected-cert-sha256 }}
+      build-tools-version: ${{ inputs.build-tools-version }}
+      build-timeout-minutes: ${{ inputs.build-timeout-minutes }}
+      self-hosted-max-workers: ${{ inputs.self-hosted-max-workers }}
+      self-hosted-gradle-jvmargs: ${{ inputs.self-hosted-gradle-jvmargs }}
+      self-hosted-kotlin-daemon-jvmargs: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
+    secrets: inherit
+
+  # Publishes the APKs of the build that passed. It runs on GitHub, checks out
+  # the repository only to read its history for the release notes, and runs
+  # none of its code: the token that can write releases exists in this job
+  # alone.
+  publish:
+    needs: [plan, primary, fallback]
+    if: ${{ !cancelled() && (needs.primary.result == 'success' || needs.fallback.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      # Full history and every tag: release-notes reads the commits between
+      # two tags.
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The name is built here and not passed as a job output: the runner
+      # drops an output that contains the value of a secret, and "release" is
+      # a likely key alias.
+      - name: Download the signed APKs
+        uses: actions/download-artifact@v8
+        with:
+          name: android-release-apk-${{ needs.primary.result == 'success' && 'primary' || 'fallback' }}
+          path: ${{ runner.temp }}/android-release-apk
+
+      - name: Look for the GitHub Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if published=$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq '.tag_name' 2>&1); then
+            exists=true
+          elif grep -q 'HTTP 404' <<< "$published"; then
+            exists=false
+          else
+            echo "::error::Cannot tell whether release $TAG exists: $published"
+            exit 1
+          fi
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          echo "GitHub Release $TAG exists: $exists."
+
+      # The notes cover what this release adds to the one before it on its own
+      # line: the highest lower release tag that the tagged commit contains.
+      # So 1.13.2, cut from a maintenance branch after 2.0.0 exists, starts at
+      # 1.13.1, and 2.0.0 starts at the 1.x release the main line grew from.
+      # Only a tag with a published release is a start: a lower tag whose
+      # release never happened (its build failed, and the fix got the next
+      # version) has its changes listed here. Without any, the output is
+      # empty and the notes cover the whole history.
+      - name: Find the previous release of the line
+        id: previous
+        if: ${{ steps.release.outputs.exists == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if ! published=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.draft | not) | .tag_name'); then
+            echo "::error::Cannot list the releases of $GH_REPO."
+            exit 1
+          fi
+          contained=$(git tag --merged "refs/tags/$TAG" | grep -E "$pattern" || true)
+          # In rising order up to the tag itself: the last published one wins.
+          previous=""
+          while IFS= read -r candidate; do
+            if [[ "$candidate" == "$TAG" ]]; then
+              break
+            fi
+            if grep -qxF "$candidate" <<< "$published"; then
+              previous="$candidate"
+            fi
+          done < <(printf '%s\n%s\n' "$contained" "$TAG" | grep -E "$pattern" | sort -V -u)
+          echo "tag=$previous" >> "$GITHUB_OUTPUT"
+          echo "Previous release of the line: ${previous:-none}."
+
+      # Only for a new release: the notes of an existing one may have been
+      # edited by hand, and they are kept.
+      #
+      # tag-pattern is read only when previous-tag is empty, where the action
+      # would search for a previous tag itself and could pick one the step
+      # above left out: a tag that was never published, or a suffixed tag
+      # (vX.Y.Z-label.N). The pattern has no wildcard and names no tag, so
+      # that search finds nothing.
+      - name: Write the release notes
+        id: notes
+        if: ${{ steps.release.outputs.exists == 'false' }}
+        uses: asleep-ai/actions/release-notes@release-notes/v1
+        with:
+          current-tag: ${{ needs.plan.outputs.tag }}
+          previous-tag: ${{ steps.previous.outputs.tag }}
+          tag-pattern: android-release/no-previous-release
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          system-prompt: ${{ inputs.release-notes-prompt }}
+          output-file: ${{ runner.temp }}/android-release-notes.md
+
+      # Running the release again is safe: an existing release keeps its
+      # title, notes and latest mark and gets the APKs again, replacing assets
+      # of the same name. An APK with another name is added next to them.
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          VERSION_CODE: ${{ needs.plan.outputs.version-code }}
+          LATEST: ${{ needs.plan.outputs.latest }}
+          EXISTS: ${{ steps.release.outputs.exists }}
+          APK_DIRECTORY: ${{ runner.temp }}/android-release-apk
+          NOTES_FILE: ${{ runner.temp }}/android-release-notes.md
+          BUILT_ON: ${{ needs.primary.result == 'success' && 'primary' || 'fallback' }}
+          SELF_HOSTED: ${{ needs.plan.outputs.self-hosted }}
+        run: |
+          set -euo pipefail
+          apks=()
+          names=""
+          while IFS= read -r apk; do
+            apks+=("$apk")
+            names="${names:+$names, }$(basename "$apk")"
+          done < <(find "$APK_DIRECTORY" -type f -name '*.apk' | sort)
+          if [[ "${#apks[@]}" == 0 ]]; then
+            echo "::error::The build artifact holds no APK."
+            exit 1
+          fi
+
+          if [[ "$EXISTS" == true ]]; then
+            gh release upload "$TAG" "${apks[@]}" --clobber
+            action="Added $names to the existing release"
+          else
+            # --verify-tag: if the tag was deleted meanwhile, fail instead of
+            # letting gh create it on the default branch. --latest is always
+            # stated: a release of a lower line must not become the latest
+            # release because it is the newest.
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$NOTES_FILE" "--latest=$LATEST" "${apks[@]}"
+            action="Created the release with $names"
+          fi
+
+          if [[ "$BUILT_ON" == fallback ]]; then
+            where="the GitHub-hosted runner, after the self-hosted build did not pass for a reason outside the code"
+            echo "::warning title=Self-hosted runner problem::The release was built on the GitHub-hosted runner after the self-hosted build did not pass. Check the host."
+          elif [[ "$SELF_HOSTED" == true ]]; then
+            where="a self-hosted runner"
+          else
+            where="a GitHub-hosted runner"
+          fi
+          url="$GITHUB_SERVER_URL/$GH_REPO/releases/tag/$TAG"
+          {
+            echo "### Android release $TAG"
+            echo
+            echo "$action: <$url>"
+            echo
+            echo "| version | versionCode | latest | built on |"
+            echo "|---------|-------------|--------|----------|"
+            echo "| $VERSION | $VERSION_CODE | $([[ "$EXISTS" == true ]] && echo unchanged || echo "$LATEST") | $where |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$action: $url"

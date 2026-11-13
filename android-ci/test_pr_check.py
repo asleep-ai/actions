@@ -333,8 +333,8 @@ def test_gradle_job_checkout(jobs, job):
     checkout = checkout_step(jobs[job])["with"]
     # The plan step compares a pull request's merge commit with its first parent.
     assert checkout["fetch-depth"] == 2
-    # Only a push may have to fetch another commit; a pull request's code must not find a token in the clone.
-    assert checkout["persist-credentials"] == "${{ github.event_name == 'push' }}"
+    # No step fetches anything after the checkout, so no code of the build finds a token in the clone.
+    assert checkout["persist-credentials"] is False
     # GIT_TOKEN only where submodules need it: the job token reads the repository itself.
     assert checkout["token"] == "${{ inputs.checkout-submodules != 'false' && secrets.GIT_TOKEN || github.token }}"
     assert checkout["submodules"] == "${{ inputs.checkout-submodules }}"
@@ -343,7 +343,6 @@ def test_gradle_job_checkout(jobs, job):
 # --- the plan step: which changes need a build ---------------------------------
 
 DEFAULT_IGNORE = "*.md\ndocs/**\n.gitignore\nLICENSE\n.github/ISSUE_TEMPLATE/**\n.github/PULL_REQUEST_TEMPLATE.md\n"
-ZERO = "0" * 40
 
 
 def git(repo: Path, *args: str) -> str:
@@ -391,7 +390,6 @@ def plan(jobs, repo: Path, job: str = "verify", **env: str) -> tuple[str, str]:
     environment = {
         "EVENT_NAME": "pull_request",
         "REF": "refs/pull/1/merge",
-        "BEFORE": "",
         "PATHS_IGNORE": DEFAULT_IGNORE,
         "SKIP_PUSH_BRANCHES": "",
         "GITHUB_OUTPUT": str(output),
@@ -466,53 +464,41 @@ def test_plan_without_a_first_parent_builds(jobs, tmp_path):
     assert "git cannot list the changed files" in log
 
 
-def pushed(tmp_path: Path, changes: dict[str, str | None]) -> tuple[Path, str]:
+def pushed(tmp_path: Path, changes: dict[str, str | None]) -> Path:
+    """A checkout like a push run's: HEAD is the pushed commit, on top of the branch's previous tip."""
     repo = new_repository(tmp_path / "repo")
-    before = git(repo, "rev-parse", "HEAD")
-    commit(repo, changes, "first pushed commit")
-    commit(repo, {"docs/second.md": "x"}, "second pushed commit")
-    return repo, before
+    commit(repo, changes, "pushed commit")
+    return repo
 
 
 @pytest.mark.parametrize(
-    ("changes", "build"),
-    [({"docs/guide.md": "more\n"}, "false"), ({"app/Main.kt": "fun main() = Unit\n"}, "true")],
-)
-def test_plan_of_a_push_compares_with_the_previous_tip(jobs, tmp_path, changes, build):
-    repo, before = pushed(tmp_path, changes)
-    assert plan(jobs, repo, EVENT_NAME="push", REF="refs/heads/develop", BEFORE=before)[0] == build
-
-
-@pytest.mark.parametrize(
-    ("changes", "build"),
-    [({"docs/guide.md": "more\n"}, "false"), ({"app/Main.kt": "fun main() = Unit\n"}, "true")],
-)
-def test_plan_of_a_push_fetches_a_previous_tip_the_shallow_clone_lacks(jobs, tmp_path, changes, build):
-    origin, before = pushed(tmp_path, changes)
-    # GitHub serves any reachable commit by SHA; a local repository has to be told to.
-    git(origin, "config", "uploadpack.allowAnySHA1InWant", "true")
-    clone = tmp_path / "clone" / "repo"
-    clone.parent.mkdir()
-    git(tmp_path, "clone", "-q", "--depth", "1", origin.as_uri(), str(clone))
-    assert subprocess.run(["git", "cat-file", "-e", before], cwd=clone, check=False).returncode != 0
-    decision, _ = plan(jobs, clone, EVENT_NAME="push", REF="refs/heads/develop", BEFORE=before)
-    assert decision == build
-
-
-@pytest.mark.parametrize(
-    ("before", "reason"),
+    "changes",
     [
-        (ZERO, "the push has no previous commit, as on a new branch"),
-        ("", "the push has no previous commit, as on a new branch"),
-        ("f" * 40, "the push's previous commit cannot be fetched, as after a force push"),
-        ("--upload-pack=touch /tmp/x", "the push has no previous commit"),
+        {"app/Main.kt": "fun main() = Unit\n"},
+        # The check of a pushed commit is what a release of it relies on: documentation only, or
+        # nothing at all (a merge commit that changes no file), is still built.
+        {"docs/guide.md": "more\n"},
+        {"README.md": "# new\n", "LICENSE": "x"},
+        {},
     ],
 )
-def test_plan_of_a_push_without_a_usable_previous_tip_builds(jobs, tmp_path, before, reason):
-    repo, _ = pushed(tmp_path, {"docs/guide.md": "more\n"})
-    decision, log = plan(jobs, repo, EVENT_NAME="push", REF="refs/heads/develop", BEFORE=before)
+@pytest.mark.parametrize("ref", ["refs/heads/develop", "refs/heads/main", "refs/heads/release/1.x", "refs/heads/feature"])
+@pytest.mark.parametrize("job", ["verify", "release-build"])
+def test_plan_of_a_push_always_builds(jobs, tmp_path, changes, ref, job):
+    repo = pushed(tmp_path, changes)
+    decision, log = plan(jobs, repo, job=job, EVENT_NAME="push", REF=ref)
     assert decision == "true"
-    assert reason in log
+    assert "a push always builds" in log
+
+
+def test_plan_of_a_push_does_not_read_the_previous_tip(jobs):
+    # A push run that compared with the previous tip passed a documentation-only commit whose
+    # predecessor never passed. Neither Gradle job takes the previous tip any more.
+    for job in ("verify", "release-build"):
+        decide = step(jobs[job], "Decide whether to build")
+        assert set(decide["env"]) == {"EVENT_NAME", "REF", "PATHS_IGNORE", "SKIP_PUSH_BRANCHES"}
+        assert "github.event.before" not in str(jobs[job])
+        assert "fetch" not in decide["run"]
 
 
 @pytest.mark.parametrize("event", ["workflow_dispatch", "schedule", "merge_group"])
@@ -538,12 +524,10 @@ def test_plan_of_other_events_always_builds(jobs, tmp_path, event):
 )
 def test_plan_skips_the_release_build_on_pushes_to_the_named_branches(jobs, tmp_path, event, ref, skip, build):
     if event == "push":
-        repo, before = pushed(tmp_path, {"app/Main.kt": "fun main() = Unit\n"})
+        repo = pushed(tmp_path, {"app/Main.kt": "fun main() = Unit\n"})
     else:
-        repo, before = merged_pull_request(tmp_path, {"app/Main.kt": "fun main() = Unit\n"}), ""
-    decision, log = plan(
-        jobs, repo, job="release-build", EVENT_NAME=event, REF=ref, BEFORE=before, SKIP_PUSH_BRANCHES=skip
-    )
+        repo = merged_pull_request(tmp_path, {"app/Main.kt": "fun main() = Unit\n"})
+    decision, log = plan(jobs, repo, job="release-build", EVENT_NAME=event, REF=ref, SKIP_PUSH_BRANCHES=skip)
     assert decision == build
     assert ("this build is skipped on a push to develop" in log) == (build == "false")
 
@@ -555,7 +539,6 @@ def test_only_the_release_build_has_a_push_skip_list(jobs):
         == "${{ inputs.release-build-skip-push-branches }}"
     )
     env = step(jobs["verify"], "Decide whether to build")["env"]
-    assert env["BEFORE"] == "${{ github.event.before }}"
     assert env["PATHS_IGNORE"] == "${{ inputs.paths-ignore }}"
 
 

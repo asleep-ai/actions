@@ -1,0 +1,73 @@
+name: Version Bump
+
+# Started by hand for a merged pull request. The run plans the next version
+# and checks the commit, and that is all it does as long as dry_run is on,
+# which is the default. With dry_run off and the planned version in confirm,
+# it then tags the merge commit vX.Y.Z and starts release.yml for the tag, at
+# once: nobody is asked in between. The tag is the release: no branch is moved
+# and nothing is committed.
+#
+# The pull request was merged into the default branch or, for a hotfix of an
+# older major version, into its maintenance branch release/<major>.x. The
+# workflow finds the line from the commit, whichever branch the run is
+# started from.
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Number of the merged pull request to release (its merge commit is tagged)'
+        required: false
+        type: string
+      sha:
+        description: 'Exception: the commit to release, instead of a pull request'
+        required: false
+        type: string
+      bump:
+        description: 'Which part of the version to raise'
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      version:
+        description: 'Exception: the exact version X.Y.Z to release (bump is then ignored)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run: plan and check only. Untick to release, and fill in confirm'
+        required: false
+        default: true
+        type: boolean
+      confirm:
+        description: 'To release (dry run off): the version the dry run planned, e.g. v1.13.1'
+        required: false
+        type: string
+
+# One release at a time: a second run waits for the first. GitHub keeps one
+# waiting run per group, so a third run would replace the one that waits. A
+# dry run writes nothing and gets a group of its own, so it neither waits
+# behind a release nor replaces one.
+concurrency:
+  group: ${{ inputs.dry_run && format('version-bump-dry-{0}', github.run_id) || 'version-bump' }}
+  cancel-in-progress: false
+
+# The called workflow can use no more than what is granted here, and it fails
+# to start when one of these is missing.
+permissions:
+  contents: write       # the tag
+  actions: write        # start release.yml for the tag
+  checks: read          # the checks of the commit
+  pull-requests: read   # the merge commit of the pull request
+
+jobs:
+  version-bump:
+    uses: asleep-ai/actions/.github/workflows/android-version-bump.yml@android-ci/v1
+    with:
+      pr: ${{ inputs.pr }}
+      sha: ${{ inputs.sha }}
+      bump: ${{ inputs.bump }}
+      version: ${{ inputs.version }}
+      dry_run: ${{ inputs.dry_run }}
+      confirm: ${{ inputs.confirm }}

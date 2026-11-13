@@ -49,4 +49,7 @@ runs:
         SETUP_OUTCOME: ${{ inputs.setup-outcome }}
         BUILD_OUTCOME: ${{ inputs.build-outcome }}
         JOB_STATUS: ${{ inputs.job-status }}
-      run: python3 "$GITHUB_ACTION_PATH/verdict.py"
+      # -s -E: no user site-packages and no PYTHON* variables. The step also
+      # runs in jobs that hold a signing key, and on a self-hosted runner an
+      # earlier job can write to both.
+      run: python3 -s -E "$GITHUB_ACTION_PATH/verdict.py"

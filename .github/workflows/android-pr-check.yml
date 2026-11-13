@@ -99,7 +99,8 @@ on:
         description: >-
           Branch names, separated by whitespace or commas. A push to one of
           them skips the release build, for a branch whose pushes another
-          workflow already builds the release variant for.
+          workflow already builds the release variant for. The check of such
+          a push then does not cover the release variant.
         required: false
         type: string
         default: ''
@@ -122,8 +123,10 @@ on:
       paths-ignore:
         description: >-
           Glob patterns, one per line, in the syntax of full-scan-paths. When
-          every file a pull request or push changed matches one of them, the
-          Gradle jobs skip the build and pass. Empty builds on every change.
+          every file a pull request changed matches one of them, the Gradle
+          jobs skip the build and pass. Empty builds on every change. A push
+          always builds, whatever it changed: its check is what a release of
+          the pushed commit relies on.
         required: false
         type: string
         default: |

@@ -177,27 +177,14 @@ def apksigner_run(command: list[str], env: Mapping[str, str], capture: bool) -> 
         raise Failure(f"could not run {command[0]}: {exc}") from None
 
 
-def verify(env: Mapping[str, str]) -> int:
-    apk_input = env.get("APK_FILE", "").strip()
-    if not apk_input:
-        raise Failure("apk-file is required for verify")
+def verify_apk(apksigner: str, apk_input: str, expected: list[str], env: Mapping[str, str]) -> None:
     # An absolute path cannot be read as an option by apksigner.
     apk = os.path.abspath(apk_input)
-    if not os.path.isfile(apk):
-        raise Failure(f"apk-file does not exist: {apk_input}")
-    expected = parse_expected(env.get("EXPECTED_CERT_SHA256", ""))
-    apksigner = str(find_apksigner(sdk_root(env), env.get("BUILD_TOOLS_VERSION", "").strip()))
-    print(f"Using {apksigner}")
-
     if not expected:
         result = apksigner_run([apksigner, "verify", "--verbose", apk], env, capture=False)
         if result.returncode != 0:
             raise Failure(f"apksigner verify failed for {apk_input} (exit status {result.returncode})")
-        # An annotation, not a log line: a misspelt or deleted variable gives an
-        # empty input too, and the step is green either way.
-        annotate("notice", "The APK signature is valid. The signer certificate was not compared, because "
-                           "expected-cert-sha256 is empty.")
-        return 0
+        return
 
     # One run gives both the exit status and the certificates.
     result = apksigner_run([apksigner, "verify", "--verbose", "--print-certs", apk], env, capture=True)
@@ -212,8 +199,34 @@ def verify(env: Mapping[str, str]) -> int:
     # looks like a signer, or a second signer, then fails instead of passing.
     unexpected = sorted(set(found) - set(expected))
     if unexpected:
-        raise Failure(f"the APK is signed with a certificate that is not expected: SHA-256 {', '.join(unexpected)}")
-    print(f"The signature is valid and the signer certificate is expected: SHA-256 {', '.join(sorted(set(found)))}")
+        raise Failure(f"{apk_input} is signed with a certificate that is not expected: "
+                      f"SHA-256 {', '.join(unexpected)}")
+    print(f"The signature of {apk_input} is valid and the signer certificate is expected: "
+          f"SHA-256 {', '.join(sorted(set(found)))}")
+
+
+def verify(env: Mapping[str, str]) -> int:
+    # One path per line: a build with several flavors has several APKs.
+    apk_inputs = [line.strip() for line in env.get("APK_FILE", "").splitlines() if line.strip()]
+    if not apk_inputs:
+        raise Failure("apk-file is required for verify")
+    # Before anything is verified: a path that is wrong must not hide behind the ones that are right.
+    missing = [apk_input for apk_input in apk_inputs if not os.path.isfile(os.path.abspath(apk_input))]
+    if missing:
+        raise Failure("apk-file does not exist: " + "\n".join(missing))
+    expected = parse_expected(env.get("EXPECTED_CERT_SHA256", ""))
+    apksigner = str(find_apksigner(sdk_root(env), env.get("BUILD_TOOLS_VERSION", "").strip()))
+    print(f"Using {apksigner}")
+
+    # Every APK is verified, and the first that fails fails the step.
+    for apk_input in apk_inputs:
+        verify_apk(apksigner, apk_input, expected, env)
+    if not expected:
+        # An annotation, not a log line: a misspelt or deleted variable gives an
+        # empty input too, and the step is green either way.
+        subject = "The APK signature is" if len(apk_inputs) == 1 else f"The signatures of {len(apk_inputs)} APKs are"
+        annotate("notice", f"{subject} valid. The signer certificate was not compared, because "
+                           "expected-cert-sha256 is empty.")
     return 0
 
 
