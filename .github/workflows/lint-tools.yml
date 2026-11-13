@@ -45,20 +45,11 @@ jobs:
       - name: Validate composite action metadata
         run: uvx check-jsonschema --schemafile https://json.schemastore.org/github-action.json pre-commit-changed/action.yml
 
-      # The detekt tests run the hook against a real detekt-cli on PATH. The
-      # checksum pins the release asset; java is on the runner image.
-      - name: Install detekt-cli
-        env:
-          DETEKT_VERSION: '1.23.8'
-          DETEKT_SHA256: ff9f9258879ff2ec4349114740221498afec46a85cf6302c9f80b06eb4429501
-        run: |
-          set -euo pipefail
-          curl -fsSL -o "$RUNNER_TEMP/detekt-cli.zip" \
-            "https://github.com/detekt/detekt/releases/download/v$DETEKT_VERSION/detekt-cli-$DETEKT_VERSION.zip"
-          echo "$DETEKT_SHA256  $RUNNER_TEMP/detekt-cli.zip" | sha256sum --check -
-          unzip -q "$RUNNER_TEMP/detekt-cli.zip" -d "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/detekt-cli-$DETEKT_VERSION/bin" >> "$GITHUB_PATH"
-
+      # With the integration variables, the ktfmt and detekt tests also run the
+      # hooks through the real mise: each throwaway caller repository declares
+      # java and the tool in its mise.toml, and `mise exec` installs them. The
+      # detekt tests take that mise.toml from detekt/README.md, so this step is
+      # what verifies the example there.
       - name: Test lint execution and real ktfmt and detekt integration
         env:
           KTFMT_INTEGRATION: '1'

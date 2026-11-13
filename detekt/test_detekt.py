@@ -2,13 +2,16 @@
 
 Every scenario runs against a fake toolchain (stand-ins for mise and
 detekt-cli), so only git, bash and pre-commit >= 4.4.0 are needed.
-DETEKT_INTEGRATION=1 also runs the shared scenarios with the real detekt-cli
-found on PATH, which needs java. mise stays a stand-in there: the hook only
-asks it to run a command, and the ktfmt tests cover the real one.
+DETEKT_INTEGRATION=1 also runs the shared scenarios with the real mise, java
+and detekt-cli: the throwaway caller repository gets the mise.toml that
+README.md shows, so the run proves that those lines put detekt-cli on PATH.
+DETEKT_INTEGRATION=path is for a machine without mise: the real detekt-cli
+found on PATH (it needs java), with mise still a stand-in.
 
 Run from the repository root:
     uv run --with pytest python -m pytest detekt -q
     DETEKT_INTEGRATION=1 uv run --with pytest python -m pytest detekt -q
+    DETEKT_INTEGRATION=path uv run --with pytest python -m pytest detekt -q
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,14 +33,20 @@ CONFIG = "config/detekt.yml"
 BASELINE = "config/detekt-baseline.xml"
 FINDINGS = 2  # detekt-cli's exit status when it reports findings
 
+INTEGRATION = os.environ.get("DETEKT_INTEGRATION", "")  # "1": real mise; "path": real detekt-cli on PATH
+
 CONFIG_YML = "style:\n  MagicNumber:\n    active: false\n"
+# A second configuration that turns off every rule SMELLY breaks.
+RELAXED_YML = ("empty-blocks:\n  EmptyCatchBlock:\n    active: false\n"
+               "exceptions:\n  TooGenericExceptionCaught:\n    active: false\n  SwallowedException:\n    active: false\n")
 CLEAN = "fun clean(value: Int): Int = value + 1\n"
 # detekt's default rules report the empty catch block; the fake keys on the catch clause.
 SMELLY = 'fun swallow() {\n    try {\n        println("x")\n    } catch (e: Exception) {\n    }\n}\n'
 
-# Stands in for detekt-cli: records its arguments and reports SMELLY files that no baseline names.
+# Stands in for detekt-cli: records its arguments and reports SMELLY files that
+# no baseline names, unless a configuration mentions the rule (RELAXED_YML).
 FAKE_DETEKT = r'''
-import json, os, sys
+import json, os, re, sys
 
 ARITY = {"--build-upon-default-config": 0, "--config": 1, "--baseline": 1, "--plugins": 1, "--jvm-target": 1,
          "--language-version": 1, "--input": 1}
@@ -51,11 +61,12 @@ while index < len(args):
     options[args[index]] = args[index + 1] if count else True
     index += 1 + count
 baseline = open(options["--baseline"]).read() if "--baseline" in options else ""
+relaxed = any("EmptyCatchBlock" in open(path).read() for path in re.split("[,;]", options["--config"]))
 status = int(os.environ.get("FAKE_DETEKT_EXIT", "0"))
 for name in options["--input"].split(","):
     if not os.path.isfile(name):
         sys.exit(f"Input path does not exist: {name}")
-    if "catch (e: Exception)" in open(name).read() and os.path.basename(name) not in baseline:
+    if "catch (e: Exception)" in open(name).read() and os.path.basename(name) not in baseline and not relaxed:
         print(f"{name}:4:7: Empty catch block detected. [EmptyCatchBlock]")
         status = status or 2
 sys.exit(status)
@@ -83,16 +94,25 @@ esac
 class Toolchain:
     name: str
     env: dict[str, str]
-    logs: Path
+    logs: Path | None = None  # where the stand-in mise and detekt-cli record their calls
+    mise_toml: str | None = None  # the real mise reads the caller's configuration
 
     def mise_calls(self) -> list[tuple[str, str]]:
+        assert self.logs is not None
         path = self.logs / "mise.log"
         lines = path.read_text().splitlines() if path.exists() else []
         return [tuple(line.split("\t", 1)) for line in lines]  # type: ignore[misc]
 
     def detekt_calls(self) -> list[list[str]]:
+        assert self.logs is not None
         path = self.logs / "detekt.log"
         return [json.loads(line)["args"] for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def readme_mise_toml() -> str:
+    """The mise.toml that README.md tells a caller to write."""
+    [block] = re.findall(r"```toml\n(.*?)```", (REPO / "detekt" / "README.md").read_text(), re.DOTALL)
+    return block
 
 
 @pytest.fixture(scope="session")
@@ -117,6 +137,15 @@ def base_env(pre_commit_home: Path) -> dict[str, str]:
 
 @pytest.fixture(params=["fake", "real"])
 def toolchain(request: pytest.FixtureRequest, tmp_path: Path, base_env: dict[str, str]) -> Toolchain:
+    if request.param == "real":
+        if INTEGRATION not in ("1", "path"):
+            pytest.skip("the real detekt-cli runs only with DETEKT_INTEGRATION=1 or DETEKT_INTEGRATION=path")
+        if INTEGRATION == "1":
+            if shutil.which("mise", path=base_env["PATH"]) is None:
+                pytest.fail("DETEKT_INTEGRATION=1 needs mise on PATH; use DETEKT_INTEGRATION=path without it")
+            return Toolchain("real", dict(base_env), mise_toml=readme_mise_toml())
+        if shutil.which("detekt-cli", path=base_env["PATH"]) is None:
+            pytest.fail("DETEKT_INTEGRATION=path needs detekt-cli on PATH")
     fake = tmp_path / "fake"
     for directory in ("bin", "detekt", "logs"):
         (fake / directory).mkdir(parents=True)
@@ -124,10 +153,6 @@ def toolchain(request: pytest.FixtureRequest, tmp_path: Path, base_env: dict[str
     env = dict(base_env)
     env.update(PATH=f"{fake / 'bin'}{os.pathsep}{base_env['PATH']}", FAKE_MISE_LOG=str(fake / "logs" / "mise.log"))
     if request.param == "real":
-        if os.environ.get("DETEKT_INTEGRATION") != "1":
-            pytest.skip("the real detekt-cli runs only with DETEKT_INTEGRATION=1")
-        if shutil.which("detekt-cli", path=base_env["PATH"]) is None:
-            pytest.fail("DETEKT_INTEGRATION=1 needs detekt-cli on PATH")
         return Toolchain("real", env, fake / "logs")
     (fake / "detekt.py").write_text(FAKE_DETEKT)
     executable(fake / "detekt" / "detekt-cli", f'#!/bin/sh\nexec "{sys.executable}" "{fake / "detekt.py"}" "$@"\n')
@@ -151,8 +176,10 @@ class Caller:
     def __init__(self, root: Path, toolchain: Toolchain) -> None:
         self.root = root
         self.toolchain = toolchain
-        self.env = dict(toolchain.env)
+        self.env = {**toolchain.env, "MISE_TRUSTED_CONFIG_PATHS": str(root)}
         self.git("init", "-q")
+        if toolchain.mise_toml:
+            (root / "mise.toml").write_text(toolchain.mise_toml)
         self.add(CONFIG, CONFIG_YML)
 
     def git(self, *args: str) -> str:
@@ -175,9 +202,10 @@ class Caller:
         """Record the current findings of `files`, as `detekt-cli --create-baseline` does."""
         (self.root / baseline).parent.mkdir(parents=True, exist_ok=True)
         if self.toolchain.name == "real":
-            subprocess.run(["detekt-cli", "--build-upon-default-config", "--config", config, "--baseline", baseline,
-                            "--create-baseline", "--input", ",".join(files)], cwd=self.root, env=self.env,
-                           capture_output=True, check=False)
+            mise = ["mise", "exec", "--"] if self.toolchain.mise_toml else []
+            subprocess.run([*mise, "detekt-cli", "--build-upon-default-config", "--config", config,
+                            "--baseline", baseline, "--create-baseline", "--input", ",".join(files)],
+                           cwd=self.root, env=self.env, capture_output=True, check=False)
         else:
             ids = "".join(f"    <ID>EmptyCatchBlock:{Path(name).name}$catch (e: Exception) {{ }}</ID>\n" for name in files)
             (self.root / baseline).write_text(
@@ -259,31 +287,56 @@ def test_compiler_options_are_passed_only_when_given(caller: Caller) -> None:
              "--input", "Clean.kt"]]
 
 
-def test_plugins_and_a_standalone_config(caller: Caller) -> None:
-    fake_only(caller.toolchain)
+def test_several_configs_are_all_applied(caller: Caller) -> None:
+    caller.add("Smelly.kt", SMELLY)
+    caller.add("config/detekt-relaxed.yml", RELAXED_YML)
+    both = f"{CONFIG},config/detekt-relaxed.yml"
+
+    caller.run("Smelly.kt", expected=FINDINGS)
+    # The second file turns the reported rules off, so detekt read both.
+    caller.run("--config", both, "Smelly.kt")
+    caller.run("--config", f"config/detekt-relaxed.yml;{CONFIG}", "Smelly.kt")
+
+    result = caller.run("--config", f"{both},config/missing.yml", "Smelly.kt", expected=1)
+    assert "no detekt configuration at config/missing.yml" in result.stderr
+    if caller.toolchain.name == "fake":
+        assert [call[1:3] for call in caller.toolchain.detekt_calls()] == [
+            ["--config", CONFIG], ["--config", both], ["--config", f"config/detekt-relaxed.yml;{CONFIG}"]]
+
+
+def empty_jar(caller: Caller, name: str) -> None:
+    """A jar that holds no rule set: detekt loads it and finds nothing to add."""
+    path = caller.root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as jar:
+        jar.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
+
+
+def test_plugin_jars_are_passed_to_detekt(caller: Caller) -> None:
     caller.add("Clean.kt", CLEAN)
-    caller.add("config/detekt-plugins/rules-a.jar", "jar")
-    caller.add("config/detekt-plugins/rules-b.jar", "jar")
+    caller.add("Smelly.kt", SMELLY)
+    empty_jar(caller, "config/detekt-plugins/rules-a.jar")
+    empty_jar(caller, "config/detekt-plugins/rules-b.jar")
     plugins = "config/detekt-plugins/rules-a.jar,config/detekt-plugins/rules-b.jar"
 
-    caller.run("--plugins", plugins, "--no-build-upon-default-config", "Clean.kt")
+    caller.run("--plugins", plugins, "Clean.kt")
+    caller.run("--plugins", plugins, "Smelly.kt", expected=FINDINGS)
 
-    assert caller.toolchain.detekt_calls() == [["--config", CONFIG, "--plugins", plugins, "--input", "Clean.kt"]]
     missing = caller.run("--plugins", f"{plugins};config/detekt-plugins/missing.jar", "Clean.kt", expected=1)
     assert "no detekt plugin jar at config/detekt-plugins/missing.jar" in missing.stderr
-    assert len(caller.toolchain.detekt_calls()) == 1
+    if caller.toolchain.name == "fake":
+        assert caller.toolchain.detekt_calls() == [
+            ["--build-upon-default-config", "--config", CONFIG, "--plugins", plugins, "--input", "Clean.kt"],
+            ["--build-upon-default-config", "--config", CONFIG, "--plugins", plugins, "--input", "Smelly.kt"]]
 
 
-def test_several_configs_must_all_exist(caller: Caller) -> None:
+def test_default_config_can_be_left_out(caller: Caller) -> None:
     fake_only(caller.toolchain)
     caller.add("Clean.kt", CLEAN)
-    caller.add("config/detekt-compose.yml", CONFIG_YML)
 
-    caller.run("--config", f"{CONFIG},config/detekt-compose.yml", "Clean.kt")
+    caller.run("--no-build-upon-default-config", "Clean.kt")
 
-    assert caller.toolchain.detekt_calls()[-1][1:3] == ["--config", f"{CONFIG},config/detekt-compose.yml"]
-    result = caller.run("--config", f"{CONFIG},config/missing.yml", "Clean.kt", expected=1)
-    assert "no detekt configuration at config/missing.yml" in result.stderr
+    assert caller.toolchain.detekt_calls() == [["--config", CONFIG, "--input", "Clean.kt"]]
 
 
 def test_named_baseline_must_exist(caller: Caller) -> None:
@@ -349,6 +402,23 @@ def test_unsafe_invocations_are_rejected(caller: Caller) -> None:
     assert caller.toolchain.detekt_calls() == []
 
 
+@pytest.mark.parametrize(("args", "message"), [
+    # The next option would be swallowed as the value, and detekt would fail on it with a stack trace.
+    (["--jvm-target", "--language-version", "2.0"], "--jvm-target needs a value, not the option --language-version"),
+    (["--baseline", "-baseline.xml"], "--baseline needs a value, not the option -baseline.xml"),
+    (["--config", ","], "--config has an empty entry"),
+    (["--config", "config/detekt.yml,"], "--config has an empty entry"),
+    (["--config", ";config/detekt.yml"], "--config has an empty entry"),
+    (["--plugins", "a.jar,,b.jar"], "--plugins has an empty entry"),
+])
+def test_option_values_detekt_would_misread_are_rejected(caller: Caller, args: list[str], message: str) -> None:
+    fake_only(caller.toolchain)
+    caller.add("Clean.kt", CLEAN)
+
+    assert message in caller.run(*args, "Clean.kt", expected=2).stderr
+    assert caller.toolchain.detekt_calls() == []
+
+
 def test_detekt_exit_status_is_propagated(caller: Caller) -> None:
     fake_only(caller.toolchain)
     caller.add("Clean.kt", CLEAN)
@@ -394,13 +464,20 @@ def test_missing_detekt_cli_fails_with_a_hint(caller: Caller) -> None:
 
     result = caller.run("Clean.kt", expected=1)
 
-    assert "detekt-cli is not on PATH in the project's mise environment" in result.stderr
+    assert "detekt-cli is not on PATH inside `mise exec`" in result.stderr
     assert "mise.toml" in result.stderr
+
+
+def test_readme_shows_the_mise_configuration_the_integration_run_uses() -> None:
+    # DETEKT_INTEGRATION=1 writes this block as the caller's mise.toml.
+    block = readme_mise_toml()
+    assert block.count("[tools]") == 1
+    assert re.search(r'^java = "', block, re.MULTILINE) and "detekt" in block
 
 
 def pre_commit_command(env: dict[str, str]) -> list[str]:
     # A developer run may skip without pre-commit; an integration run must not pass without it.
-    unavailable = pytest.fail if os.environ.get("DETEKT_INTEGRATION") == "1" else pytest.skip
+    unavailable = pytest.fail if INTEGRATION in ("1", "path") else pytest.skip
     if shutil.which("pre-commit", path=env["PATH"]) is None:
         unavailable("pre-commit is not installed")
     result = subprocess.run(["pre-commit", "--version"], env=env, text=True, capture_output=True, check=False)
@@ -451,12 +528,13 @@ def test_remote_hook_runs_from_its_clone_in_the_caller_root(
     assert "Bad Space.kt" in output and "EmptyCatchBlock" in output
     pre_commit(caller, "detekt", "--files", "Clean.kt")
 
-    calls = caller.toolchain.mise_calls()
-    # mise reads the caller's configuration: every call runs in the caller root.
-    assert {os.path.realpath(cwd) for cwd, _ in calls} == {os.path.realpath(caller.root)}
-    script = calls[0][1].split(" ")[3]
-    assert os.path.realpath(script).startswith(os.path.realpath(pre_commit_home))
-    assert not os.path.realpath(script).startswith(str(REPO))
+    if caller.toolchain.logs:
+        calls = caller.toolchain.mise_calls()
+        # mise reads the caller's configuration: every call runs in the caller root.
+        assert {os.path.realpath(cwd) for cwd, _ in calls} == {os.path.realpath(caller.root)}
+        script = calls[0][1].split(" ")[3]
+        assert os.path.realpath(script).startswith(os.path.realpath(pre_commit_home))
+        assert not os.path.realpath(script).startswith(str(REPO))
 
 
 def test_hook_args_replace_the_defaults(caller: Caller, hook_repo: tuple[Path, str]) -> None:

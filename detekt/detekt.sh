@@ -63,6 +63,17 @@ while [ "$#" -gt 0 ]; do
     # No `--option=VALUE` form: a tracked file may be named --config=X.kt.
     --config | --baseline | --plugins | --jvm-target | --language-version)
       { [ "$#" -ge 2 ] && [ -n "$2" ]; } || usage_error "$1 needs a value"
+      # detekt-cli would take it as the value all the same and fail on it.
+      case "$2" in
+        -*) usage_error "$1 needs a value, not the option $2 (write a path that starts with - as ./-...)" ;;
+      esac
+      case "$1" in
+        --config | --plugins)
+          case "$2" in
+            [,\;]* | *[,\;] | *[,\;][,\;]*) usage_error "$1 has an empty entry: $2" ;;
+          esac
+          ;;
+      esac
       case "$1" in
         --config) CONFIG="$2" ;;
         --baseline) BASELINE="$2" BASELINE_GIVEN=1 ;;
@@ -119,8 +130,11 @@ done
 # Without --input detekt would scan the whole working directory.
 [ "${#inputs[@]}" -gt 0 ] || exit 0
 
+# Whichever detekt-cli is first on PATH inside `mise exec` runs. Unlike the
+# ktfmt hook, this one does not ask mise whether the tool is declared: it does
+# not know which mise tool the caller gets detekt-cli from.
 command -v detekt-cli >/dev/null 2>&1 ||
-  die "detekt-cli is not on PATH in the project's mise environment; declare detekt under [tools] in mise.toml"
+  die "detekt-cli is not on PATH inside \`mise exec\`; add a tool that provides it under [tools] in mise.toml (see the hook's README)"
 
 detekt=(detekt-cli)
 [ -z "$BUILD_UPON_DEFAULT_CONFIG" ] || detekt+=(--build-upon-default-config)

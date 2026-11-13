@@ -29,7 +29,8 @@ caller's. This repository only holds the script that puts them together.
 - A detekt configuration at `config/detekt.yml`, or elsewhere with `--config`.
 - bash and git.
 
-Any mise tool that puts `detekt-cli` on `PATH` works, for example:
+Any mise tool that puts `detekt-cli` on `PATH` works. This repository's CI
+runs the hook with exactly these lines:
 
 ```toml
 # mise.toml
@@ -40,6 +41,13 @@ java = "temurin-17.0.20+8"
 
 Exact versions and a committed `mise.lock` (`mise lock`) are recommended, so
 local runs and CI report the same findings.
+
+Unlike the [`ktfmt`](../ktfmt/) hook, this one does not check that the mise
+configuration declares the tool: it does not know which mise tool a caller
+gets `detekt-cli` from, so it cannot ask mise for it. If the configuration
+declares none and another `detekt-cli` is installed on the machine, that one
+runs, and its version may differ from CI's. Declare the tool in `mise.toml` to
+rule that out.
 
 ## Usage
 
@@ -86,15 +94,40 @@ item. There is no `--option=value` form.
 | `--language-version VERSION` | detekt's own | `--language-version VERSION` |
 
 All paths are relative to the repository root. An option given twice keeps the
-last value. Any other option fails the hook with exit status 2; detekt options
-that write files (`--create-baseline`, `--auto-correct`, reports) are not part
-of a check and are run directly, as below.
+last value. A value may not start with `-` (write such a path as `./-name`),
+and a list may not have an empty entry. Any other option fails the hook;
+detekt options that write files (`--create-baseline`, `--auto-correct`,
+reports) are not part of a check and are run directly, as below.
 
 With `--build-upon-default-config`, the caller's configuration only needs the
 rules it changes; everything else keeps detekt's defaults.
 
 The hook's exit status is detekt-cli's: 0 when there is nothing to report;
-detekt 1.23 exits with 2 when there are findings.
+detekt 1.23 exits with 2 when there are findings. A wrong option also exits
+with 2, as in the ktfmt hook, so tell the two apart by the output: the hook's
+own messages start with `detekt hook:` and are followed by the usage line.
+
+## Moving from a script in the repository
+
+A repository that ran detekt-cli from its own script passes, as `args`, what
+that script passed. Leaving one out is not an error: detekt then falls back to
+its own default, for instance its default JVM target and language version, and
+reports different findings without saying why.
+
+```yaml
+      - id: detekt
+        args:
+          - --jvm-target
+          - '17'
+          - --language-version
+          - '2.2'
+          - --plugins
+          - config/detekt-plugins/rules-a.jar,config/detekt-plugins/rules-b.jar
+```
+
+`--build-upon-default-config`, `--config config/detekt.yml` and
+`--baseline config/detekt-baseline.xml` are the hook's defaults and need no
+`args`.
 
 ## Baseline
 
@@ -104,12 +137,26 @@ baseline records those findings, so only new ones fail the hook.
 
 The baseline is optional: a repository without legacy findings needs none, and
 the hook then passes no `--baseline`. Create or regenerate it with detekt
-itself, using the same options as the hook, and review the diff:
+itself, using the same options as the hook and the same files the hook can
+receive, which is every tracked `.kt` and `.kts` file, in every module and
+including build scripts:
 
 ```bash
 mise exec -- detekt-cli --build-upon-default-config --config config/detekt.yml \
-  --baseline config/detekt-baseline.xml --create-baseline --input app/src
+  --baseline config/detekt-baseline.xml --create-baseline \
+  --input "$(git ls-files '*.kt' '*.kts' | paste -sd, -)"
 ```
+
+Add the hook's other `args` (`--plugins`, `--jvm-target`,
+`--language-version`) to the command, and review the diff. A baseline made
+from a narrower input, such as one module's source directory, has no entries
+for the other files, and the first pull request that touches one of them
+inherits all of its legacy findings.
+
+If the hook's `files` or `exclude` are overridden in
+`.pre-commit-config.yaml`, narrow the `git ls-files` patterns the same way. In
+a repository so large that the list exceeds the operating system's limit for
+one argument, pass the directories that hold those files instead.
 
 ## Plugins
 
@@ -139,11 +186,16 @@ plugins, so it works offline and the bytes it runs are the ones under review.
 ```bash
 uv run --with pytest python -m pytest detekt -q
 DETEKT_INTEGRATION=1 uv run --with pytest python -m pytest detekt -q
+DETEKT_INTEGRATION=path uv run --with pytest python -m pytest detekt -q
 ```
 
 The default run uses stand-ins for mise and detekt-cli and needs git, bash,
 and pre-commit 4.4.0+ on `PATH`; without pre-commit the hook tests skip.
-`DETEKT_INTEGRATION=1` repeats the shared scenarios with the real `detekt-cli`
-found on `PATH` (it needs java), and fails rather than skips when detekt-cli
-or pre-commit is missing or pre-commit is older than 4.4.0. mise stays a
-stand-in in both runs.
+
+`DETEKT_INTEGRATION=1` repeats the shared scenarios with the real mise, java
+and detekt-cli, as CI does. The throwaway caller repository gets the
+`mise.toml` shown under [Caller contract](#caller-contract), read from this
+file, so that example is what the run verifies. `DETEKT_INTEGRATION=path` is
+for a machine without mise: it uses the real `detekt-cli` found on `PATH`
+(which needs java) and keeps the stand-in for mise. Both fail rather than skip
+when a tool they need is missing or pre-commit is older than 4.4.0.
