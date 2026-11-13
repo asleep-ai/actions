@@ -6,7 +6,7 @@ Shared GitHub Actions, local lint hooks, and adoption templates for `asleep-ai` 
 
 | path | description |
 |------|-------------|
-| [`openai-review/`](./openai-review/) | Manual API-key PR review without checking out or executing PR code; bounded advisory output. |
+| [`codex-review/`](./codex-review/) | Automatic API-key Codex agent review for trusted internal PRs; reusable workflow with isolated read-only exploration and feedback publishing. |
 | [`release-notes/`](./release-notes/) | AI-drafted markdown release notes from a git tag range, with a deterministic commit-list fallback. |
 | [`pre-commit-changed/`](./pre-commit-changed/) | Run the caller's pre-commit hooks against event-specific changes, with full scans for lint configuration changes. |
 

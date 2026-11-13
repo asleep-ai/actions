@@ -1,0 +1,22 @@
+name: Codex review workflow tests
+on:
+  pull_request:
+    paths: ['codex-review/**', '.github/workflows/code-review.yml', '.github/workflows/codex-review-tests.yml']
+  push:
+    branches: [main]
+    paths: ['codex-review/**', '.github/workflows/code-review.yml', '.github/workflows/codex-review-tests.yml']
+permissions:
+  contents: read
+concurrency:
+  group: codex-review-tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: node --test codex-review/test-workflow.mjs
+      - run: python3 codex-review/test-bound.py
