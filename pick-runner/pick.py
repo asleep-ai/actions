@@ -12,13 +12,15 @@ Rules:
   count: waiting for one beats moving the run elsewhere. Labels compare
   case-insensitively, as GitHub matches runs-on labels.
 - No matching runner is online -> the fallback, with a warning.
-- The check itself cannot run (no token, API error, unreadable response) ->
-  the labels, with a warning. A failed check is not evidence that the runners
-  are offline, and the labels are what the jobs used before this check.
+- The check itself cannot run (no token, API error, unreadable response, or
+  any other error while reading the runners) -> the labels, with a warning. A
+  failed check is not evidence that the runners are offline, and the labels are
+  what the jobs used before this check.
 - Invalid inputs fail the step: they are caller bugs, not runner state.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -53,27 +55,47 @@ class Result:
     warning: Optional[Tuple[str, str]]  # (title, message)
 
 
-def parse_labels(raw: str) -> list:
+def parse_labels(raw: str, name: str = "labels") -> list:
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise InputError(f"labels must be a JSON array of strings: {exc}") from None
+        raise InputError(f"{name} must be a JSON array of strings: {exc}") from None
     if not isinstance(value, list) or not value:
-        raise InputError("labels must be a non-empty JSON array of strings")
+        raise InputError(f"{name} must be a non-empty JSON array of strings")
     for label in value:
-        if not isinstance(label, str) or not label.strip():
-            raise InputError(f"labels must contain only non-empty strings, got {label!r}")
+        # A label with surrounding whitespace never equals a runner's label.
+        if not isinstance(label, str) or not label or label != label.strip():
+            raise InputError(
+                f"{name} must contain only non-empty strings without surrounding whitespace, got {label!r}"
+            )
     return value
 
 
 def parse_fallback(raw: str) -> str:
-    """Return the fallback as JSON: a quoted label or a label array."""
+    """Return the fallback as JSON: a quoted label or a label array.
+
+    Anything else fails here. A value that is not a real label would queue the
+    jobs for a runner that does not exist, the wait this action is there to
+    prevent.
+    """
     text = raw.strip()
     if not text:
         raise InputError("fallback must not be empty")
     if text.startswith("["):
-        return json.dumps(parse_labels(text), separators=(",", ":"))
-    return json.dumps(text)
+        return json.dumps(parse_labels(text, "fallback"), separators=(",", ":"))
+    shape = InputError(f"fallback must be one label or a JSON array of labels, got {text!r}")
+    label = text
+    if text.startswith('"'):
+        # A JSON string, as a runs-on output is written: the label is inside.
+        try:
+            label = json.loads(text)
+        except json.JSONDecodeError:
+            raise shape from None
+    # A label with a comma or whitespace is far more likely a list or an object
+    # written the wrong way; the array form still takes such a label.
+    if not label or label.startswith("{") or "," in label or any(ch.isspace() for ch in label):
+        raise shape
+    return json.dumps(label)
 
 
 def next_link(link: Optional[str], api_url: str) -> Optional[str]:
@@ -137,10 +159,14 @@ def decide(labels: list, fallback: str, token: str, org: str, api_url: str, fetc
         ))
     try:
         online = count_online(list_runners(org, token, api_url, fetch), labels)
-    except CheckError as exc:
+    except Exception as exc:
+        # Whatever stopped the check, expected or not, it is a failed check and
+        # not evidence that the runners are offline. An unexpected exception is
+        # named by type only: its message can quote the request, token included.
+        reason = str(exc) if isinstance(exc, CheckError) else f"unexpected error ({type(exc).__name__})"
         return Result(chosen, True, None, (
             "Runner check failed",
-            f"Could not read the runners of {org}, so the jobs go to the self-hosted labels unchecked: {exc}",
+            f"Could not read the runners of {org}, so the jobs go to the self-hosted labels unchecked: {reason}",
         ))
     if online > 0:
         return Result(chosen, True, online, None)
@@ -148,6 +174,24 @@ def decide(labels: list, fallback: str, token: str, org: str, api_url: str, fetc
         "Self-hosted runners offline",
         f"No online runner carries every label in {chosen}, so this run uses {fallback}.",
     ))
+
+
+class SameHostRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only when it stays on the host that was asked.
+
+    urllib sends the Authorization header along with a redirect, wherever it
+    points, so a redirect to another host would hand that host the token.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        asked = urllib.parse.urlsplit(req.full_url)
+        target = urllib.parse.urlsplit(newurl)
+        if (asked.scheme, asked.netloc) != (target.scheme, target.netloc):
+            raise CheckError(f"redirect points outside {asked.scheme}://{asked.netloc}: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(SameHostRedirects)
 
 
 def http_get(url: str, token: str) -> Tuple[bytes, Optional[str]]:
@@ -158,13 +202,15 @@ def http_get(url: str, token: str) -> Tuple[bytes, Optional[str]]:
         "User-Agent": "asleep-ai-actions-pick-runner",
     })
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with _OPENER.open(request, timeout=20) as response:
             return response.read(), response.headers.get("Link")
     except urllib.error.HTTPError as exc:
         detail = exc.read(300).decode(errors="replace").strip()
         raise CheckError(f"HTTP {exc.code}: {detail}") from None
-    except (urllib.error.URLError, OSError) as exc:
-        raise CheckError(str(exc)) from None
+    # http.client's own errors (a truncated body, a reply that is not HTTP) are
+    # not OSErrors.
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        raise CheckError(str(exc) or type(exc).__name__) from None
 
 
 def escape(text: str) -> str:
@@ -184,7 +230,9 @@ def main(env: Mapping[str, str] = os.environ, fetch: Fetch = http_get) -> int:
         return 1
 
     api_url = env.get("GITHUB_API_URL") or "https://api.github.com"
-    result = decide(labels, fallback, env.get("TOKEN", ""), org, api_url, fetch)
+    # A secret pasted with a trailing newline is still the same token.
+    token = env.get("TOKEN", "").strip()
+    result = decide(labels, fallback, token, org, api_url, fetch)
 
     if result.warning:
         title, message = result.warning

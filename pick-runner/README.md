@@ -30,13 +30,22 @@ jobs:
 
 No checkout is needed; the action only calls the GitHub API.
 
+If the `pick-runner` job itself fails (an invalid input, a GitHub-hosted outage, its timeout), the jobs that need it are skipped. To send them to the self-hosted labels instead, let them run anyway and repeat the labels as the default:
+
+```yaml
+  build:
+    needs: pick-runner
+    if: ${{ !cancelled() }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs-on || '["self-hosted","Linux","X64"]') }}
+```
+
 ## Inputs
 
 | name | required | default | description |
 |------|----------|---------|-------------|
 | `labels` | yes | | Self-hosted `runs-on` labels as a JSON array of strings. |
 | `token` | yes | | Token that can list the organization's self-hosted runners (see [Token](#token)). When empty, the check is skipped (see [Rules](#rules)). |
-| `fallback` | no | `ubuntu-latest` | `runs-on` when no matching runner is online: one label, or a JSON array of labels. |
+| `fallback` | no | `ubuntu-latest` | `runs-on` when no matching runner is online: one label (`ubuntu-latest`), or a JSON array of labels. A `runs-on` object (`group:`) is not supported. |
 | `organization` | no | `github.repository_owner` | Organization whose runners are checked. |
 
 ## Outputs
@@ -53,13 +62,15 @@ No checkout is needed; the action only calls the GitHub API.
 |-------|-------|-----|
 | At least one online runner carries every label | `labels` | |
 | No matching runner is online | `fallback` | warning |
-| No token, API error, or unreadable response | `labels` | warning |
+| No token, API error, unreadable response, or any other error while reading the runners | `labels` | warning |
 | Invalid `labels`, `fallback` or `organization` | — (step fails) | error |
 
 - Busy runners count as available: waiting for one beats moving the run elsewhere.
-- A runner matches when it carries every label. Labels compare case-insensitively, as GitHub matches `runs-on` labels; extra labels on the runner do not matter.
+- A runner matches when it carries every label. Labels compare case-insensitively, as GitHub matches `runs-on` labels ([labels are case-insensitive](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/apply-labels)); extra labels on the runner do not matter.
+- Only the organization's runner list is read. A runner registered on a repository is not counted, and runner-group access is not checked: a runner in a group the calling repository cannot use may still be counted.
 - A failed check is not evidence that the runners are offline, so it keeps the self-hosted labels instead of silently moving every run to GitHub-hosted runners. Watch for the `Runner check failed` warning.
-- Every page of the runner list is read. Pagination links are only followed on the API host the token was issued for.
+- Every page of the runner list is read. Pagination links and redirects are only followed on the API host the token was issued for.
+- A `fallback` that is not one label or an array of labels fails the step: quoted JSON is unwrapped, but an object, or a single label containing a comma or whitespace, is rejected. A label that no runner has would leave the jobs queued, which is what this action is there to prevent.
 
 ## Token
 
