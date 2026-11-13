@@ -1,10 +1,24 @@
 # android-ci
 
-Reusable workflows for Android app repositories. The calling repository keeps a short workflow file and two Gradle tasks; the jobs, the runner choice and the re-run policy live here.
+Reusable workflows for Android app repositories. The calling repository keeps a short workflow file per workflow and a few Gradle tasks; the jobs, the runner choice and the re-run policy live here.
 
 | workflow | description |
 |----------|-------------|
 | [`android-pr-check.yml`](../.github/workflows/android-pr-check.yml) | Pull request check: code style, a verification build and a release build, with a GitHub-hosted re-run after an infrastructure failure on self-hosted runners. |
+| [`android-version-bump.yml`](../.github/workflows/android-version-bump.yml) | Release cut, started by hand: computes the next version from the tags, checks the commit, and after approval tags it `vX.Y.Z` and moves the main branch to it. |
+| [`android-release.yml`](../.github/workflows/android-release.yml) | Release of a tag `vX.Y.Z`: a cold, signed build, a check of the APK, and a GitHub Release with the APK attached. |
+
+A version exists only as a git tag. No file in the calling repository states it:
+
+```
+pull request merged
+        │
+        ▼
+version-bump.yml (by hand: pr, bump) ──▶ plan ──▶ approval ──▶ tag vX.Y.Z, main moved
+                                                                      │
+                                                                      ▼
+release.yml (for the tag) ──▶ plan ──▶ build with -PciVersionName, -PciVersionCode ──▶ GitHub Release
+```
 
 ## android-pr-check.yml
 
@@ -232,24 +246,331 @@ KEY_PASSWORD=…
 
 When the Gradle step of `verify` or `release-build` fails, the job uploads `**/build/reports/tests/**`, `**/build/reports/lint-results-*` and `**/build/reports/configuration-cache/**` as an artifact named `android-pr-check-<job>-reports-<primary|fallback>`, kept for 14 days. A build that fails before any report exists uploads nothing, and a failed upload does not change the job's outcome.
 
-### Versioning
+## android-version-bump.yml
+
+### Usage
+
+```yaml
+name: Version Bump
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Number of the merged pull request to release (its merge commit is tagged)'
+        type: string
+      sha:
+        description: 'Exception: the commit to release, instead of a pull request'
+        type: string
+      bump:
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      dry_run:
+        type: boolean
+        default: false
+
+concurrency:
+  group: version-bump
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+  checks: read
+  pull-requests: read
+
+jobs:
+  version-bump:
+    uses: asleep-ai/actions/.github/workflows/android-version-bump.yml@android-ci/v1
+    with:
+      pr: ${{ inputs.pr }}
+      sha: ${{ inputs.sha }}
+      bump: ${{ inputs.bump }}
+      dry_run: ${{ inputs.dry_run }}
+```
+
+[`version-bump.yml.example`](./version-bump.yml.example) is a complete file.
+
+- `permissions` must grant the four scopes above: the tag and the branch (`contents: write`), starting the release workflow (`actions: write`), reading the commit's checks and the pull request.
+- No secret is needed. See [Secrets](#secrets-1) for the one optional token.
+- Give the calling file one `concurrency` group without cancellation, so two releases never plan from the same state.
+
+### Jobs
+
+| job | runs on | what it does |
+|-----|---------|--------------|
+| `plan` | GitHub-hosted | Read-only. Computes the next version with [`release-version`](../release-version/), checks the commit, and writes the plan to the job summary. |
+| `tag` | GitHub-hosted, in `environment` | Waits for the environment's approval, tags the commit, moves `main-branch` to it and starts `release-workflow`. Skipped on a dry run. |
+
+### What is released
+
+- **The commit** is the merge commit of the pull request named by `pr`: the commit the merge left on its base branch. `sha` names a commit directly and is the exception, for a commit that no pull request produced.
+- **The version** is the last release raised by `bump`. The last release is the highest `vX.Y.Z` among all tags of the repository, compared as numbers. Tags with a suffix (`v1.2.3-rc.1`) or of another form are not releases. A repository without a release tag counts from `0.0.0`, so `minor` gives `v0.1.0`.
+- **The summary** shows `vA → vB`, the commit, its versionCode, and the pull requests the release adds (number and title), read from the first-parent history between the two versions. A commit that names no pull request is listed by its id.
+
+The plan refuses the release, with an error that says which rule it was, when:
+
+- the pull request is not merged, or the commit is not in the repository;
+- the commit does not contain the last release, or is the commit of the last release (nothing new);
+- a check named in `required-checks` has not succeeded on the commit. The newest run of each check counts, and a check that never ran on the commit is a refusal;
+- `main-branch` holds a commit that the commit to release lacks;
+- the version has no versionCode under [the formula](#version-and-versioncode).
+
+Every refusal happens in `plan`, so a dry run shows it and nobody is asked to approve a release that cannot happen.
+
+`required-checks` defaults to `pr-check / result`, the check of [`android-pr-check.yml`](#android-pr-checkyml) when the calling job is named `pr-check`. The merge commit gets that check from the `push` run of the pull request check on the base branch, so the calling repository has to run it on pushes to that branch. A run that was cancelled by a newer push leaves the check `cancelled`; run it again for that commit, or release the newer commit.
+
+### The tag and the main branch
+
+- The tag is an annotated tag on the commit itself. No commit is created: the version is in no file.
+- `main-branch` is moved to the same commit as a fast-forward, never with a merge commit. The released commit, the tagged commit and the tip of `main-branch` are then one commit, the one whose checks passed. A merge commit on `main-branch` would be a commit that nothing checked, and it would put the next release's starting point outside the working branch.
+- The tag and the branch go in one atomic push. When the branch cannot move, for instance because a rule of the repository refuses the push, no tag is left behind.
+- When `main-branch` holds commits of its own, merge it into the working branch (a merge commit, not a squash) and release a commit after that merge. A repository that used to release with merge commits on `main-branch` has to do this once.
+- The push uses the job token. A repository whose rules do not let it push to `main-branch` provides `RELEASE_PUSH_TOKEN`.
+
+### Starting the release
+
+GitHub starts no workflow for a push made with the job token, so the new tag alone would not start the release. The `tag` job therefore starts `release-workflow` for the tag itself, as a manual run: starting a workflow by hand is one of the two events the job token may cause.
+
+- The calling repository's release workflow needs the `workflow_dispatch` trigger, and has to exist at the tagged commit.
+- The release runs as a run of its own, on the tag. It can be run again without another version bump, and the rules of its environment see the tag as the ref.
+- With `RELEASE_PUSH_TOKEN`, the tag push itself starts every workflow that triggers on tags. Set `release-workflow: ''` then, or the release runs twice.
+
+### Approval and dry run
+
+The `tag` job runs in `environment`, and the protection rules of that environment are the approval: with required reviewers, the job waits until one of them approves, with the plan already in the summary of the run. Without protection rules the job runs at once.
+
+With `dry_run`, only `plan` runs. Nothing is tagged, pushed or started, and no approval is asked for.
+
+### Running again
+
+- Time passes between the plan and the approval. Before it pushes, the `tag` job plans the version again from the repository as it is then, and stops when the result differs: another release happened meanwhile.
+- A run that tagged and then failed can be run again, as a re-run or as a new run with the same inputs after the failure is fixed. A re-run finds the tag on the commit and does only what is left: the branch, and starting the release.
+
+### Inputs
+
+| name | default | description |
+|------|---------|-------------|
+| `pr` | `''` | Number of the merged pull request to release. Exactly one of `pr` and `sha` is given. |
+| `sha` | `''` | The exception to `pr`: id of the commit to release, 7 or more hex digits. A branch name is refused. |
+| `bump` | `patch` | Which part of the last version to raise: `patch`, `minor` or `major`. |
+| `dry_run` | `false` | Plan and check only. |
+| `required-checks` | `pr-check / result` | Names of the checks that must have succeeded on the commit, one per line, as the commit's list of checks shows them. Empty requires none. |
+| `main-branch` | `main` | The branch that is moved to the released commit. Empty moves no branch. |
+| `release-workflow` | `release.yml` | File name of the calling repository's workflow that is started for the new tag. Empty starts nothing. |
+| `environment` | `release` | The environment of the `tag` job. |
+
+### Secrets
+
+| name | used for |
+|------|----------|
+| `RELEASE_PUSH_TOKEN` | Optional. Pushes the tag and the branch instead of the job token. Needs write access to the repository's contents, and the right to push to `main-branch` under the repository's rules. |
+
+## android-release.yml
+
+### Usage
+
+```yaml
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: read
+  pull-requests: read
+
+jobs:
+  release:
+    uses: asleep-ai/actions/.github/workflows/android-release.yml@android-ci/v1
+    with:
+      runner-labels: '["self-hosted","Linux","X64"]'
+      local-properties-secrets: |
+        EXAMPLE_API_KEY
+        EXAMPLE_BASE_URL
+      required-secrets: SENTRY_AUTH_TOKEN
+    secrets: inherit
+```
+
+[`release.yml.example`](./release.yml.example) is a complete file.
+
+- `workflow_dispatch` is how [`android-version-bump.yml`](#starting-the-release) starts the release. The tag trigger covers a tag pushed by a person.
+- `permissions` must grant the three scopes above: the GitHub Release, private packages, and pull request descriptions for the release notes.
+- `secrets: inherit` is required here, unlike in the pull request check. See [Secrets and variables](#secrets-and-variables).
+
+### Jobs
+
+```
+plan ─▶ primary / build ─▶ fallback / build ─▶ publish
+```
+
+| job | runs on | what it does |
+|-----|---------|--------------|
+| `plan` | GitHub-hosted | Checks the tag, computes the versionCode, and picks the runner with [`pick-runner`](../pick-runner/). |
+| `primary / build` | picked runner, in `environment` | Builds the tag with `./gradlew ciRelease`, checks the APK and uploads it as an artifact. |
+| `fallback / build` | `fallback-runs-on`, in `environment` | The same build again, only after an infrastructure failure of a self-hosted primary build. |
+| `publish` | GitHub-hosted | Creates the GitHub Release with the APK of the build that passed, or adds the APK to an existing release. |
+
+### What the calling repository provides
+
+| what | contract |
+|------|----------|
+| `ciRelease` | Gradle task in the root project that builds the one release APK, signed, and runs the uploads that belong to a release, such as mapping files. Which variant or flavor that is, is decided in the calling repository's build; `gradle-args` can pass it a property. |
+| Version | The build takes `versionName` from `-PciVersionName` and `versionCode` from `-PciVersionCode`. The workflow reads both back from the APK and fails when they differ. |
+| Signing | The release variant's `signingConfig` reads `KEYSTORE_FILE`, `KEYSTORE_PASSWORD`, `KEY_ALIAS` and `KEY_PASSWORD` from `local.properties` in the repository root, as for the pull request check. |
+| Other `local.properties` values | Named in `local-properties-secrets`. Each is a secret or a variable, written under its own name. |
+| `SENTRY_AUTH_TOKEN` | Read by the build from the environment. Only the Gradle step has it. |
+| APK | `apk-path` matches exactly one file after the build. |
+| Runners | bash, git, `python3` 3.9 or newer, and an Android SDK with a build-tools package (`apksigner`, `aapt2`) that is found through `ANDROID_HOME`. GitHub-hosted Ubuntu runners have all of it. |
+
+### Inputs
+
+| name | default | description |
+|------|---------|-------------|
+| `tag` | `''` | The release tag to build. Empty means the ref the run started for: the tag on a tag push, and on a manual run started for a tag. |
+| `runner-labels` | `''` | Self-hosted `runs-on` labels as a JSON array of strings. Empty builds on `fallback-runs-on`, with no runner check and no re-run. |
+| `fallback-runs-on` | `ubuntu-latest` | GitHub-hosted `runs-on`: a bare label or a JSON array of labels, as for the pull request check. |
+| `environment` | `release` | The environment of the build job. See [Environment](#environment). |
+| `java-version` | `17` | JDK version for the build. |
+| `java-distribution` | `temurin` | JDK distribution for `actions/setup-java`. |
+| `checkout-submodules` | `false` | `submodules` of `actions/checkout` in the build: `false`, `true` or `recursive`. Anything but `false` checks out with `GIT_TOKEN`. |
+| `local-properties-secrets` | `''` | Names of secrets and variables, separated by whitespace or commas, written to `local.properties` under their own names. |
+| `required-secrets` | `''` | Names of secrets and variables that must not be empty and are not written to `local.properties`, such as `SENTRY_AUTH_TOKEN`. |
+| `gradle-args` | `''` | Extra Gradle arguments for `./gradlew ciRelease`, split on whitespace without glob expansion. |
+| `apk-path` | `app/build/outputs/apk/release/*.apk` | Glob pattern of the APK, relative to the repository root. |
+| `expected-cert-sha256` | `''` | Optional SHA-256 digest of the signing certificate the APK must carry, as [`android-signing`](../android-signing/#comparing-the-certificate) takes it. Empty checks only that the signature is valid. |
+| `build-tools-version` | `''` | Optional build-tools version whose `apksigner` and `aapt2` check the APK. Empty uses the highest installed version. |
+| `release-branch` | `main` | The branch the tagged commit has to be on. Empty skips the check. |
+| `release-notes-prompt` | `''` | System prompt for [`release-notes`](../release-notes/), replacing its built-in one. |
+| `build-timeout-minutes` | `60` | Timeout of the build job, on either kind of runner. The build never uses a cache, so size it for a cold build. |
+| `self-hosted-max-workers` | `32` | Gradle `--max-workers` on a self-hosted runner. Empty leaves Gradle's default. |
+| `self-hosted-gradle-jvmargs` | `-Xmx16g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8` | `org.gradle.jvmargs` on a self-hosted runner. Empty keeps the caller's `gradle.properties` value. |
+| `self-hosted-kotlin-daemon-jvmargs` | `-Xmx6g` | `kotlin.daemon.jvmargs` on a self-hosted runner. Empty keeps the caller's value. |
+
+### Secrets and variables
+
+The calling job passes `secrets: inherit`. The names in `local-properties-secrets` and `required-secrets` are known only to the calling repository, so the workflow cannot declare them, and a secret that is not declared can only be handed over with `inherit`. Variables need nothing: a called workflow reads the caller's.
+
+The workflow reads these by name:
+
+| name | required | used for |
+|------|----------|----------|
+| `KEYSTORE_BASE64` | yes | The signing keystore, base64-encoded (`base64 -i release.jks`). |
+| `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD` | yes | Written to `local.properties` with the path of the decoded keystore. |
+| `RUNNER_READ_TOKEN` | no | `pick-runner`'s token. Without it the self-hosted labels are used unchecked, with a warning. |
+| `GIT_TOKEN` | no | Checkout when `checkout-submodules` is not `false`, and `GITHUB_TOKEN` of the Gradle step, so private GitHub Packages of other repositories resolve. Without it both use the job token. |
+| `SENTRY_AUTH_TOKEN` | no | An environment variable of the Gradle step, and of no other step. Name it in `required-secrets` when a release must not be built without it. |
+| `OPENAI_API_KEY` | no | `release-notes`. Without it the notes are a list of commits. |
+
+How the values are read:
+
+- The build job's first step checks the four signing values and every name in `local-properties-secrets` and `required-secrets`, before anything is checked out. All empty names are printed in one error. A value is never printed.
+- A name is looked up among the secrets, then among the variables. For each, GitHub gives the job the closest value: the environment's, then the repository's, then the organization's. Where a value is kept is therefore the calling repository's choice; the signing secrets belong in the environment (see below).
+- That first step is the only one that is handed every secret. It writes the values for `local.properties` to a file in the job's temp directory, readable by the runner's user only, and a later step moves the file into place with the keystore path as `KEYSTORE_FILE`.
+- Values are written with the escapes of `java.util.Properties`, so a backslash, a leading space, a line break or a character outside ASCII in a secret reaches the build unchanged.
+- The keystore, `local.properties` and the prepared file are deleted at the end of the job, whatever happened before.
+
+### Environment
+
+The build job runs in `environment`, by default `release`:
+
+- Secrets of the environment are read only by jobs that name it. Keeping the four signing secrets there, and not among the repository's secrets, keeps them from every other workflow of the repository.
+- The environment's rules apply to the build job. A rule for allowed branches and tags is checked against the ref of the run, which is the tag when the release was started for a tag. Required reviewers make the build wait for approval, and a `fallback` build waits again.
+- `plan` and `publish` name no environment and read no signing secret.
+
+### The tag
+
+`plan` stops the release before any build when:
+
+- the tag is not of the form `vX.Y.Z`, or does not exist. A branch, or a tag with a suffix, is never built;
+- the tag is below the highest release tag and has no GitHub Release yet. A new release with a lower version would carry a lower versionCode than devices already have. Building an older tag again for its existing release is allowed;
+- the tagged commit is not on `release-branch`.
+
+### The build
+
+The build trusts nothing an earlier job left behind:
+
+- **Work folder.** On a self-hosted runner the folder is emptied before the checkout, `.git` included, so the checkout is a fresh clone: files, git hooks and git configuration of earlier jobs are gone. It is emptied again at the end, because the build outputs hold the values of `local.properties`.
+- **Gradle user home.** `GRADLE_USER_HOME` is a new directory in the job's temp directory, which the runner empties before and after every job. The build starts without the init scripts, dependency cache, build cache and daemons of the shared home, and what it leaves there does not outlive the job.
+- **No caches.** `setup-gradle` runs with the Actions cache off, and Gradle with `--no-daemon --no-build-cache`. Every dependency is downloaded and every task runs. The build is therefore about as slow on a self-hosted runner as on a GitHub-hosted one.
+- **The commit.** The checkout is the tag, and the job fails when the tag no longer names the commit the release was planned for.
+
+What a self-hosted host still shares with this job: the JDK and other tools in the runner's tool cache, the Android SDK, and everything else the runner's user can write. A pull request build on the same host can change those. A repository that cannot accept that leaves `runner-labels` empty, and the release is built on a GitHub-hosted runner.
+
+On a self-hosted runner the Gradle step passes `--max-workers`, `org.gradle.jvmargs` and `kotlin.daemon.jvmargs` from the three `self-hosted-*` inputs, as the pull request check does.
+
+### The APK
+
+After the build:
+
+- `apk-path` has to match exactly one file.
+- `aapt2 dump badging` reads the APK's `versionName` and `versionCode`, and both have to be the planned ones. A build that ignores `-PciVersionName` or `-PciVersionCode` fails here instead of being released under another version.
+- [`android-signing`](../android-signing/) verifies the signature and, with `expected-cert-sha256`, the signing certificate.
+- The APK is uploaded as the artifact `android-release-apk-<primary|fallback>`, kept for 90 days.
+
+### The GitHub Release
+
+- A new release gets the tag as its title, notes from [`release-notes`](../release-notes/) for the commits since the previous release tag, and the APK.
+- When the release of the tag exists already, its title and notes are kept, because they may have been edited, and the APK is uploaded again. An asset of the same name is replaced; an APK with another name is added next to it.
+- Running the release of a tag again is therefore safe. A second APK for the same release, such as another flavor built with a `gradle-args` property, is a second run for the same tag.
+
+### How a run is decided
+
+The build job reports a verdict like the Gradle jobs of the pull request check: `pass`, `code` or `infra`, from [`gradle-log-verdict`](../gradle-log-verdict/).
+
+- A missing secret or variable is `code`: no other runner has it either.
+- A failed step after a successful Gradle run (the APK check, the signature, the upload) is `infra`, as the verdict of every doubtful case is.
+
+The `fallback` build starts when the primary build ran on a self-hosted runner, its result is `failure` or `cancelled` (a timeout), its verdict is not `code`, and the run was not cancelled. `publish` runs when either build passed and takes that build's APK. It adds a warning annotation when the APK came from the fallback build.
+
+After a failed primary build the run stays red even when the fallback build passed and the release was published. The summary of `publish` states the outcome.
+
+## Version and versionCode
+
+The version of a build is the tag. The workflows pass it to Gradle as `-PciVersionName` (`X.Y.Z`) and `-PciVersionCode`, and the calling repository's build uses the two values as they are. A build without them is a local build, and what version it shows is the calling repository's choice.
+
+The versionCode is computed in one place, [`release-version/version_code.py`](../release-version/version_code.py):
+
+| build | versionCode |
+|-------|-------------|
+| release `X.Y.Z` | `X × 100000000 + Y × 100000 + 50000 + Z` |
+| QA build `N` after a release of `X.Y` | `X × 100000000 + Y × 100000 + N` |
+
+- Each minor version has a block of 100000 codes: QA builds in the lower half, releases in the upper half.
+- Within a minor version, a release installs over every QA build, and a QA build never installs over a release.
+- `X` goes up to 20, `Y` up to 999, `Z` and `N` up to 49999. A version outside these is refused when the release is planned.
+- `1.13.1` is `101350001`; `0.1.0` is `150000`.
+
+Android installs an APK over an installed one only when its versionCode is not lower. A change of the formula therefore has to keep every new code above the codes that devices already have; the tests next to the formula state the order it has to keep.
+
+## Versioning
 
 The workflows are released together under `android-ci/vX.Y.Z`, with `android-ci/v1` as the floating major tag.
 
 Inside the workflows:
 
-- Actions of this repository are referenced by full path at the workflows' own major tag (`asleep-ai/actions/<name>@android-ci/v1`), so an `android-ci` release carries the actions it was tested with. `pick-runner`, released before the workflows, is referenced at `pick-runner/v1`. A `./` action path would be looked up in the calling repository's checkout.
-- `android-pr-check.yml` calls `android-pr-check-jobs.yml` as `./.github/workflows/…`, which GitHub resolves in this repository at the same commit as the calling workflow file. The two files therefore always match.
+- Actions of this repository are referenced by full path at the workflows' own major tag (`asleep-ai/actions/<name>@android-ci/v1`), so an `android-ci` release carries the actions it was tested with. `pick-runner` and `release-notes`, released before the workflows, are referenced at `pick-runner/v1` and `release-notes/v1`. A `./` action path would be looked up in the calling repository's checkout.
+- `android-pr-check.yml` calls `android-pr-check-jobs.yml`, and `android-release.yml` calls `android-release-build.yml`, as `./.github/workflows/…`, which GitHub resolves in this repository at the same commit as the calling workflow file. The two files of a pair therefore always match.
 - Third-party actions are pinned to a commit. GitHub's own (`actions/*`) follow their major tags.
 
-Pinning the workflow to a full version or a commit SHA fixes the two workflow files, not everything they run: the actions of this repository are referenced at the floating `android-ci/v1` and `pick-runner/v1`, so a rule change in `gradle-log-verdict`, for instance, reaches a caller pinned to an older `android-ci` version with the next release.
+Pinning a workflow to a full version or a commit SHA fixes its workflow files, not everything they run: the actions of this repository are referenced at the floating `android-ci/v1`, `pick-runner/v1` and `release-notes/v1`, so a rule change in `gradle-log-verdict`, for instance, reaches a caller pinned to an older `android-ci` version with the next release.
 
-`android-pr-check-jobs.yml` is internal: its inputs change without notice, so call `android-pr-check.yml`.
+`android-pr-check-jobs.yml` and `android-release-build.yml` are internal: their inputs change without notice, so call `android-pr-check.yml` and `android-release.yml`.
 
-### Development
+## Development
 
 ```bash
 uv run --with pytest --with pyyaml python -m pytest android-ci -q
 ```
 
-The tests read both workflow files. They run the shell of each `run` step against throwaway git repositories and stand-ins for `gradlew` and `keytool`, check every combination of results and verdicts that `result` has to decide, and fail when the `verify` and `release-build` jobs, or the `primary` and `fallback` calls, drift apart. They cannot evaluate GitHub's expressions: job conditions such as the ones on `pick-runner` and `fallback` are pinned as text and verified only by running the workflow from a calling repository.
+The tests read the workflow files. They run the shell of each `run` step against throwaway git repositories and stand-ins for `gradlew`, `keytool`, `gh`, `aapt2` and the GitHub API, check every combination of results and verdicts that `result` has to decide, and fail when the copies that have to match drift apart: the `verify` and `release-build` jobs, and the `primary` and `fallback` calls of both workflow pairs.
+
+They cannot evaluate GitHub's expressions or its behaviour: job conditions are pinned as text, and how secrets of an environment reach a called workflow, whether a push is accepted under the repository's rules, and whether a started workflow runs are verified only by running the workflows from a calling repository.

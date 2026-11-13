@@ -1,0 +1,52 @@
+name: Version Bump
+
+# Started by hand for a merged pull request. The run plans the next version,
+# waits for the approval of the `release` environment, tags the merge commit
+# vX.Y.Z, moves main to it and starts release.yml for the tag.
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Number of the merged pull request to release (its merge commit is tagged)'
+        required: false
+        type: string
+      sha:
+        description: 'Exception: the commit to release, instead of a pull request'
+        required: false
+        type: string
+      bump:
+        description: 'Which part of the version to raise'
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      dry_run:
+        description: 'Plan and check only: nothing is tagged, pushed or started'
+        required: false
+        default: false
+        type: boolean
+
+# One release at a time, and none is dropped: a second run waits for the first.
+concurrency:
+  group: version-bump
+  cancel-in-progress: false
+
+# The called workflow can use no more than what is granted here, and it fails
+# to start when one of these is missing.
+permissions:
+  contents: write       # the tag, and the main branch
+  actions: write        # start release.yml for the tag
+  checks: read          # the checks of the commit
+  pull-requests: read   # the merge commit of the pull request
+
+jobs:
+  version-bump:
+    uses: asleep-ai/actions/.github/workflows/android-version-bump.yml@android-ci/v1
+    with:
+      pr: ${{ inputs.pr }}
+      sha: ${{ inputs.sha }}
+      bump: ${{ inputs.bump }}
+      dry_run: ${{ inputs.dry_run }}

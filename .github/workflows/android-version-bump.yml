@@ -1,0 +1,378 @@
+name: Android version bump
+
+# Reusable release cut for an Android app repository whose versions are git
+# tags. A person starts it by hand for a merged pull request. The plan job
+# computes the next version, checks that the commit passed its checks and
+# writes what would be released to the job summary. The tag job then waits for
+# the approval of its environment, tags the commit vX.Y.Z, moves the main
+# branch to it and starts the caller's release workflow.
+#
+# The caller's contract and every input are in android-ci/README.md.
+on:
+  workflow_call:
+    inputs:
+      pr:
+        description: >-
+          Number of the merged pull request to release; its merge commit is
+          tagged. Exactly one of pr and sha is given.
+        required: false
+        type: string
+        default: ''
+      sha:
+        description: >-
+          The exception to pr: id of the commit to release, 7 or more hex
+          digits.
+        required: false
+        type: string
+        default: ''
+      bump:
+        description: 'Which part of the last version to raise: patch, minor or major.'
+        required: false
+        type: string
+        default: patch
+      dry_run:
+        description: >-
+          Plan and check only: nothing is tagged, pushed or started, and no
+          approval is asked for.
+        required: false
+        type: boolean
+        default: false
+      required-checks:
+        description: >-
+          Names of the checks that must have succeeded on the commit, one per
+          line, as the commit's checks list shows them.
+        required: false
+        type: string
+        default: pr-check / result
+      main-branch:
+        description: >-
+          The branch that is moved to the released commit, as a fast-forward.
+          Empty moves no branch.
+        required: false
+        type: string
+        default: main
+      release-workflow:
+        description: >-
+          File name of the caller's workflow that builds a release tag. It is
+          started for the new tag. Empty starts nothing.
+        required: false
+        type: string
+        default: release.yml
+      environment:
+        description: >-
+          The environment of the job that tags. Its protection rules, such as
+          required reviewers, are the approval of the release.
+        required: false
+        type: string
+        default: release
+    secrets:
+      RELEASE_PUSH_TOKEN:
+        description: >-
+          Optional. Token that pushes the tag and the branch instead of the
+          job token, for a repository whose rules do not let the job token
+          push to main-branch.
+        required: false
+    outputs:
+      tag:
+        description: The tag of the planned version.
+        value: ${{ jobs.plan.outputs.tag }}
+      version:
+        description: The planned version, X.Y.Z.
+        value: ${{ jobs.plan.outputs.version }}
+      target-sha:
+        description: The commit that is released.
+        value: ${{ jobs.plan.outputs.target-sha }}
+      tagged:
+        description: "'true' when the tag exists on the commit after this run."
+        value: ${{ jobs.tag.outputs.tagged }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Read-only. Everything that can refuse the release is decided here, so a
+  # dry run shows the same refusals and an approver sees the summary before
+  # the tag job asks.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      previous-tag: ${{ steps.version.outputs.previous-tag }}
+      target-sha: ${{ steps.version.outputs.target-sha }}
+    steps:
+      # Every tag and the whole history: the last release is searched among
+      # all tags, and the commit is compared with it.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Plan the version
+        id: version
+        uses: asleep-ai/actions/release-version@android-ci/v1
+        with:
+          pr: ${{ inputs.pr }}
+          sha: ${{ inputs.sha }}
+          bump: ${{ inputs.bump }}
+
+      - name: Write the plan to the summary
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          PREVIOUS_TAG: ${{ steps.version.outputs.previous-tag }}
+          VERSION_CODE: ${{ steps.version.outputs.version-code }}
+          TARGET_SHA: ${{ steps.version.outputs.target-sha }}
+          PRS: ${{ steps.version.outputs.prs }}
+          PR: ${{ inputs.pr }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### ${PREVIOUS_TAG:-no release yet} → $TAG"
+            echo
+            if [[ "$DRY_RUN" == true ]]; then
+              echo "**Dry run.** Nothing is tagged, pushed or started."
+              echo
+            fi
+            echo "- Commit: [\`${TARGET_SHA:0:7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$TARGET_SHA)${PR:+, the merge commit of #${PR#\#}}"
+            echo "- versionCode: $VERSION_CODE"
+            echo
+            echo "#### Included"
+            echo
+            # printf: a pull request title is data, not a format or an option.
+            printf '%s\n' "${PRS:-Nothing listed.}"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A release is cut from a commit that passed the same checks a pull
+      # request has to pass. The newest check run of each name counts. A check
+      # that never ran on the commit is a refusal, like one that failed.
+      - name: Check the commit's checks
+        env:
+          TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.version.outputs.target-sha }}
+          REQUIRED_CHECKS: ${{ inputs.required-checks }}
+        run: |
+          set -euo pipefail
+          python3 - <<'CHECKS'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          sha = os.environ["TARGET_SHA"]
+          token = os.environ.get("TOKEN", "").strip()
+          required = [line.strip() for line in os.environ.get("REQUIRED_CHECKS", "").splitlines() if line.strip()]
+
+
+          def check_runs(name):
+              query = urllib.parse.urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+              request = urllib.request.Request(
+                  f"{api}/repos/{repository}/commits/{sha}/check-runs?{query}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "asleep-ai-actions-android-version-bump",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      document = json.load(response)
+              except urllib.error.HTTPError as error:
+                  detail = error.read(300).decode(errors="replace").strip()
+                  sys.exit(f"::error::Cannot read the checks of {sha}: HTTP {error.code}: {detail}")
+              except (OSError, ValueError) as error:
+                  sys.exit(f"::error::Cannot read the checks of {sha}: {error}")
+              runs = document.get("check_runs") if isinstance(document, dict) else None
+              if not isinstance(runs, list):
+                  sys.exit(f"::error::Cannot read the checks of {sha}: the response has no check_runs list")
+              return [run for run in runs if isinstance(run, dict) and run.get("name") == name]
+
+
+          rows = []
+          refused = []
+          for name in required:
+              runs = check_runs(name)
+              if not runs:
+                  rows.append((name, "not run", ""))
+                  refused.append(f"'{name}' did not run on the commit")
+                  continue
+              newest = max(runs, key=lambda run: (str(run.get("started_at") or ""), run.get("id") or 0))
+              state = newest.get("conclusion") or newest.get("status") or "unknown"
+              rows.append((name, state, newest.get("html_url") or ""))
+              if newest.get("status") != "completed" or newest.get("conclusion") != "success":
+                  refused.append(f"'{name}' is {state}")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("#### Checks on the commit\n\n")
+              if not rows:
+                  summary.write("No check is required (`required-checks` is empty).\n\n")
+              else:
+                  summary.write("| check | result |\n|-------|--------|\n")
+                  for name, state, url in rows:
+                      summary.write(f"| {name} | {f'[{state}]({url})' if url else state} |\n")
+                  summary.write("\n")
+
+          if not required:
+              print("::notice::No check is required: required-checks is empty.")
+          for name, state, _ in rows:
+              print(f"{name}: {state}")
+          if refused:
+              print(f"::error title=The commit has not passed its checks::{sha[:7]}: {'; '.join(refused)}. "
+                    "Release a commit whose checks succeeded, or run them again on this one.")
+              sys.exit(1)
+          CHECKS
+
+      # The branch only ever moves forward to a released commit. When it holds
+      # a commit the release lacks, moving it would drop that commit, so the
+      # release is refused until the working branch has received it.
+      - name: Check that the main branch can move
+        env:
+          MAIN_BRANCH: ${{ inputs.main-branch }}
+          TARGET_SHA: ${{ steps.version.outputs.target-sha }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$MAIN_BRANCH" ]]; then
+            line="No branch is moved (\`main-branch\` is empty)."
+          elif [[ "$MAIN_BRANCH" == -* ]] || ! git check-ref-format "refs/heads/$MAIN_BRANCH"; then
+            echo "::error::main-branch is not a branch name: $MAIN_BRANCH"
+            exit 1
+          elif ! current=$(git rev-parse --verify --quiet "refs/remotes/origin/$MAIN_BRANCH^{commit}"); then
+            line="\`$MAIN_BRANCH\` does not exist and is created at the commit."
+          elif [[ "$current" == "$TARGET_SHA" ]]; then
+            line="\`$MAIN_BRANCH\` is at the commit already."
+          elif git merge-base --is-ancestor "$current" "$TARGET_SHA"; then
+            line="\`$MAIN_BRANCH\` moves forward by $(git rev-list --count "$current..$TARGET_SHA") commit(s), from \`${current:0:7}\`."
+          else
+            echo "::error title=$MAIN_BRANCH cannot move forward::$MAIN_BRANCH (${current:0:7}) holds $(git rev-list --count "$TARGET_SHA..$current") commit(s) that ${TARGET_SHA:0:7} lacks. Merge $MAIN_BRANCH into the branch that is released, then release a commit after that merge."
+            git log --oneline -10 "$TARGET_SHA..$current"
+            exit 1
+          fi
+          echo "${line//\`/}"
+          {
+            echo "#### Branch"
+            echo
+            echo "$line"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The only job that writes. The environment decides who may let it run.
+  tag:
+    needs: plan
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: read
+    outputs:
+      tagged: ${{ steps.push.outputs.tagged }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PUSH_TOKEN || github.token }}
+
+      # A run that tagged and then failed can be run again: the tag is found
+      # on the commit, and only what is left is done.
+      - name: Look for the tag
+        id: state
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+          TARGET_SHA: ${{ needs.plan.outputs.target-sha }}
+        run: |
+          set -euo pipefail
+          existing=$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}" || true)
+          if [[ -z "$existing" ]]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG does not exist yet."
+          elif [[ "$existing" == "$TARGET_SHA" ]]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG is on $TARGET_SHA already: an earlier attempt created it."
+          else
+            echo "::error::Tag $TAG exists on $existing, not on $TARGET_SHA. Another release took this version; start the version bump again."
+            exit 1
+          fi
+
+      # Time passes between the plan and the approval. The version is planned
+      # again from the repository as it is now, and has to come out the same.
+      - name: Plan the version again
+        id: version
+        if: ${{ steps.state.outputs.exists == 'false' }}
+        uses: asleep-ai/actions/release-version@android-ci/v1
+        with:
+          sha: ${{ needs.plan.outputs.target-sha }}
+          bump: ${{ inputs.bump }}
+
+      # One atomic push: the tag and the branch move together or not at all,
+      # so a branch the token may not push to leaves no tag behind. The branch
+      # push is not forced, so the server accepts only a fast-forward.
+      - name: Push the tag and the main branch
+        id: push
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+          PREVIOUS_TAG: ${{ needs.plan.outputs.previous-tag }}
+          TARGET_SHA: ${{ needs.plan.outputs.target-sha }}
+          TAG_EXISTS: ${{ steps.state.outputs.exists }}
+          TAG_NOW: ${{ steps.version.outputs.tag }}
+          PREVIOUS_TAG_NOW: ${{ steps.version.outputs.previous-tag }}
+          MAIN_BRANCH: ${{ inputs.main-branch }}
+        run: |
+          set -euo pipefail
+          refs=()
+          if [[ "$TAG_EXISTS" != true ]]; then
+            if [[ "$TAG_NOW" != "$TAG" || "$PREVIOUS_TAG_NOW" != "$PREVIOUS_TAG" ]]; then
+              echo "::error::The plan was $TAG after ${PREVIOUS_TAG:-no release}; the repository now gives $TAG_NOW after ${PREVIOUS_TAG_NOW:-no release}. Another release happened meanwhile; start the version bump again."
+              exit 1
+            fi
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "$TAG" "$TARGET_SHA"
+            refs+=("refs/tags/$TAG")
+          fi
+          if [[ -n "$MAIN_BRANCH" ]]; then
+            refs+=("$TARGET_SHA:refs/heads/$MAIN_BRANCH")
+          fi
+          if [[ "${#refs[@]}" != 0 ]]; then
+            git push --atomic origin "${refs[@]}"
+          fi
+          echo "tagged=true" >> "$GITHUB_OUTPUT"
+          echo "Pushed: ${refs[*]:-nothing}"
+
+      # A tag pushed with the job token starts no workflow, so the caller's
+      # release workflow is started for the tag explicitly. Starting a
+      # workflow by hand is one of the two events the job token may cause.
+      - name: Start the release workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_WORKFLOW: ${{ inputs.release-workflow }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Tagged $TAG"
+            echo
+            if [[ -z "$RELEASE_WORKFLOW" ]]; then
+              echo "No release workflow is started (\`release-workflow\` is empty)."
+            else
+              gh workflow run "$RELEASE_WORKFLOW" --ref "$TAG" >&2
+              echo "Started [\`$RELEASE_WORKFLOW\`]($GITHUB_SERVER_URL/$GH_REPO/actions/workflows/$RELEASE_WORKFLOW) for \`$TAG\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Tagged $TAG. Release workflow: ${RELEASE_WORKFLOW:-none}."

@@ -11,14 +11,17 @@ Shared GitHub Actions, reusable workflows, local lint hooks, and adoption templa
 | [`android-signing/`](./android-signing/) | Keystore and signature steps of a signed Android build: decode the keystore, verify the APK with `apksigner`, delete the keystore and secret files. |
 | [`gradle-log-verdict/`](./gradle-log-verdict/) | Report how a Gradle job ended (`pass`, `code` or `infra`) from step outcomes and the Gradle log, so only infrastructure failures are re-run elsewhere. |
 | [`pick-runner/`](./pick-runner/) | Decide `runs-on` before jobs are queued: self-hosted labels when a matching runner is online, else a GitHub-hosted fallback. |
+| [`release-version/`](./release-version/) | Plan the next release of a repository whose versions are git tags: the last release tag, the next version, the commit to release and the pull requests it adds. Also computes the Android versionCode. |
 
 ## Reusable workflows
 
 | path | description |
 |------|-------------|
-| [`android-pr-check.yml`](./.github/workflows/android-pr-check.yml) | Pull request check for Android app repositories: code style, a verification build and a release build on self-hosted runners, re-run on a GitHub-hosted runner only after an infrastructure failure, with one aggregate check. Documented in [`android-ci/`](./android-ci/). |
+| [`android-pr-check.yml`](./.github/workflows/android-pr-check.yml) | Pull request check for Android app repositories: code style, a verification build and a release build on self-hosted runners, re-run on a GitHub-hosted runner only after an infrastructure failure, with one aggregate check. |
+| [`android-version-bump.yml`](./.github/workflows/android-version-bump.yml) | Release cut, started by hand for a merged pull request: the next version from the tags, a check of the commit, and after the approval of an environment the tag `vX.Y.Z` and the main branch on that commit. |
+| [`android-release.yml`](./.github/workflows/android-release.yml) | Release of a tag `vX.Y.Z`: a cold build signed with the caller's keystore, a check of the APK's version and signature, and a GitHub Release with the APK and release notes. |
 
-The calling repository keeps a short workflow file and the Gradle tasks the workflow runs (`ciVerify`, `ciReleaseBuild`). The workflows are released together under `android-ci/vX.Y.Z`.
+All three are documented in [`android-ci/`](./android-ci/). The calling repository keeps a short workflow file per workflow and the Gradle tasks they run (`ciVerify`, `ciReleaseBuild`, `ciRelease`). The workflows are released together under `android-ci/vX.Y.Z`.
 
 ## Local hooks
 

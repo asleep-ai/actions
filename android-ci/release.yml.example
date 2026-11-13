@@ -1,0 +1,39 @@
+name: Release
+
+# Builds a release tag and publishes the signed APK as a GitHub Release.
+# version-bump.yml starts this workflow for the tag it pushed; a tag pushed by
+# a person starts it through the push trigger.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+
+# One build per tag at a time, and a second run of a tag is not dropped: it
+# adds its APK to the same release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# The called workflow can use no more than what is granted here, and it fails
+# to start when one of these is missing.
+permissions:
+  contents: write       # the GitHub Release
+  packages: read        # private GitHub Packages of this repository
+  pull-requests: read   # pull request descriptions for the release notes
+
+jobs:
+  release:
+    uses: asleep-ai/actions/.github/workflows/android-release.yml@android-ci/v1
+    with:
+      # Leave runner-labels out to build on a GitHub-hosted runner only.
+      runner-labels: '["self-hosted","Linux","X64"]'
+      # Secrets and variables written to local.properties under their own
+      # names, next to the four signing keys.
+      local-properties-secrets: |
+        EXAMPLE_API_KEY
+        EXAMPLE_BASE_URL
+      # Must not be empty, and are not written to local.properties.
+      required-secrets: SENTRY_AUTH_TOKEN
+    # Every secret: the workflow reads the ones named above by name, and the
+    # signing secrets of the `release` environment in its build job.
+    secrets: inherit
