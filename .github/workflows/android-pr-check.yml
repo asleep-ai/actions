@@ -16,15 +16,17 @@ on:
         description: >-
           Self-hosted runs-on labels as a JSON array of strings, for example
           '["self-hosted","Linux","X64"]'. Empty runs everything on
+          fallback-runs-on. Pull requests from forks always run on
           fallback-runs-on.
         required: false
         type: string
         default: ''
       fallback-runs-on:
         description: >-
-          GitHub-hosted runs-on, used when no self-hosted runner is online and
-          for the re-run after an infrastructure failure: one label, or a JSON
-          array of labels.
+          GitHub-hosted runs-on, used when no self-hosted runner is online, for
+          pull requests from forks and for the re-run after an infrastructure
+          failure. Exactly one of two forms: a bare label (ubuntu-latest, no
+          quotes) or a JSON array of labels.
         required: false
         type: string
         default: ubuntu-latest
@@ -69,26 +71,26 @@ on:
           config/**
           scripts/**
           .github/workflows/**
-      verify-task:
-        description: Gradle task of the verify job. It runs with --continue.
-        required: false
-        type: string
-        default: ciVerify
       verify-args:
         description: >-
-          Extra Gradle arguments for the verify job, split on whitespace.
+          Extra Gradle arguments for the verify job (./gradlew ciVerify
+          --continue), split on whitespace.
         required: false
         type: string
         default: ''
-      release-build-task:
-        description: Gradle task of the release-build job.
+      verify-signing-key:
+        description: >-
+          Whether the verify job gets the throwaway signing key in
+          local.properties, as the release-build job always does. Set false
+          when no debug build reads the signing keys: a key that changes with
+          every job is then only a build input that defeats the build cache.
         required: false
-        type: string
-        default: ciReleaseBuild
+        type: boolean
+        default: true
       release-build-args:
         description: >-
-          Extra Gradle arguments for the release-build job, split on
-          whitespace.
+          Extra Gradle arguments for the release-build job (./gradlew
+          ciReleaseBuild), split on whitespace.
         required: false
         type: string
         default: ''
@@ -103,7 +105,7 @@ on:
       checkout-submodules:
         description: >-
           The submodules input of actions/checkout for the Gradle jobs: false,
-          true or recursive.
+          true or recursive. Anything but false checks out with GIT_TOKEN.
         required: false
         type: string
         default: 'false'
@@ -118,9 +120,9 @@ on:
         default: ''
       paths-ignore:
         description: >-
-          Glob patterns, one per line. When every changed file of a pull
-          request or push matches one of them, the Gradle jobs skip the build
-          and pass. Empty builds on every change.
+          Glob patterns, one per line, in the syntax of full-scan-paths. When
+          every file a pull request or push changed matches one of them, the
+          Gradle jobs skip the build and pass. Empty builds on every change.
         required: false
         type: string
         default: |
@@ -136,15 +138,19 @@ on:
         type: number
         default: 10
       verify-timeout-minutes:
-        description: Timeout of the verify job.
+        description: >-
+          Timeout of the verify job, on either kind of runner. Size it for a
+          build without any cache on the GitHub-hosted runner.
         required: false
         type: number
         default: 45
       release-build-timeout-minutes:
-        description: Timeout of the release-build job.
+        description: >-
+          Timeout of the release-build job, on either kind of runner. Size it
+          for a build without any cache on the GitHub-hosted runner.
         required: false
         type: number
-        default: 30
+        default: 45
       self-hosted-max-workers:
         description: >-
           Gradle --max-workers on a self-hosted runner. Empty leaves Gradle's
@@ -166,11 +172,6 @@ on:
         required: false
         type: string
         default: -Xmx6g
-      report-retention-days:
-        description: Days to keep the test and lint reports of a failed build.
-        required: false
-        type: number
-        default: 14
     secrets:
       RUNNER_READ_TOKEN:
         description: >-
@@ -187,14 +188,25 @@ on:
 permissions:
   contents: read
   packages: read
-  # dorny/paths-filter lists a pull request's files through the API.
-  pull-requests: read
 
 jobs:
   # Decided up front, on a GitHub-hosted runner: a job queued for self-hosted
   # labels while every matching runner is offline waits instead of failing.
+  #
+  # The job is skipped, and everything then runs on fallback-runs-on, when the
+  # caller named no self-hosted labels and when the event carries a pull
+  # request whose head is in another repository: a fork's code (its mise
+  # configuration, its hooks, its build scripts) does not run on a runner that
+  # keeps its disk between jobs. The other jobs read this decision from
+  # needs.pick-runner.result, so the condition lives here only.
+  # pull_request_target is refused in the result job.
   pick-runner:
-    if: ${{ inputs.runner-labels != '' }}
+    if: >-
+      ${{
+        inputs.runner-labels != ''
+        && github.event_name != 'pull_request_target'
+        && (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository)
+      }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
     permissions: {}
@@ -211,22 +223,24 @@ jobs:
 
   # !cancelled(): when pick-runner itself fails, the jobs still go to the
   # self-hosted labels instead of being skipped, and a skipped job would count
-  # as passing. Without runner-labels pick-runner is skipped and the jobs run
-  # on fallback-runs-on.
+  # as passing. When pick-runner was skipped, the jobs run on fallback-runs-on.
+  #
+  # Not on pull_request_target: the Gradle jobs check out the event's default
+  # ref, which for that event is the base branch, so they would pass without
+  # building the pull request.
   primary:
     needs: pick-runner
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request_target' }}
     uses: ./.github/workflows/android-pr-check-jobs.yml
     with:
-      runs-on: ${{ needs.pick-runner.outputs.runs-on || inputs.runner-labels || (startsWith(inputs.fallback-runs-on, '[') && inputs.fallback-runs-on) || toJSON(inputs.fallback-runs-on || 'ubuntu-latest') }}
+      runs-on: ${{ needs.pick-runner.outputs.runs-on || (needs.pick-runner.result != 'skipped' && inputs.runner-labels) || (startsWith(inputs.fallback-runs-on, '[') && inputs.fallback-runs-on) || toJSON(inputs.fallback-runs-on || 'ubuntu-latest') }}
       attempt: primary
       java-version: ${{ inputs.java-version }}
       java-distribution: ${{ inputs.java-distribution }}
       mise-version: ${{ inputs.mise-version }}
       full-scan-paths: ${{ inputs.full-scan-paths }}
-      verify-task: ${{ inputs.verify-task }}
       verify-args: ${{ inputs.verify-args }}
-      release-build-task: ${{ inputs.release-build-task }}
+      verify-signing-key: ${{ inputs.verify-signing-key }}
       release-build-args: ${{ inputs.release-build-args }}
       release-build-skip-push-branches: ${{ inputs.release-build-skip-push-branches }}
       checkout-submodules: ${{ inputs.checkout-submodules }}
@@ -238,21 +252,21 @@ jobs:
       self-hosted-max-workers: ${{ inputs.self-hosted-max-workers }}
       self-hosted-gradle-jvmargs: ${{ inputs.self-hosted-gradle-jvmargs }}
       self-hosted-kotlin-daemon-jvmargs: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
-      report-retention-days: ${{ inputs.report-retention-days }}
     secrets:
       GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
 
   # Only after a primary run on self-hosted runners, and never after a code
-  # verdict. A job that never reported (its runner went away) has an empty
-  # verdict, which is not code. A primary result of cancelled while the run
-  # itself is not cancelled means a job hit its timeout. A run cancelled by a
-  # person or by a newer push fails !cancelled() and is not run again.
+  # verdict. pick-runner skipped means the primary run was already on
+  # fallback-runs-on. A job that never reported (its runner went away) has an
+  # empty verdict, which is not code. A primary result of cancelled while the
+  # run itself is not cancelled means a job hit its timeout. A run cancelled by
+  # a person or by a newer push fails !cancelled() and is not run again.
   fallback:
     needs: [pick-runner, primary]
     if: >-
       ${{
         !cancelled()
-        && inputs.runner-labels != ''
+        && needs.pick-runner.result != 'skipped'
         && needs.pick-runner.outputs.self-hosted != 'false'
         && (needs.primary.result == 'failure' || needs.primary.result == 'cancelled')
         && needs.primary.outputs.code-style-verdict != 'code'
@@ -267,9 +281,8 @@ jobs:
       java-distribution: ${{ inputs.java-distribution }}
       mise-version: ${{ inputs.mise-version }}
       full-scan-paths: ${{ inputs.full-scan-paths }}
-      verify-task: ${{ inputs.verify-task }}
       verify-args: ${{ inputs.verify-args }}
-      release-build-task: ${{ inputs.release-build-task }}
+      verify-signing-key: ${{ inputs.verify-signing-key }}
       release-build-args: ${{ inputs.release-build-args }}
       release-build-skip-push-branches: ${{ inputs.release-build-skip-push-branches }}
       checkout-submodules: ${{ inputs.checkout-submodules }}
@@ -281,7 +294,6 @@ jobs:
       self-hosted-max-workers: ${{ inputs.self-hosted-max-workers }}
       self-hosted-gradle-jvmargs: ${{ inputs.self-hosted-gradle-jvmargs }}
       self-hosted-kotlin-daemon-jvmargs: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
-      report-retention-days: ${{ inputs.report-retention-days }}
     secrets:
       GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
 
@@ -301,8 +313,10 @@ jobs:
       - name: Combine the runs
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
           RUNNER_LABELS: ${{ inputs.runner-labels }}
           FALLBACK_RUNS_ON: ${{ inputs.fallback-runs-on || 'ubuntu-latest' }}
+          PICK_RUNNER: ${{ needs.pick-runner.result }}
           SELF_HOSTED: ${{ needs.pick-runner.outputs.self-hosted }}
           PRIMARY: ${{ needs.primary.result }}
           PRIMARY_CODE_STYLE: ${{ needs.primary.outputs.code-style-verdict }}
@@ -314,9 +328,16 @@ jobs:
           FALLBACK_RELEASE_BUILD: ${{ needs.fallback.outputs.release-build-verdict }}
         run: |
           set -euo pipefail
+          if [[ "$EVENT_NAME" == pull_request_target ]]; then
+            echo "::error::pull_request_target is not supported: the build jobs would check out the base branch and pass without building the pull request. Call this workflow on pull_request."
+            exit 1
+          fi
+
           primary="result=${PRIMARY:-none}, code-style=${PRIMARY_CODE_STYLE:-none}, verify=${PRIMARY_VERIFY:-none}, release-build=${PRIMARY_RELEASE_BUILD:-none}"
           fallback="result=${FALLBACK:-none}, code-style=${FALLBACK_CODE_STYLE:-none}, verify=${FALLBACK_VERIFY:-none}, release-build=${FALLBACK_RELEASE_BUILD:-none}"
-          if [[ -z "$RUNNER_LABELS" ]]; then
+          if [[ "$PICK_RUNNER" == skipped && -n "$RUNNER_LABELS" ]]; then
+            where="$FALLBACK_RUNS_ON (a pull request from a fork does not run on the self-hosted runners)"
+          elif [[ "$PICK_RUNNER" == skipped ]]; then
             where="$FALLBACK_RUNS_ON"
           elif [[ "$SELF_HOSTED" == false ]]; then
             where="$FALLBACK_RUNS_ON (no self-hosted runner was online)"
@@ -333,7 +354,7 @@ jobs:
           status=0
           if passed "$PRIMARY" "$PRIMARY_CODE_STYLE" "$PRIMARY_VERIFY" "$PRIMARY_RELEASE_BUILD"; then
             outcome="Passed on $where."
-            if [[ -n "$RUNNER_LABELS" && "$SELF_HOSTED" == false ]]; then
+            if [[ "$PICK_RUNNER" != skipped && "$SELF_HOSTED" == false ]]; then
               echo "::warning title=Self-hosted runners offline::The check ran on $FALLBACK_RUNS_ON because no self-hosted runner was online. Check the host."
             fi
           elif [[ "$PRIMARY" == success ]]; then
@@ -349,7 +370,7 @@ jobs:
             if [[ "$PRIMARY" == failure ]]; then
               outcome="Failed on $where ($primary)."
             else
-              outcome="Did not finish on $where ($primary): the run was cancelled, or a job hit its timeout next to a code failure."
+              outcome="Did not finish on $where ($primary): the run was cancelled, or a job hit its timeout next to a code failure or on a GitHub-hosted runner."
             fi
             status=1
           else

@@ -31,16 +31,13 @@ on:
         required: false
         type: string
         default: ''
-      verify-task:
-        required: true
-        type: string
       verify-args:
         required: false
         type: string
         default: ''
-      release-build-task:
+      verify-signing-key:
         required: true
-        type: string
+        type: boolean
       release-build-args:
         required: false
         type: string
@@ -81,9 +78,6 @@ on:
         required: false
         type: string
         default: ''
-      report-retention-days:
-        required: true
-        type: number
     secrets:
       GIT_TOKEN:
         description: 'Optional. Token for private submodules and private GitHub Packages.'
@@ -102,8 +96,6 @@ on:
 permissions:
   contents: read
   packages: read
-  # dorny/paths-filter lists a pull request's files through the API.
-  pull-requests: read
 
 defaults:
   run:
@@ -189,8 +181,8 @@ jobs:
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
 
   # verify and release-build share every step up to the report upload; only
-  # the task, its arguments and the skip rule differ. android-ci's tests fail
-  # when the two copies drift apart.
+  # the Gradle task, its arguments, the skip rule and the signing key of
+  # verify differ. android-ci's tests fail when the two copies drift apart.
   verify:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: ${{ inputs.verify-timeout-minutes }}
@@ -208,86 +200,105 @@ jobs:
             done < <(find "$GITHUB_WORKSPACE/.git" -type f -name '*.lock' -print0)
           fi
 
-      # GIT_TOKEN reaches private submodules; the job token is used when the
-      # caller has none. The token stays in the clone only on a push, where
-      # paths-filter fetches the previous commit with git; for a pull request
-      # it lists the files through the API, and the pull request's code never
-      # finds the token in the clone.
+      # GIT_TOKEN is used only when submodules are checked out: it reaches
+      # private ones, and the job token reads the repository itself. Two
+      # commits deep, so the plan step can compare a pull request's merge
+      # commit with its first parent. The token stays in the clone only on a
+      # push, where the plan step may have to fetch the previous commit; a
+      # pull request's code never finds a token in the clone.
       - uses: actions/checkout@v7
         id: checkout
         with:
-          token: ${{ secrets.GIT_TOKEN || github.token }}
+          token: ${{ inputs.checkout-submodules != 'false' && secrets.GIT_TOKEN || github.token }}
           submodules: ${{ inputs.checkout-submodules }}
+          fetch-depth: 2
           persist-credentials: ${{ github.event_name == 'push' }}
 
-      - name: Prepare the path filter
-        id: paths
-        env:
-          PATHS_IGNORE: ${{ inputs.paths-ignore }}
-        run: |
-          set -euo pipefail
-          # A file counts as a code change when it matches '**' and none of the
-          # ignored patterns (predicate-quantifier: every, below).
-          quote="'"
-          {
-            echo 'filters<<ANDROID_PR_CHECK_FILTERS'
-            echo 'code:'
-            echo "  - '**'"
-            while IFS= read -r pattern || [[ -n "$pattern" ]]; do
-              pattern="${pattern%$'\r'}"
-              pattern="${pattern#"${pattern%%[![:space:]]*}"}"
-              pattern="${pattern%"${pattern##*[![:space:]]}"}"
-              if [[ -n "$pattern" ]]; then
-                printf "  - '!%s'\n" "${pattern//$quote/$quote$quote}"
-              fi
-            done <<< "$PATHS_IGNORE"
-            echo 'ANDROID_PR_CHECK_FILTERS'
-          } >> "$GITHUB_OUTPUT"
-
-      # Other events (a manual run, a schedule) have no change to compare and
-      # always build.
-      - name: Detect code changes
-        id: filter
-        if: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || github.event_name == 'push' }}
-        uses: dorny/paths-filter@v4
-        with:
-          predicate-quantifier: every
-          filters: ${{ steps.paths.outputs.filters }}
-
-      # A skipped build still ends in a successful job, so a required check
-      # built on this workflow reports on a documentation-only change too.
+      # Lists the files the pull request or push changed with git alone, and
+      # skips the build when all of them match paths-ignore. A skipped build
+      # still ends in a successful job, so a required check built on this
+      # workflow reports on a documentation-only change too. Whenever the
+      # change cannot be listed, the answer is to build.
       - name: Decide whether to build
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          CODE_CHANGED: ${{ steps.filter.outputs.code }}
+          BEFORE: ${{ github.event.before }}
+          PATHS_IGNORE: ${{ inputs.paths-ignore }}
           SKIP_PUSH_BRANCHES: ''
         run: |
           set -euo pipefail
-          build=true
-          reason="a $EVENT_NAME run always builds"
-          case "$EVENT_NAME" in
-            pull_request | pull_request_target | push)
-              if [[ "$CODE_CHANGED" == true ]]; then
-                reason="a file outside paths-ignore changed"
-              else
-                build=false
-                reason="every changed file matches paths-ignore"
-              fi
-              ;;
-          esac
-          if [[ "$build" == true && "$EVENT_NAME" == push ]]; then
-            set -f
-            for branch in ${SKIP_PUSH_BRANCHES//,/ }; do
-              if [[ "$REF" == "refs/heads/$branch" ]]; then
-                build=false
-                reason="this build is skipped on a push to $branch"
-              fi
-            done
-          fi
-          echo "build=$build: $reason"
-          echo "build=$build" >> "$GITHUB_OUTPUT"
+          python3 - <<'PLAN'
+          import os
+          import re
+          import subprocess
+
+          event = os.environ["EVENT_NAME"]
+          ref = os.environ["REF"]
+          before = os.environ.get("BEFORE", "").strip()
+          ignored = [line.strip() for line in os.environ.get("PATHS_IGNORE", "").splitlines() if line.strip()]
+          skipped_branches = os.environ.get("SKIP_PUSH_BRANCHES", "").replace(",", " ").split()
+
+
+          def git(*args):
+              return subprocess.run(["git", *args], capture_output=True, check=False)
+
+
+          def glob(pattern):
+              # The syntax of full-scan-paths: `**/` spans zero or more directories, any
+              # other `**` matches anything, `*` and `?` stay within one path segment.
+              pattern = re.sub(r"^(\./|/)+", "", pattern)
+              regex, i = "", 0
+              while i < len(pattern):
+                  if pattern.startswith("**/", i):
+                      regex, i = regex + "(?:.*/)?", i + 3
+                  elif pattern.startswith("**", i):
+                      regex, i = regex + ".*", i + 2
+                  else:
+                      regex, i = regex + {"*": "[^/]*", "?": "[^/]"}.get(pattern[i], re.escape(pattern[i])), i + 1
+              return re.compile(regex)
+
+
+          def base_commit():
+              """The commit to compare HEAD with, or None and why there is none."""
+              if event == "pull_request":
+                  # The checkout is the merge commit; its first parent is the base branch.
+                  return "HEAD^1", ""
+              if event != "push":
+                  return None, f"a {event} run always builds"
+              if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", before) or set(before) == {"0"}:
+                  return None, "the push has no previous commit, as on a new branch"
+              if git("cat-file", "-e", before + "^{commit}").returncode != 0:
+                  if git("fetch", "--no-tags", "--depth=1", "origin", before).returncode != 0:
+                      return None, "the push's previous commit cannot be fetched, as after a force push"
+              return before, ""
+
+
+          def decide():
+              base, reason = base_commit()
+              if base is None:
+                  return True, reason
+              diff = git("diff", "--name-only", "--no-renames", "-z", base, "HEAD", "--")
+              if diff.returncode != 0:
+                  return True, "git cannot list the changed files: " + diff.stderr.decode(errors="replace").strip()
+              files = [os.fsdecode(path) for path in diff.stdout.split(b"\0") if path]
+              patterns = [glob(pattern) for pattern in ignored]
+              code = [path for path in files if not any(pattern.fullmatch(path) for pattern in patterns)]
+              if not code:
+                  return False, f"all {len(files)} changed file(s) match paths-ignore"
+              return True, f"{len(code)} of {len(files)} changed file(s) are outside paths-ignore, the first being {code[0]}"
+
+
+          build, reason = decide()
+          if build and event == "push":
+              for branch in skipped_branches:
+                  if ref == "refs/heads/" + branch:
+                      build, reason = False, f"this build is skipped on a push to {branch}"
+          print(f"build={str(build).lower()}: {reason}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"build={str(build).lower()}\n")
+          PLAN
 
       - name: Set up the JDK
         if: ${{ steps.plan.outputs.build == 'true' }}
@@ -298,7 +309,7 @@ jobs:
 
       - name: Set up Gradle
         if: ${{ steps.plan.outputs.build == 'true' }}
-        uses: gradle/actions/setup-gradle@v6
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
         with:
           # On a GitHub-hosted runner the run restores the Gradle user home
           # from the Actions cache and saves it again. A self-hosted runner
@@ -307,14 +318,15 @@ jobs:
           cache-read-only: false
           cache-disabled: ${{ runner.environment == 'self-hosted' }}
 
-      # The key exists only in this job's temp directory. It lets the build
-      # sign without any secret, so pull requests from forks and Dependabot
-      # build the same way. local-properties holds placeholder values for a
-      # pull request build, never secrets.
-      - name: Write local.properties with a throwaway signing key
+      # The signing key exists only in this job's temp directory. It lets the
+      # build sign without any secret, so pull requests from forks and
+      # Dependabot build the same way. local-properties holds placeholder
+      # values for a pull request build, never secrets.
+      - name: Write local.properties
         if: ${{ steps.plan.outputs.build == 'true' }}
         env:
           LOCAL_PROPERTIES: ${{ inputs.local-properties }}
+          SIGNING_KEY: ${{ inputs.verify-signing-key }}
         run: |
           set -euo pipefail
           comment='^[[:space:]]*#'
@@ -343,30 +355,36 @@ jobs:
           if [[ "$invalid" != 0 ]]; then
             exit 1
           fi
+          if [[ "$SIGNING_KEY" != true && "${#lines[@]}" == 0 ]]; then
+            echo "Nothing to write: no signing key in this job and no local-properties lines."
+            exit 0
+          fi
 
-          keystore="$RUNNER_TEMP/android-pr-check.jks"
-          password=android-pr-check
-          rm -f "$keystore"
-          keytool -genkeypair -keystore "$keystore" -storetype PKCS12 \
-            -storepass "$password" -keypass "$password" -alias android-pr-check \
-            -keyalg RSA -keysize 2048 -validity 30 \
-            -dname "CN=Android PR check throwaway key"
           {
-            echo "KEYSTORE_FILE=$keystore"
-            echo "KEYSTORE_PASSWORD=$password"
-            echo "KEY_ALIAS=android-pr-check"
-            echo "KEY_PASSWORD=$password"
+            if [[ "$SIGNING_KEY" == true ]]; then
+              keystore="$RUNNER_TEMP/android-pr-check.jks"
+              password=android-pr-check
+              rm -f "$keystore"
+              keytool -genkeypair -keystore "$keystore" -storetype PKCS12 \
+                -storepass "$password" -keypass "$password" -alias android-pr-check \
+                -keyalg RSA -keysize 2048 -validity 30 \
+                -dname "CN=Android PR check throwaway key" >&2
+              echo "KEYSTORE_FILE=$keystore"
+              echo "KEYSTORE_PASSWORD=$password"
+              echo "KEY_ALIAS=android-pr-check"
+              echo "KEY_PASSWORD=$password"
+            fi
             for line in ${lines[@]+"${lines[@]}"}; do
               printf '%s\n' "$line"
             done
           } > local.properties
-          echo "Wrote local.properties: the four signing keys and ${#lines[@]} caller line(s)."
+          echo "Wrote local.properties: signing key $SIGNING_KEY, ${#lines[@]} caller line(s)."
 
       - name: Run Gradle
         id: build
         if: ${{ steps.plan.outputs.build == 'true' }}
         env:
-          GRADLE_TASK: ${{ inputs.verify-task }}
+          GRADLE_TASK: ciVerify
           # --continue reports build, test and lint failures of one run together.
           GRADLE_ARGS: --continue ${{ inputs.verify-args }}
           # Scoped to this step: Gradle reads GITHUB_ACTOR and GITHUB_TOKEN as
@@ -404,8 +422,8 @@ jobs:
           echo "GitHub Packages credentials for Gradle: GITHUB_ACTOR=$GITHUB_ACTOR, GITHUB_TOKEN from $TOKEN_SOURCE."
           # The copy in the temp directory is what gradle-log-verdict reads.
           set -f
-          # shellcheck disable=SC2086 # word splitting is intended: both are argument lists
-          ./gradlew $GRADLE_TASK $GRADLE_ARGS ${extra[@]+"${extra[@]}"} 2>&1 | tee "$RUNNER_TEMP/gradle.log"
+          # shellcheck disable=SC2086 # word splitting is intended: the second is an argument list
+          ./gradlew "$GRADLE_TASK" $GRADLE_ARGS ${extra[@]+"${extra[@]}"} 2>&1 | tee "$RUNNER_TEMP/gradle.log"
 
       # A failed upload must not turn a code failure into a job that looks
       # like an infrastructure failure, hence continue-on-error.
@@ -419,7 +437,7 @@ jobs:
             **/build/reports/tests/**
             **/build/reports/lint-results-*
             **/build/reports/configuration-cache/**
-          retention-days: ${{ inputs.report-retention-days }}
+          retention-days: 14
           # A compile failure produces no report; that is not an error.
           if-no-files-found: ignore
           overwrite: true
@@ -460,74 +478,91 @@ jobs:
       - uses: actions/checkout@v7
         id: checkout
         with:
-          token: ${{ secrets.GIT_TOKEN || github.token }}
+          token: ${{ inputs.checkout-submodules != 'false' && secrets.GIT_TOKEN || github.token }}
           submodules: ${{ inputs.checkout-submodules }}
+          fetch-depth: 2
           persist-credentials: ${{ github.event_name == 'push' }}
-
-      - name: Prepare the path filter
-        id: paths
-        env:
-          PATHS_IGNORE: ${{ inputs.paths-ignore }}
-        run: |
-          set -euo pipefail
-          # A file counts as a code change when it matches '**' and none of the
-          # ignored patterns (predicate-quantifier: every, below).
-          quote="'"
-          {
-            echo 'filters<<ANDROID_PR_CHECK_FILTERS'
-            echo 'code:'
-            echo "  - '**'"
-            while IFS= read -r pattern || [[ -n "$pattern" ]]; do
-              pattern="${pattern%$'\r'}"
-              pattern="${pattern#"${pattern%%[![:space:]]*}"}"
-              pattern="${pattern%"${pattern##*[![:space:]]}"}"
-              if [[ -n "$pattern" ]]; then
-                printf "  - '!%s'\n" "${pattern//$quote/$quote$quote}"
-              fi
-            done <<< "$PATHS_IGNORE"
-            echo 'ANDROID_PR_CHECK_FILTERS'
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Detect code changes
-        id: filter
-        if: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || github.event_name == 'push' }}
-        uses: dorny/paths-filter@v4
-        with:
-          predicate-quantifier: every
-          filters: ${{ steps.paths.outputs.filters }}
 
       - name: Decide whether to build
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          CODE_CHANGED: ${{ steps.filter.outputs.code }}
+          BEFORE: ${{ github.event.before }}
+          PATHS_IGNORE: ${{ inputs.paths-ignore }}
           SKIP_PUSH_BRANCHES: ${{ inputs.release-build-skip-push-branches }}
         run: |
           set -euo pipefail
-          build=true
-          reason="a $EVENT_NAME run always builds"
-          case "$EVENT_NAME" in
-            pull_request | pull_request_target | push)
-              if [[ "$CODE_CHANGED" == true ]]; then
-                reason="a file outside paths-ignore changed"
-              else
-                build=false
-                reason="every changed file matches paths-ignore"
-              fi
-              ;;
-          esac
-          if [[ "$build" == true && "$EVENT_NAME" == push ]]; then
-            set -f
-            for branch in ${SKIP_PUSH_BRANCHES//,/ }; do
-              if [[ "$REF" == "refs/heads/$branch" ]]; then
-                build=false
-                reason="this build is skipped on a push to $branch"
-              fi
-            done
-          fi
-          echo "build=$build: $reason"
-          echo "build=$build" >> "$GITHUB_OUTPUT"
+          python3 - <<'PLAN'
+          import os
+          import re
+          import subprocess
+
+          event = os.environ["EVENT_NAME"]
+          ref = os.environ["REF"]
+          before = os.environ.get("BEFORE", "").strip()
+          ignored = [line.strip() for line in os.environ.get("PATHS_IGNORE", "").splitlines() if line.strip()]
+          skipped_branches = os.environ.get("SKIP_PUSH_BRANCHES", "").replace(",", " ").split()
+
+
+          def git(*args):
+              return subprocess.run(["git", *args], capture_output=True, check=False)
+
+
+          def glob(pattern):
+              # The syntax of full-scan-paths: `**/` spans zero or more directories, any
+              # other `**` matches anything, `*` and `?` stay within one path segment.
+              pattern = re.sub(r"^(\./|/)+", "", pattern)
+              regex, i = "", 0
+              while i < len(pattern):
+                  if pattern.startswith("**/", i):
+                      regex, i = regex + "(?:.*/)?", i + 3
+                  elif pattern.startswith("**", i):
+                      regex, i = regex + ".*", i + 2
+                  else:
+                      regex, i = regex + {"*": "[^/]*", "?": "[^/]"}.get(pattern[i], re.escape(pattern[i])), i + 1
+              return re.compile(regex)
+
+
+          def base_commit():
+              """The commit to compare HEAD with, or None and why there is none."""
+              if event == "pull_request":
+                  # The checkout is the merge commit; its first parent is the base branch.
+                  return "HEAD^1", ""
+              if event != "push":
+                  return None, f"a {event} run always builds"
+              if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", before) or set(before) == {"0"}:
+                  return None, "the push has no previous commit, as on a new branch"
+              if git("cat-file", "-e", before + "^{commit}").returncode != 0:
+                  if git("fetch", "--no-tags", "--depth=1", "origin", before).returncode != 0:
+                      return None, "the push's previous commit cannot be fetched, as after a force push"
+              return before, ""
+
+
+          def decide():
+              base, reason = base_commit()
+              if base is None:
+                  return True, reason
+              diff = git("diff", "--name-only", "--no-renames", "-z", base, "HEAD", "--")
+              if diff.returncode != 0:
+                  return True, "git cannot list the changed files: " + diff.stderr.decode(errors="replace").strip()
+              files = [os.fsdecode(path) for path in diff.stdout.split(b"\0") if path]
+              patterns = [glob(pattern) for pattern in ignored]
+              code = [path for path in files if not any(pattern.fullmatch(path) for pattern in patterns)]
+              if not code:
+                  return False, f"all {len(files)} changed file(s) match paths-ignore"
+              return True, f"{len(code)} of {len(files)} changed file(s) are outside paths-ignore, the first being {code[0]}"
+
+
+          build, reason = decide()
+          if build and event == "push":
+              for branch in skipped_branches:
+                  if ref == "refs/heads/" + branch:
+                      build, reason = False, f"this build is skipped on a push to {branch}"
+          print(f"build={str(build).lower()}: {reason}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"build={str(build).lower()}\n")
+          PLAN
 
       - name: Set up the JDK
         if: ${{ steps.plan.outputs.build == 'true' }}
@@ -538,15 +573,16 @@ jobs:
 
       - name: Set up Gradle
         if: ${{ steps.plan.outputs.build == 'true' }}
-        uses: gradle/actions/setup-gradle@v6
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
         with:
           cache-read-only: false
           cache-disabled: ${{ runner.environment == 'self-hosted' }}
 
-      - name: Write local.properties with a throwaway signing key
+      - name: Write local.properties
         if: ${{ steps.plan.outputs.build == 'true' }}
         env:
           LOCAL_PROPERTIES: ${{ inputs.local-properties }}
+          SIGNING_KEY: 'true'
         run: |
           set -euo pipefail
           comment='^[[:space:]]*#'
@@ -575,30 +611,36 @@ jobs:
           if [[ "$invalid" != 0 ]]; then
             exit 1
           fi
+          if [[ "$SIGNING_KEY" != true && "${#lines[@]}" == 0 ]]; then
+            echo "Nothing to write: no signing key in this job and no local-properties lines."
+            exit 0
+          fi
 
-          keystore="$RUNNER_TEMP/android-pr-check.jks"
-          password=android-pr-check
-          rm -f "$keystore"
-          keytool -genkeypair -keystore "$keystore" -storetype PKCS12 \
-            -storepass "$password" -keypass "$password" -alias android-pr-check \
-            -keyalg RSA -keysize 2048 -validity 30 \
-            -dname "CN=Android PR check throwaway key"
           {
-            echo "KEYSTORE_FILE=$keystore"
-            echo "KEYSTORE_PASSWORD=$password"
-            echo "KEY_ALIAS=android-pr-check"
-            echo "KEY_PASSWORD=$password"
+            if [[ "$SIGNING_KEY" == true ]]; then
+              keystore="$RUNNER_TEMP/android-pr-check.jks"
+              password=android-pr-check
+              rm -f "$keystore"
+              keytool -genkeypair -keystore "$keystore" -storetype PKCS12 \
+                -storepass "$password" -keypass "$password" -alias android-pr-check \
+                -keyalg RSA -keysize 2048 -validity 30 \
+                -dname "CN=Android PR check throwaway key" >&2
+              echo "KEYSTORE_FILE=$keystore"
+              echo "KEYSTORE_PASSWORD=$password"
+              echo "KEY_ALIAS=android-pr-check"
+              echo "KEY_PASSWORD=$password"
+            fi
             for line in ${lines[@]+"${lines[@]}"}; do
               printf '%s\n' "$line"
             done
           } > local.properties
-          echo "Wrote local.properties: the four signing keys and ${#lines[@]} caller line(s)."
+          echo "Wrote local.properties: signing key $SIGNING_KEY, ${#lines[@]} caller line(s)."
 
       - name: Run Gradle
         id: build
         if: ${{ steps.plan.outputs.build == 'true' }}
         env:
-          GRADLE_TASK: ${{ inputs.release-build-task }}
+          GRADLE_TASK: ciReleaseBuild
           GRADLE_ARGS: ${{ inputs.release-build-args }}
           GITHUB_TOKEN: ${{ secrets.GIT_TOKEN || github.token }}
           TOKEN_SOURCE: ${{ secrets.GIT_TOKEN != '' && 'GIT_TOKEN' || 'the job token (GIT_TOKEN did not reach this job)' }}
@@ -632,8 +674,8 @@ jobs:
           echo "GitHub Packages credentials for Gradle: GITHUB_ACTOR=$GITHUB_ACTOR, GITHUB_TOKEN from $TOKEN_SOURCE."
           # The copy in the temp directory is what gradle-log-verdict reads.
           set -f
-          # shellcheck disable=SC2086 # word splitting is intended: both are argument lists
-          ./gradlew $GRADLE_TASK $GRADLE_ARGS ${extra[@]+"${extra[@]}"} 2>&1 | tee "$RUNNER_TEMP/gradle.log"
+          # shellcheck disable=SC2086 # word splitting is intended: the second is an argument list
+          ./gradlew "$GRADLE_TASK" $GRADLE_ARGS ${extra[@]+"${extra[@]}"} 2>&1 | tee "$RUNNER_TEMP/gradle.log"
 
       - name: Upload the test and lint reports
         if: ${{ failure() && steps.build.outcome == 'failure' }}
@@ -645,7 +687,7 @@ jobs:
             **/build/reports/tests/**
             **/build/reports/lint-results-*
             **/build/reports/configuration-cache/**
-          retention-days: ${{ inputs.report-retention-days }}
+          retention-days: 14
           if-no-files-found: ignore
           overwrite: true
 

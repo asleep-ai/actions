@@ -10,6 +10,8 @@ on:
       - 'android-signing/**'
       - 'gradle-log-verdict/**'
       - 'pick-runner/**'
+      # The android-ci tests compare a default with pre-commit-changed/action.yml.
+      - 'pre-commit-changed/action.yml'
       - 'release-notes/**'
   push:
     branches: [main]
@@ -21,6 +23,7 @@ on:
       - 'android-signing/**'
       - 'gradle-log-verdict/**'
       - 'pick-runner/**'
+      - 'pre-commit-changed/action.yml'
       - 'release-notes/**'
   # The android-signing job verifies real APKs with every build-tools version
   # on the runner image. The image gains versions without a change here, and a

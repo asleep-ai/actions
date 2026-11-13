@@ -16,7 +16,6 @@ concurrency:
 permissions:
   contents: read
   packages: read
-  pull-requests: read
 
 jobs:
   # The check to require is `pr-check / result`.
@@ -29,4 +28,8 @@ jobs:
       local-properties: |
         EXAMPLE_API_KEY=ci-placeholder
         EXAMPLE_BASE_URL=https://ci.placeholder.invalid
-    secrets: inherit
+    # By name: `secrets: inherit` would hand over every secret of this
+    # repository. Both are optional.
+    secrets:
+      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
+      GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
