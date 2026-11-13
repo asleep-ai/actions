@@ -4,8 +4,9 @@ name: Android version bump
 # tags. A person starts it by hand for a merged pull request. The plan job
 # computes the next version, checks that the commit passed its checks and
 # writes what would be released to the job summary. The tag job then waits for
-# the approval of its environment, tags the commit vX.Y.Z, moves the main
-# branch to it and starts the caller's release workflow.
+# the approval of its environment, tags the commit vX.Y.Z and starts the
+# caller's release workflow. The tag is the release: no branch is moved unless
+# the caller names one.
 #
 # The caller's contract and every input are in android-ci/README.md.
 on:
@@ -26,10 +27,21 @@ on:
         type: string
         default: ''
       bump:
-        description: 'Which part of the last version to raise: patch, minor or major.'
+        description: >-
+          Which part of the last version to raise: patch, minor or major. Not
+          read when version is given.
         required: false
         type: string
         default: patch
+      version:
+        description: >-
+          Optional. The exact version to release, X.Y.Z, instead of a bump:
+          for a first release that does not start at 0.x, or to skip
+          versions. It has to be higher than the last release the commit
+          contains and must not be tagged yet.
+        required: false
+        type: string
+        default: ''
       dry_run:
         description: >-
           Plan and check only: nothing is tagged, pushed or started, and no
@@ -40,9 +52,10 @@ on:
       source-branch:
         description: >-
           The branch releases are cut from; empty means the default branch of
-          the repository. The commit has to be on it, or, for a major version
-          that has a branch release/<major>.x, on that branch. A commit of an
-          open pull request or of an unmerged branch is refused.
+          the repository. The commit has to be in its first-parent history, or,
+          for a major version that has a branch release/<major>.x, in that
+          branch's. A commit of an open pull request or of an unmerged branch
+          is refused.
         required: false
         type: string
         default: ''
@@ -55,12 +68,13 @@ on:
         default: pr-check / result
       main-branch:
         description: >-
-          The branch that is moved to the released commit, as a fast-forward,
-          when the release is cut from the source branch. A release from a
-          release/<major>.x branch moves no branch. Empty moves no branch.
+          Optional. A branch that is moved to the released commit, as a
+          fast-forward, when the release is cut from the source branch. A
+          release from a release/<major>.x branch moves no branch. Empty, the
+          default, moves no branch: the tag alone is the release.
         required: false
         type: string
-        default: main
+        default: ''
       release-workflow:
         description: >-
           File name of the caller's workflow that builds a release tag. It is
@@ -70,17 +84,17 @@ on:
         default: release.yml
       environment:
         description: >-
-          The environment of the job that tags. Its protection rules, such as
-          required reviewers, are the approval of the release.
+          The environment of the job that tags. Its required reviewers are the
+          approval of the release. It is not the environment that holds the
+          signing key: that one is the build job's, in android-release.yml.
         required: false
         type: string
-        default: release
+        default: release-approval
     secrets:
       RELEASE_PUSH_TOKEN:
         description: >-
-          Optional. Token that pushes the tag and the branch instead of the
-          job token, for a repository whose rules do not let the job token
-          push to main-branch.
+          Optional. Token that pushes the tag instead of the job token, for a
+          repository whose rules restrict who may create release tags.
         required: false
     outputs:
       tag:
@@ -104,9 +118,11 @@ defaults:
     shell: bash
 
 jobs:
-  # Read-only. Everything that can refuse the release is decided here, so a
-  # dry run shows the same refusals and an approver sees the summary before
-  # the tag job asks.
+  # Read-only. What the release would be, and whether the commit may be
+  # released, is decided here, so a dry run shows the same refusals and an
+  # approver sees the summary before the tag job asks. What can only fail
+  # while writing (a version another release took meanwhile, a push the
+  # repository's rules refuse) fails in the tag job.
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -141,6 +157,7 @@ jobs:
           pr: ${{ inputs.pr }}
           sha: ${{ inputs.sha }}
           bump: ${{ inputs.bump }}
+          version: ${{ inputs.version }}
           source-branch: ${{ inputs.source-branch || github.event.repository.default_branch }}
 
       - name: Write the plan to the summary
@@ -152,6 +169,8 @@ jobs:
           LINE_BRANCH: ${{ steps.version.outputs.branch }}
           PRS: ${{ steps.version.outputs.prs }}
           PR: ${{ inputs.pr }}
+          BUMP: ${{ inputs.bump }}
+          VERSION_GIVEN: ${{ inputs.version }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
@@ -165,6 +184,9 @@ jobs:
             echo "- Commit: [\`${TARGET_SHA:0:7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$TARGET_SHA)${PR:+, the merge commit of #${PR#\#}}"
             echo "- Release line: \`$LINE_BRANCH\`"
             echo "- versionCode: $VERSION_CODE"
+            if [[ -n "$VERSION_GIVEN" ]]; then
+              echo "- The version was given (\`version\`); \`bump\` ($BUMP) is ignored."
+            fi
             echo
             echo "#### Included"
             echo
@@ -176,6 +198,8 @@ jobs:
       # A release is cut from a commit that passed the same checks a pull
       # request has to pass. The newest check run of each name counts. A check
       # that never ran on the commit is a refusal, like one that failed.
+      # android-release.yml runs the same script on the tagged commit, and
+      # android-ci's tests fail when the two copies differ.
       #
       # python3 -I: the script comes from standard input, and without -I
       # Python would look for the modules it imports in the checkout first.
@@ -209,7 +233,7 @@ jobs:
                       "Accept": "application/vnd.github+json",
                       "Authorization": f"Bearer {token}",
                       "X-GitHub-Api-Version": "2022-11-28",
-                      "User-Agent": "asleep-ai-actions-android-version-bump",
+                      "User-Agent": "asleep-ai-actions-android-ci",
                   },
               )
               try:
@@ -260,13 +284,15 @@ jobs:
               sys.exit(1)
           CHECKS
 
-      # The branch only ever moves forward to a released commit. When it holds
-      # a commit the release lacks, moving it would drop that commit, so the
-      # release is refused until the working branch has received it.
+      # Only for a caller that names a main-branch; by default no branch is
+      # moved. The branch only ever moves forward to a released commit. When
+      # it holds a commit the release lacks, moving it would drop that commit,
+      # so the release is refused until the working branch has received it.
       #
       # The branch follows the releases of the source branch only. A release
       # from a maintenance branch (release/<major>.x) is a commit the main
-      # branch cannot move forward to, and it is left where it is.
+      # branch cannot move forward to, and it is left where it is. The source
+      # branch itself is never moved: it holds the commit already.
       - name: Check that the main branch can move
         id: main
         env:
@@ -278,7 +304,10 @@ jobs:
           set -euo pipefail
           moved="$MAIN_BRANCH"
           if [[ -z "$MAIN_BRANCH" ]]; then
-            line="No branch is moved (\`main-branch\` is empty)."
+            line="No branch is moved: the tag is the release."
+          elif [[ "$MAIN_BRANCH" == "$SOURCE_BRANCH" ]]; then
+            moved=""
+            line="No branch is moved: \`$MAIN_BRANCH\` is the branch the release is cut from."
           elif [[ "$LINE_BRANCH" != "$SOURCE_BRANCH" ]]; then
             moved=""
             line="\`$MAIN_BRANCH\` is not moved: it follows the releases of \`$SOURCE_BRANCH\`, and this one is cut from \`$LINE_BRANCH\`."
@@ -355,11 +384,13 @@ jobs:
         with:
           sha: ${{ needs.plan.outputs.target-sha }}
           bump: ${{ inputs.bump }}
+          version: ${{ inputs.version }}
           source-branch: ${{ inputs.source-branch || github.event.repository.default_branch }}
 
-      # One atomic push: the tag and the branch move together or not at all,
-      # so a branch the token may not push to leaves no tag behind. The branch
-      # push is not forced, so the server accepts only a fast-forward.
+      # One atomic push. With a main-branch, the tag and the branch move
+      # together or not at all, so a branch the token may not push to leaves
+      # no tag behind. The branch push is not forced, so the server accepts
+      # only a fast-forward.
       - name: Push the tag and the main branch
         id: push
         env:
@@ -369,8 +400,8 @@ jobs:
           TAG_EXISTS: ${{ steps.state.outputs.exists }}
           TAG_NOW: ${{ steps.version.outputs.tag }}
           PREVIOUS_TAG_NOW: ${{ steps.version.outputs.previous-tag }}
-          # Empty when no branch is moved: main-branch is empty, or the
-          # release is cut from a maintenance branch.
+          # Empty when no branch is moved: main-branch is empty or the source
+          # branch, or the release is cut from a maintenance branch.
           MAIN_BRANCH: ${{ needs.plan.outputs.main-branch }}
         run: |
           set -euo pipefail

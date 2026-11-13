@@ -71,10 +71,14 @@ def test_the_codes_continue_above_what_the_apps_have_shipped():
     # sleephub shipped 1.13.0 as 101_300_000 under its earlier formula, with test builds up to
     # 101_150_086; its next release is 1.13.1 or 1.14.0.
     assert min(release_code(1, 13, 1), release_code(1, 14, 0)) > 101_300_000
-    # heysleep has shipped only QA builds, numbered 100_000 + N by this same formula, and its
-    # first release 0.1.0 has to install over them.
+    # heysleep has shipped only QA builds, numbered 100_000 + N by this same formula (QA builds of
+    # 0.1). Its first release is 2.0.0, and from then on its QA builds are QA builds of 2.0,
+    # numbered 200_000_000 + N with the same N going on: they install over every QA build of 0.1,
+    # and the release 2.0.0 installs over them and not the other way round.
     assert qa_code(0, 1, 1) == 100_001
-    assert release_code(0, 1, 0) > qa_code(0, 1, version_code.MAX_QA_SEQUENCE)
+    shipped_qa = qa_code(0, 1, version_code.MAX_QA_SEQUENCE)
+    assert shipped_qa < qa_code(2, 0, 1) == 200_000_001
+    assert qa_code(2, 0, version_code.MAX_QA_SEQUENCE) < release_code(2, 0, 0) == 200_050_000
 
 
 @pytest.mark.parametrize("last_release", [(0, 1, 0), (1, 13, 0), (1, 13, 4), (3, 0, 0)])

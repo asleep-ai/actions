@@ -1,8 +1,9 @@
 name: Version Bump
 
 # Started by hand for a merged pull request. The run plans the next version,
-# waits for the approval of the `release` environment, tags the merge commit
-# vX.Y.Z, moves main to it and starts release.yml for the tag.
+# waits for the approval of the `release-approval` environment, tags the merge
+# commit vX.Y.Z and starts release.yml for the tag. The tag is the release: no
+# branch is moved and nothing is committed.
 #
 # The pull request was merged into the default branch or, for a hotfix of an
 # older major version, into its maintenance branch release/<major>.x. The
@@ -28,22 +29,28 @@ on:
           - patch
           - minor
           - major
+      version:
+        description: 'Exception: the exact version X.Y.Z to release (bump is then ignored)'
+        required: false
+        type: string
       dry_run:
         description: 'Plan and check only: nothing is tagged, pushed or started'
         required: false
         default: false
         type: boolean
 
-# One release at a time: a second run waits for the first. GitHub keeps one
-# waiting run per group, so a third run would replace the one that waits.
+# One release at a time: a second run waits for the first, also while the
+# first waits for its approval. GitHub keeps one waiting run per group, so a
+# third run would replace the one that waits. A dry run writes nothing and
+# gets a group of its own, so it never waits and never replaces a release.
 concurrency:
-  group: version-bump
+  group: ${{ inputs.dry_run && format('version-bump-dry-{0}', github.run_id) || 'version-bump' }}
   cancel-in-progress: false
 
 # The called workflow can use no more than what is granted here, and it fails
 # to start when one of these is missing.
 permissions:
-  contents: write       # the tag, and the main branch
+  contents: write       # the tag
   actions: write        # start release.yml for the tag
   checks: read          # the checks of the commit
   pull-requests: read   # the merge commit of the pull request
@@ -55,4 +62,5 @@ jobs:
       pr: ${{ inputs.pr }}
       sha: ${{ inputs.sha }}
       bump: ${{ inputs.bump }}
+      version: ${{ inputs.version }}
       dry_run: ${{ inputs.dry_run }}

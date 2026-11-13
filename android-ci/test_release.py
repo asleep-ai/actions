@@ -61,13 +61,6 @@ case "$*" in
     if [ -f "$GH_DIR/release-error" ]; then cat "$GH_DIR/release-error" >&2; exit 1; fi
     if [ ! -f "$GH_DIR/release" ]; then echo "gh: Not Found (HTTP 404)" >&2; exit 1; fi
     cat "$GH_DIR/release" ;;
-  "api repos/acme/app/compare/"*)
-    # One file per branch that exists; any other branch answers as GitHub does.
-    comparison="${2#repos/acme/app/compare/}"
-    branch="${comparison%%...*}"
-    file="$GH_DIR/compare-$(printf '%s' "$branch" | tr '/' '_')"
-    if [ ! -f "$file" ]; then echo "gh: Not Found (HTTP 404)" >&2; exit 1; fi
-    cat "$file" ;;
   "release upload "*|"release create "*|"workflow run "*)
     exit "${GH_EXIT:-0}" ;;
   *)
@@ -77,16 +70,14 @@ esac
 SHA = "1f" * 20
 
 
-def gh_directory(tmp_path: Path, tags: list[str], released=(), compare="identical", release_exists=False) -> Path:
-    """A stand-in for gh: the tags, the tags with a published release, how the tagged commit compares with
-    each branch (a status means main), and whether the release asked for by tag exists."""
+def gh_directory(tmp_path: Path, tags: list[str], released=(), release_exists=False) -> Path:
+    """A stand-in for gh: the tags, the tags with a published release, and whether the release asked for
+    by tag exists."""
     directory = tmp_path / "gh"
     directory.mkdir(parents=True)
     executable(directory / "gh", GH_STUB)
     (directory / "tags").write_text("".join(f"{tag}\n" for tag in tags))
     (directory / "sha").write_text(SHA + "\n")
-    for branch, status in ({"main": compare} if isinstance(compare, str) else compare).items():
-        (directory / f"compare-{branch.replace('/', '_')}").write_text(status + "\n")
     (directory / "calls").write_text("")
     (directory / "released").write_text("".join(f"{tag}\n" for tag in released))
     if release_exists:
@@ -94,7 +85,7 @@ def gh_directory(tmp_path: Path, tags: list[str], released=(), compare="identica
     return directory
 
 
-def check_tag(entry, tmp_path, tag: str, directory: Path, branch: str = "main"):
+def check_tag(entry, tmp_path, tag: str, directory: Path):
     output = tmp_path / "output"
     output.write_text("")
     env = {
@@ -103,7 +94,6 @@ def check_tag(entry, tmp_path, tag: str, directory: Path, branch: str = "main"):
         "GH_REPO": "acme/app",
         "GH_TOKEN": "token",
         "TAG": tag,
-        "RELEASE_BRANCH": branch,
         "GITHUB_OUTPUT": str(output),
     }
     result = run_script(step_by_id(entry["jobs"]["plan"], "tag")["run"], env, tmp_path)
@@ -122,8 +112,6 @@ def test_a_new_release_of_the_highest_tag_is_planned(entry, tmp_path):
     result, outputs = check_tag(entry, tmp_path, "v1.10.1", directory)
     assert result.returncode == 0, result.stdout + result.stderr
     assert outputs == {"tag": "v1.10.1", "sha": SHA, "latest": "true"}
-    assert "repos/acme/app/compare/main..." + SHA in (directory / "calls").read_text()
-    assert "on main" in result.stdout
 
 
 def test_the_first_release_is_the_latest(entry, tmp_path):
@@ -168,14 +156,12 @@ def test_an_older_release_that_exists_can_be_built_again(entry, tmp_path):
     assert "GitHub Release exists: true" in result.stdout
 
 
-def test_a_release_of_a_lower_line_is_built_from_its_maintenance_branch(entry, tmp_path):
-    # 2.0.1 exists, and 1.13.2 is released after it from release/1.x, which main never receives.
-    compare = {"main": "diverged", "release/1.x": "identical"}
-    directory = gh_directory(tmp_path, LINE_TAGS, released=["v1.13.0", "v1.13.1", "v2.0.0", "v2.0.1"], compare=compare)
+def test_a_release_of_a_lower_line_is_not_the_latest(entry, tmp_path):
+    # 2.0.1 exists, and 1.13.2 is released after it from release/1.x.
+    directory = gh_directory(tmp_path, LINE_TAGS, released=["v1.13.0", "v1.13.1", "v2.0.0", "v2.0.1"])
     result, outputs = check_tag(entry, tmp_path, "v1.13.2", directory)
     assert result.returncode == 0, result.stdout + result.stderr
     assert outputs == {"tag": "v1.13.2", "sha": SHA, "latest": "false"}
-    assert "on release/1.x" in result.stdout
 
 
 def test_a_release_of_the_highest_line_is_the_latest(entry, tmp_path):
@@ -193,26 +179,166 @@ def test_an_api_failure_is_not_read_as_no_release(entry, tmp_path):
     assert "::error::Cannot list the releases of acme/app." in result.stdout
 
 
-@pytest.mark.parametrize(("status", "code"), [("identical", 0), ("behind", 0), ("ahead", 1), ("diverged", 1)])
-def test_the_tagged_commit_has_to_be_on_the_release_branch(entry, tmp_path, status, code):
-    # No release/1.x branch exists here: that comparison answers 404.
-    result, _ = check_tag(entry, tmp_path, "v1.10.1", gh_directory(tmp_path, TAGS, compare=status))
-    assert result.returncode == code, result.stdout + result.stderr
-    assert ("is on neither main nor release/1.x" in result.stdout) == (code == 1)
+# --- plan: the branch and the checks of the tagged commit ------------------------------------
 
 
-def test_a_commit_on_another_line_s_branch_is_refused(entry, tmp_path):
-    compare = {"main": "diverged", "release/1.x": "ahead", "release/2.x": "identical"}
-    result, _ = check_tag(entry, tmp_path, "v1.10.1", gh_directory(tmp_path, TAGS, compare=compare))
-    assert result.returncode == 1
-    assert "is on neither main nor release/1.x" in result.stdout
+@pytest.fixture
+def lines(tmp_path) -> dict:
+    """A clone as the plan job's checkout has it: every branch of the remote, and HEAD at the tag.
+
+        develop:      base ── merge of #12 (feature: head) ── a
+        release/1.x:    └── h
+        open pull request:                                    └── open
+    """
+    from test_pr_check import commit, git, new_repository
+
+    seed = new_repository(tmp_path / "seed")
+    git(seed, "branch", "-m", "develop")
+    commits = {"base": git(seed, "rev-parse", "HEAD")}
+    git(seed, "checkout", "-q", "-b", "release/1.x")
+    commits["h"] = commit(seed, {"hotfix.kt": "1"}, "hotfix (#21)")
+    git(seed, "checkout", "-q", "-b", "feature", "develop")
+    commits["head"] = commit(seed, {"feature.kt": "1"}, "work on the feature")
+    git(seed, "checkout", "-q", "develop")
+    commit(seed, {"other.kt": "1"}, "the base branch moved on (#11)")
+    git(seed, "merge", "-q", "--no-ff", "-m", "Merge pull request #12 from acme/feature", "feature")
+    commits["merge"] = git(seed, "rev-parse", "HEAD")
+    commits["a"] = commit(seed, {"a.kt": "1"}, "fix (#13)")
+    git(seed, "checkout", "-q", "-b", "open")
+    commits["open"] = commit(seed, {"open.kt": "1"}, "head of an open pull request")
+    git(seed, "checkout", "-q", "develop")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", seed.as_uri(), str(clone))
+    git(clone, "checkout", "-q", "--detach", commits["a"])
+    return {"clone": clone, **commits}
 
 
-def test_an_empty_release_branch_skips_the_branch_check(entry, tmp_path):
-    directory = gh_directory(tmp_path, TAGS, compare="diverged")
-    result, _ = check_tag(entry, tmp_path, "v1.10.1", directory, branch="")
+def check_line(entry, lines: dict, tag: str, sha: str, source: str = "develop"):
+    env = {"TAG": tag, "SHA": sha, "SOURCE_BRANCH": source, "RUNNER_TEMP": str(lines["clone"].parent)}
+    return run_script(step_by_id(entry["jobs"]["plan"], "line")["run"], env, lines["clone"])
+
+
+@pytest.mark.parametrize(
+    ("tag", "commit_name", "branch"),
+    [
+        ("v2.0.0", "a", "develop"),
+        ("v2.0.0", "merge", "develop"),
+        # Before the lines parted: the commit is on both branches.
+        ("v1.13.0", "base", "develop"),
+        ("v1.13.1", "h", "release/1.x"),
+    ],
+)
+def test_a_tag_on_a_commit_of_its_release_branch_is_built(entry, lines, tag, commit_name, branch):
+    result = check_line(entry, lines, tag, lines[commit_name])
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "compare" not in (directory / "calls").read_text()
+    assert f"The commit of {tag} ({lines[commit_name][:7]}) is on {branch}." in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("tag", "commit_name"),
+    [
+        # A tag that a person pushed on a commit that was never merged.
+        ("v2.0.0", "open"),
+        # The head of a pull request merged with a merge commit: in the history, and never the branch's tip.
+        ("v2.0.0", "head"),
+        # release/1.x releases major 1 only.
+        ("v2.0.0", "h"),
+        ("v3.0.0", "h"),
+    ],
+)
+def test_a_tag_on_any_other_commit_is_refused(entry, lines, tag, commit_name):
+    result = check_line(entry, lines, tag, lines[commit_name])
+    assert result.returncode == 1
+    major = tag[1]
+    assert f"is in the first-parent history of neither develop nor release/{major}.x" in result.stdout
+    assert "::error title=The tag is not on a release branch::" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("trunk", "Branch trunk does not exist in this repository."),
+        ("", "source-branch is not a branch name"),
+        ("-x", "source-branch is not a branch name"),
+        ("develop..open", "source-branch is not a branch name"),
+    ],
+)
+def test_the_source_branch_has_to_exist(entry, lines, source, message):
+    result = check_line(entry, lines, "v2.0.0", lines["a"], source=source)
+    assert result.returncode == 1
+    assert message in result.stdout
+
+
+def test_the_branch_and_the_checks_are_checked_for_every_tag_before_anything_is_built(entry):
+    plan = entry["jobs"]["plan"]
+    names = [item.get("name") or item.get("uses") for item in plan["steps"]]
+    assert names == [
+        "Check the tag",
+        "actions/checkout@v7",
+        "Check the branch of the tagged commit",
+        "Check the commit's checks",
+        "Compute the versionCode",
+        "Pick the runner",
+    ]
+    # No step is conditional on who pushed the tag or on what started the run.
+    for item in plan["steps"][:4]:
+        assert "if" not in item, item
+    assert "github.event_name" not in json.dumps(plan) and "github.actor" not in json.dumps(plan)
+    # The checkout is of the tag that was just checked, with every branch, and leaves no token.
+    assert plan["steps"][1]["with"] == {
+        "ref": "refs/tags/${{ steps.tag.outputs.tag }}",
+        "fetch-depth": 0,
+        "persist-credentials": False,
+    }
+    line = step_by_id(plan, "line")
+    assert line["env"] == {
+        "TAG": "${{ steps.tag.outputs.tag }}",
+        "SHA": "${{ steps.tag.outputs.sha }}",
+        "SOURCE_BRANCH": "${{ inputs.source-branch || github.event.repository.default_branch }}",
+    }
+    checks = step(plan, "Check the commit's checks")
+    assert checks["env"] == {
+        "TOKEN": "${{ github.token }}",
+        "TARGET_SHA": "${{ steps.tag.outputs.sha }}",
+        "REQUIRED_CHECKS": "${{ inputs.required-checks }}",
+    }
+    assert plan["permissions"] == {"contents": "read", "checks": "read"}
+    # The primary build needs the plan, so a refusal here means that no job reads the signing key.
+    assert entry["jobs"]["primary"]["needs"] == "plan"
+
+
+def test_the_checks_are_decided_by_the_script_of_the_version_bump(entry):
+    # One rule in two workflows: what the version bump requires before it tags is what the release
+    # requires of a tag, including one that the version bump never saw.
+    bump = load("android-version-bump.yml")
+    ours = step(entry["jobs"]["plan"], "Check the commit's checks")
+    theirs = step(bump["jobs"]["plan"], "Check the commit's checks")
+    assert ours["run"] == theirs["run"]
+    inputs = trigger(entry)["inputs"]
+    assert inputs["required-checks"]["default"] == trigger(bump)["inputs"]["required-checks"]["default"]
+    assert inputs["source-branch"]["default"] == trigger(bump)["inputs"]["source-branch"]["default"] == ""
+
+
+@pytest.mark.parametrize(
+    ("conclusion", "code"), [("success", 0), ("failure", 1), ("cancelled", 1), ("skipped", 1), (None, 1)]
+)
+def test_a_tag_on_a_commit_whose_check_did_not_succeed_is_not_built(entry, tmp_path, conclusion, code):
+    from test_version_bump import SHA as CHECKED, check_run, check_runs_api
+
+    with check_runs_api() as api:
+        # None: the check never ran on the commit, as on one that was pushed together with later commits.
+        api.runs = [check_run(conclusion=conclusion)] if conclusion else []
+        env = {
+            "TOKEN": "job-token",
+            "TARGET_SHA": CHECKED,
+            "REQUIRED_CHECKS": trigger(entry)["inputs"]["required-checks"]["default"],
+            "GITHUB_API_URL": f"http://127.0.0.1:{api.server_port}",
+            "GITHUB_REPOSITORY": "acme/app",
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+        }
+        result = run_script(step(entry["jobs"]["plan"], "Check the commit's checks")["run"], env, tmp_path)
+    assert result.returncode == code, result.stdout + result.stderr
+    assert ("::error title=The commit has not passed its checks::" in result.stdout) == (code == 1)
 
 
 def test_plan_takes_the_version_code_from_the_one_formula(entry):
@@ -640,8 +766,10 @@ def check_apks(build, tmp_path, apks=ONE_APK, **overrides):
     }
     result = run_script(step_by_id(build, "apk")["run"], env, workspace)
     lines = output.read_text().splitlines()
-    paths = lines[1:-1] if lines else None
-    if lines:
+    # A refusal of the APKs themselves is marked, and lists no path.
+    check_apks.refused = lines == ["refused=true"]
+    paths = lines[1:-1] if lines and not check_apks.refused else None
+    if paths is not None:
         assert (lines[0], lines[-1]) == ("paths<<android-release-apks", "android-release-apks")
     return result, paths
 
@@ -674,7 +802,7 @@ def test_an_apk_with_another_version_is_refused(build, tmp_path, built, message)
     assert result.returncode == 1
     assert message in result.stdout
     assert "-PciVersionName and -PciVersionCode" in result.stdout
-    assert paths is None
+    assert paths is None and check_apks.refused
 
 
 def test_one_flavor_with_another_version_refuses_the_release(build, tmp_path):
@@ -682,14 +810,14 @@ def test_one_flavor_with_another_version_refuses_the_release(build, tmp_path):
     assert result.returncode == 1
     assert "SweetSleep_release_1.13.1_101350001.apk is version 0.0.0-dev (1)" in result.stdout
     assert result.stdout.count("::error::") == 1
-    assert paths is None
+    assert paths is None and check_apks.refused
 
 
 def test_a_build_that_left_no_apk_is_refused(build, tmp_path):
     result, paths = check_apks(build, tmp_path, apks=())
     assert result.returncode == 1
     assert "::error::ciRelease left no APK under app/build/outputs/apk." in result.stdout
-    assert paths is None
+    assert paths is None and check_apks.refused
 
 
 @pytest.mark.parametrize("directory", ["app/build/outputs/elsewhere", "", "-delete"])
@@ -697,7 +825,7 @@ def test_the_apk_directory_has_to_exist(build, tmp_path, directory):
     result, paths = check_apks(build, tmp_path, APK_DIRECTORY=directory)
     assert result.returncode == 1
     assert "is not a directory after the build" in result.stdout
-    assert paths is None
+    assert paths is None and check_apks.refused
     assert (tmp_path / "workspace" / ONE_APK[0]).exists()
 
 
@@ -706,7 +834,7 @@ def test_apks_that_would_collide_as_release_assets_are_refused(build, tmp_path):
     result, paths = check_apks(build, tmp_path, apks=apks)
     assert result.returncode == 1
     assert "share a file name: app-release.apk" in result.stdout
-    assert paths is None
+    assert paths is None and check_apks.refused
 
 
 def test_aapt2_comes_from_the_named_build_tools_version(build, tmp_path):
@@ -715,13 +843,15 @@ def test_aapt2_comes_from_the_named_build_tools_version(build, tmp_path):
     result, _ = check_apks(build, tmp_path / "missing", BUILD_TOOLS_VERSION="34.0.0")
     assert result.returncode == 1
     assert "aapt2 was not found" in result.stdout and "(version 34.0.0)" in result.stdout
+    # The tool is missing on this runner; another runner may have it.
+    assert not check_apks.refused
 
 
 def test_without_an_sdk_the_apks_are_not_passed_unchecked(build, tmp_path):
     result, paths = check_apks(build, tmp_path, ANDROID_HOME=str(tmp_path / "no-sdk"))
     assert result.returncode == 1
     assert "No Android SDK with build-tools" in result.stdout
-    assert paths is None
+    assert paths is None and not check_apks.refused
 
 
 def test_the_apks_are_verified_uploaded_and_the_secrets_deleted(build):
@@ -776,10 +906,14 @@ def test_the_verdict_covers_every_step_before_the_build(build):
     # A step that may be skipped would read as a failed setup.
     for item in steps[: ids.index("build") + 1]:
         assert "if" not in item, item.get("name")
-    # A missing secret is final: the other runner would miss it too. The verdict is the only output:
-    # the runner drops a job output that contains a secret's value, and a file or artifact name can.
+    # A missing secret is final, and so are APKs that cannot be released: the other runner would end
+    # the same way, after another cold build. The verdict is the only output: the runner drops a job
+    # output that contains a secret's value, and a file or artifact name can.
     assert build["outputs"] == {
-        "verdict": "${{ steps.values.outcome == 'failure' && 'code' || steps.verdict.outputs.verdict }}"
+        "verdict": (
+            "${{ (steps.values.outcome == 'failure' || steps.apk.outputs.refused == 'true') && 'code' "
+            "|| steps.verdict.outputs.verdict }}"
+        )
     }
     assert set(trigger(load(BUILD))["outputs"]) == {"verdict"}
 
@@ -808,7 +942,9 @@ def test_primary_and_fallback_pass_the_same_inputs(entry):
     for name, output in planned.items():
         assert primary["with"][name] == fallback["with"][name] == f"${{{{ needs.plan.outputs.{output} }}}}"
     forwarded = set(inner["inputs"]) - {"runs-on", "attempt", *planned}
-    assert forwarded == set(inputs) - {"tag", "runner-labels", "fallback-runs-on", "release-branch", "release-notes-prompt"}
+    assert forwarded == set(inputs) - {
+        "tag", "runner-labels", "fallback-runs-on", "source-branch", "required-checks", "release-notes-prompt",
+    }
     for name in forwarded:
         assert primary["with"][name] == fallback["with"][name] == f"${{{{ inputs.{name} }}}}"
         assert inputs[name]["type"] == inner["inputs"][name]["type"], name
@@ -843,7 +979,7 @@ def test_publish_takes_the_apk_of_the_build_that_passed(entry):
     # The only job that can write, and it runs none of the repository's code.
     assert publish["permissions"] == {"contents": "write", "pull-requests": "read"}
     assert entry["permissions"] == {"contents": "read", "packages": "read"}
-    assert entry["jobs"]["plan"]["permissions"] == {"contents": "read"}
+    assert entry["jobs"]["plan"]["permissions"] == {"contents": "read", "checks": "read"}
     download = step(publish, "Download the signed APKs")["with"]
     # The name the build job uploads under, built from the results and not read from an output.
     assert download["name"] == "android-release-apk-${{ needs.primary.result == 'success' && 'primary' || 'fallback' }}"
@@ -856,6 +992,10 @@ def test_publish_takes_the_apk_of_the_build_that_passed(entry):
     previous = step(publish, "Find the previous release of the line")
     assert previous["id"] == "previous" and previous["if"] == notes["if"]
     assert notes["with"]["previous-tag"] == "${{ steps.previous.outputs.tag }}"
+    # Without a previous release the action would look for a tag itself, and could find one that was
+    # left out on purpose. A pattern without a wildcard that names no tag finds none.
+    pattern = notes["with"]["tag-pattern"]
+    assert not set("*?[") & set(pattern) and not re.fullmatch(r"v[0-9].*", pattern)
     assert notes["with"]["openai-api-key"] == "${{ secrets.OPENAI_API_KEY }}"
     create = step(publish, "Create or update the GitHub Release")
     assert notes["with"]["output-file"] == create["env"]["NOTES_FILE"]
@@ -1089,7 +1229,9 @@ def test_the_example_passes_only_what_the_workflow_declares(entry):
     assert set(job["with"]) <= set(trigger(entry)["inputs"])
     assert job["secrets"] == "inherit"
     # The called workflow cannot be given more than the caller has.
-    assert example["permissions"] == {"contents": "write", "packages": "read", "pull-requests": "read"}
+    assert example["permissions"] == {
+        "contents": "write", "packages": "read", "checks": "read", "pull-requests": "read",
+    }
     assert example[True]["push"]["tags"] == ["v[0-9]+.[0-9]+.[0-9]+"]
     assert "workflow_dispatch" in example[True]
 

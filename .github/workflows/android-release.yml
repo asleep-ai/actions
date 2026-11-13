@@ -107,14 +107,23 @@ on:
         required: false
         type: string
         default: ''
-      release-branch:
+      source-branch:
         description: >-
-          The branch the tagged commit has to be on. A commit on the
-          maintenance branch of its major version, release/<major>.x, is
-          accepted as well. Empty skips the check.
+          The branch releases are cut from; empty means the default branch of
+          the repository. The tagged commit has to be in its first-parent
+          history, or in that of release/<major>.x, the maintenance branch of
+          the tag's major version.
         required: false
         type: string
-        default: main
+        default: ''
+      required-checks:
+        description: >-
+          Names of the checks that must have succeeded on the tagged commit,
+          one per line, as the commit's checks list shows them. They are
+          checked for every tag, whoever pushed it. Empty requires none.
+        required: false
+        type: string
+        default: pr-check / result
       release-notes-prompt:
         description: >-
           System prompt for release-notes, replacing its built-in one.
@@ -206,14 +215,21 @@ defaults:
 
 jobs:
   # Everything that can stop a release before a build starts, decided on a
-  # GitHub-hosted runner: the tag, its place among the releases, the version
-  # to build, and where the build runs. A job queued for self-hosted labels
-  # while every matching runner is offline would wait instead of failing.
+  # GitHub-hosted runner: the tag, its place among the releases, the branch
+  # and the checks of its commit, the version to build, and where the build
+  # runs. A job queued for self-hosted labels while every matching runner is
+  # offline would wait instead of failing.
+  #
+  # The branch and the checks are what android-version-bump.yml requires
+  # before it tags. They are required here again because this workflow also
+  # builds a tag that a person pushed, and it is the build job that reads the
+  # signing key.
   plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
+      checks: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       sha: ${{ steps.tag.outputs.sha }}
@@ -229,7 +245,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag || github.ref_name }}
-          RELEASE_BRANCH: ${{ inputs.release-branch }}
         run: |
           set -euo pipefail
           # Only vX.Y.Z is a release. A tag with a suffix, a branch, or a
@@ -288,31 +303,154 @@ jobs:
             latest=false
           fi
 
-          on=""
-          if [[ -n "$RELEASE_BRANCH" ]]; then
-            # The tagged commit has to be on the release branch or on the
-            # maintenance branch of its line. identical or behind: the commit
-            # is on the branch. A branch that does not exist answers 404, and
-            # the commit is not on it.
-            for branch in "$RELEASE_BRANCH" "release/$major.x"; do
-              status=$(gh api "repos/$GH_REPO/compare/$branch...$sha" --jq '.status' 2>/dev/null || true)
-              if [[ "$status" == identical || "$status" == behind ]]; then
-                on="$branch"
-                break
-              fi
-            done
-            if [[ -z "$on" ]]; then
-              echo "::error::The commit of $TAG ($sha) is on neither $RELEASE_BRANCH nor release/$major.x. Releases are built from commits of those branches."
-              exit 1
-            fi
-          fi
-
           {
             echo "tag=$TAG"
             echo "sha=$sha"
             echo "latest=$latest"
           } >> "$GITHUB_OUTPUT"
-          echo "Release $TAG at $sha${on:+, on $on}. Latest: $latest. GitHub Release exists: $exists."
+          echo "Release $TAG at $sha. Latest: $latest. GitHub Release exists: $exists."
+
+      # Every branch and the whole history, for the step below. The tag was
+      # checked above, so the ref is a release tag that exists. Nothing of the
+      # checkout is run.
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The tagged commit has to be a commit its branch pointed at: in the
+      # first-parent history of the source branch, or of release/<major>.x,
+      # the maintenance branch of its line. A tag on a commit of an open pull
+      # request, of an unmerged branch or of another line is not built, and
+      # neither is one on the head of a pull request that was merged with a
+      # merge commit: its green check is the pull request's, which built the
+      # merge with the base branch and not this commit.
+      - name: Check the branch of the tagged commit
+        id: line
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          SHA: ${{ steps.tag.outputs.sha }}
+          SOURCE_BRANCH: ${{ inputs.source-branch || github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SOURCE_BRANCH" || "$SOURCE_BRANCH" == -* ]] || ! git check-ref-format "refs/heads/$SOURCE_BRANCH"; then
+            echo "::error::source-branch is not a branch name: $SOURCE_BRANCH"
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet "refs/remotes/origin/$SOURCE_BRANCH^{commit}" > /dev/null; then
+            echo "::error::Branch $SOURCE_BRANCH does not exist in this repository."
+            exit 1
+          fi
+          major="${TAG#v}"
+          major="${major%%.*}"
+          maintenance="release/$major.x"
+          history="$RUNNER_TEMP/android-release-first-parents"
+          on=""
+          for branch in "$SOURCE_BRANCH" "$maintenance"; do
+            # A branch that does not exist holds no commit.
+            if tip=$(git rev-parse --verify --quiet "refs/remotes/origin/$branch^{commit}"); then
+              git rev-list --first-parent "$tip" > "$history"
+              if grep -qxF "$SHA" "$history"; then
+                on="$branch"
+                break
+              fi
+            fi
+          done
+          rm -f "$history"
+          if [[ -z "$on" ]]; then
+            echo "::error title=The tag is not on a release branch::The commit of $TAG (${SHA:0:7}) is in the first-parent history of neither $SOURCE_BRANCH nor $maintenance. A release is built from a commit that was merged into one of them: the merge commit of a pull request, not a commit of the pull request itself."
+            exit 1
+          fi
+          echo "The commit of $TAG (${SHA:0:7}) is on $on."
+
+      # The same script as in android-version-bump.yml, on the tagged commit:
+      # a tag that the version bump created passes again, and a tag that a
+      # person pushed is held to the same checks. android-ci's tests fail when
+      # the two copies differ.
+      #
+      # python3 -I: the script comes from standard input, and without -I
+      # Python would look for the modules it imports in the checkout first.
+      - name: Check the commit's checks
+        env:
+          TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.tag.outputs.sha }}
+          REQUIRED_CHECKS: ${{ inputs.required-checks }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'CHECKS'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          sha = os.environ["TARGET_SHA"]
+          token = os.environ.get("TOKEN", "").strip()
+          required = [line.strip() for line in os.environ.get("REQUIRED_CHECKS", "").splitlines() if line.strip()]
+
+
+          def check_runs(name):
+              query = urllib.parse.urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+              request = urllib.request.Request(
+                  f"{api}/repos/{repository}/commits/{sha}/check-runs?{query}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "asleep-ai-actions-android-ci",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      document = json.load(response)
+              except urllib.error.HTTPError as error:
+                  detail = error.read(300).decode(errors="replace").strip()
+                  sys.exit(f"::error::Cannot read the checks of {sha}: HTTP {error.code}: {detail}")
+              except (OSError, ValueError) as error:
+                  sys.exit(f"::error::Cannot read the checks of {sha}: {error}")
+              runs = document.get("check_runs") if isinstance(document, dict) else None
+              if not isinstance(runs, list):
+                  sys.exit(f"::error::Cannot read the checks of {sha}: the response has no check_runs list")
+              return [run for run in runs if isinstance(run, dict) and run.get("name") == name]
+
+
+          rows = []
+          refused = []
+          for name in required:
+              runs = check_runs(name)
+              if not runs:
+                  rows.append((name, "not run", ""))
+                  refused.append(f"'{name}' did not run on the commit")
+                  continue
+              newest = max(runs, key=lambda run: (str(run.get("started_at") or ""), run.get("id") or 0))
+              state = newest.get("conclusion") or newest.get("status") or "unknown"
+              rows.append((name, state, newest.get("html_url") or ""))
+              if newest.get("status") != "completed" or newest.get("conclusion") != "success":
+                  refused.append(f"'{name}' is {state}")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("#### Checks on the commit\n\n")
+              if not rows:
+                  summary.write("No check is required (`required-checks` is empty).\n\n")
+              else:
+                  summary.write("| check | result |\n|-------|--------|\n")
+                  for name, state, url in rows:
+                      summary.write(f"| {name} | {f'[{state}]({url})' if url else state} |\n")
+                  summary.write("\n")
+
+          if not required:
+              print("::notice::No check is required: required-checks is empty.")
+          for name, state, _ in rows:
+              print(f"{name}: {state}")
+          if refused:
+              print(f"::error title=The commit has not passed its checks::{sha[:7]}: {'; '.join(refused)}. "
+                    "Release a commit whose checks succeeded, or run them again on this one.")
+              sys.exit(1)
+          CHECKS
 
       - name: Compute the versionCode
         id: code
@@ -450,7 +588,8 @@ jobs:
       # 1.13.1, and 2.0.0 starts at the 1.x release the main line grew from.
       # Only a tag with a published release is a start: a lower tag whose
       # release never happened (its build failed, and the fix got the next
-      # version) has its changes listed here.
+      # version) has its changes listed here. Without any, the output is
+      # empty and the notes cover the whole history.
       - name: Find the previous release of the line
         id: previous
         if: ${{ steps.release.outputs.exists == 'false' }}
@@ -481,6 +620,12 @@ jobs:
 
       # Only for a new release: the notes of an existing one may have been
       # edited by hand, and they are kept.
+      #
+      # tag-pattern is read only when previous-tag is empty, where the action
+      # would search for a previous tag itself and could pick one the step
+      # above left out: a tag that was never published, or a suffixed tag
+      # (vX.Y.Z-label.N). The pattern has no wildcard and names no tag, so
+      # that search finds nothing.
       - name: Write the release notes
         id: notes
         if: ${{ steps.release.outputs.exists == 'false' }}
@@ -488,6 +633,7 @@ jobs:
         with:
           current-tag: ${{ needs.plan.outputs.tag }}
           previous-tag: ${{ steps.previous.outputs.tag }}
+          tag-pattern: android-release/no-previous-release
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           system-prompt: ${{ inputs.release-notes-prompt }}
           output-file: ${{ runner.temp }}/android-release-notes.md

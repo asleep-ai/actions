@@ -1,8 +1,9 @@
 name: PR Check
 
-# release/** covers maintenance branches (release/1.x). The version bump
-# releases a commit only when this check succeeded on it, and a merge commit
-# gets the check from the push run on its branch.
+# The branches that are released from get the check on every push: the
+# default branch, and release/** for maintenance branches (release/1.x). The
+# version bump and the release build a commit only when this check succeeded
+# on it, and a merge commit gets the check from the push run on its branch.
 on:
   pull_request:
     branches: [main, develop, 'release/**']
@@ -10,9 +11,13 @@ on:
     branches: [main, develop, 'release/**']
   workflow_dispatch:
 
+# A newer push to a pull request cancels the run of the older one. A push run
+# is never cancelled: every merged commit keeps its check, so each can be
+# released. GitHub keeps one waiting run per group, so of several merges made
+# while one run is in progress, only the last one waits and gets its check.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # The called workflow can use no more than what is granted here, and it fails
 # to start when one of these is missing.

@@ -70,4 +70,7 @@ runs:
         BUILD_TOOLS_VERSION: ${{ inputs.build-tools-version }}
         KEYSTORE_FILE: ${{ inputs.keystore-file }}
         CLEANUP_PATHS: ${{ inputs.paths }}
-      run: python3 "$GITHUB_ACTION_PATH/signing.py"
+      # -s -E: no user site-packages and no PYTHON* variables. This step
+      # holds the keystore, and on a self-hosted runner an earlier job can
+      # write to both.
+      run: python3 -s -E "$GITHUB_ACTION_PATH/signing.py"

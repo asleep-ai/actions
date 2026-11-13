@@ -56,11 +56,11 @@ The `release-version/v1` tag does not exist until the first release; pin a full 
 | `operation` | all | `next` | `next` or `code`. |
 | `pr` | `next` | `''` | Number of a merged pull request; its merge commit is released. Exactly one of `pr` and `sha` is given. |
 | `sha` | `next` | `''` | The exception to `pr`: id of the commit to release, 7 or more hex digits. |
-| `bump` | `next` | `patch` | Which part of the last version to raise: `patch`, `minor` or `major`. The parts below it become 0. |
+| `bump` | `next` | `patch` | Which part of the last version to raise: `patch`, `minor` or `major`. The parts below it become 0. Not read when `version` is given. |
 | `source-branch` | `next` | `''` | Optional. The branch releases are normally cut from. When given, the commit has to be on the branch of its release line. See [Release lines](#release-lines). |
 | `tag-prefix` | all | `v` | What a release tag starts with, before `X.Y.Z`. Letters, digits and `. _ / -`, not starting with `-`; may be empty. |
 | `token` | `next` with `pr` | `github.token` | Token that can read the pull request (`pull-requests: read`). |
-| `version` | `code` | `''` | The version, as `X.Y.Z` or as its tag. |
+| `version` | `code`, `next` | `''` | For `code`: the version, as `X.Y.Z` or as its tag. For `next`, optional: the exact version to release instead of a bump. See [An exact version](#an-exact-version). |
 | `kind` | `code` | `release` | `release`, or `qa` for a QA build made after the release named by `version`. |
 | `qa-sequence` | `code` with `qa` | `''` | Number of the QA build, 1 or higher. A later build has a higher number. |
 
@@ -92,6 +92,13 @@ Inputs reach the script as environment variables, never through shell interpolat
 - `sha` has to be a commit id. A branch or tag name is refused, because it would name another commit on the next run.
 - The commit has to be in the checkout.
 
+### An exact version
+
+`version` names the next version outright, as `X.Y.Z` or as its tag, and `bump` is then not read; the log says so. It is for what a bump cannot reach: the first release of a repository that does not start at `0.x` (`version: 2.0.0` while no release tag exists), or a version that skips some.
+
+- The version has to be higher than the last release the commit contains, and its tag must not exist.
+- Every other rule applies as to a computed version: the release line, the branch, the commit that has to add something, and the versionCode limits. On `release/1.x` only a 1.x version passes.
+
 ### Release lines
 
 A major version is a release line. The next version continues its line, wherever in the repository that line was last released:
@@ -108,7 +115,9 @@ With `source-branch`, the commit also has to be on the branch of its line. Branc
 
 - When a branch `release/<major>.x` exists for the major of the next version, the commit has to be on it. On the source branch, `patch` or `minor` of that major is refused: the source branch has to raise the major.
 - Otherwise the commit has to be on the source branch. A commit that is only on `release/1.x` cannot become `v2.0.0`: a maintenance branch releases its own major only.
+- "On the branch" means in its first-parent history: a commit the branch itself pointed at, which is what a squash merge, a rebase merge and the merge commit of a pull request are. The head commit of a pull request that was merged with a merge commit is in the branch's history and still refused: the check on it is the pull request's, which built the merge with the base branch, not that commit.
 - A commit of an open pull request or of a branch that was never merged is on neither, and is refused.
+- The branch must not have released a higher version after the commit. The rule on the line's last release covers this within a major; this one covers `major`, whose line has no release yet: `v2.0.0` is not cut from a commit that precedes `v1.14.0` on the same branch.
 
 The `branch` output names the line's branch. Without `source-branch`, only the tag rules above apply.
 
@@ -118,7 +127,8 @@ The step fails, with an `::error::` annotation that names the rule, when:
 
 - the commit is the commit of the last release: there is nothing new;
 - the last release of the next version's major is not the one the commit contains, or the commit contains no release tag while the repository has some;
-- with `source-branch`: the commit is not on the branch of its release line;
+- `version` is not of the form `X.Y.Z`, is tagged already, or is not higher than the last release the commit contains;
+- with `source-branch`: the commit is not in the first-parent history of the branch of its release line, or that branch has released a higher version after the commit;
 - the checkout is shallow, so tags or history may be missing;
 - the next version has no versionCode under the formula below.
 

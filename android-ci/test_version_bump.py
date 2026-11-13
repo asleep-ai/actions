@@ -7,6 +7,7 @@ throwaway git repositories with a bare repository as the remote.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -44,6 +45,8 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
         "LINE_BRANCH": "develop",
         "PRS": prs,
         "PR": "858",
+        "BUMP": "patch",
+        "VERSION_GIVEN": "",
         "DRY_RUN": "false",
         "GITHUB_SERVER_URL": "https://github.invalid",
         "GITHUB_REPOSITORY": "acme/app",
@@ -61,15 +64,18 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
     # The titles are written as they are.
     assert prs + "\n" in text
     assert "Dry run" not in text
+    assert "is ignored" not in text
 
+    # A first release whose version was given, as a dry run.
     summary.write_text("")
-    env.update({"PREVIOUS_TAG": "", "TAG": "v0.1.0", "PRS": "", "PR": "", "DRY_RUN": "true"})
+    env.update({"PREVIOUS_TAG": "", "TAG": "v2.0.0", "PRS": "", "PR": "", "VERSION_GIVEN": "2.0.0", "DRY_RUN": "true"})
     result = run_script(script, env, tmp_path)
     assert result.returncode == 0, result.stderr
     text = summary.read_text()
-    assert text.startswith("### no release yet → v0.1.0\n")
+    assert text.startswith("### no release yet → v2.0.0\n")
     assert "**Dry run.** Nothing is tagged, pushed or started." in text
     assert "merge commit of" not in text
+    assert "- The version was given (`version`); `bump` (patch) is ignored.\n" in text
     assert "Nothing listed." in text
 
 
@@ -84,8 +90,8 @@ def check_run(name="pr-check / result", conclusion="success", status="completed"
     return {**run, **more}
 
 
-@pytest.fixture
-def api():
+@contextlib.contextmanager
+def check_runs_api():
     """A local GitHub API that answers the check-runs request with the runs set on it."""
 
     class Handler(BaseHTTPRequestHandler):
@@ -113,9 +119,17 @@ def api():
     server.runs, server.requests, server.status, server.body = [], [], 200, None
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    yield server
-    server.shutdown()
-    thread.join()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        thread.join()
+
+
+@pytest.fixture
+def api():
+    with check_runs_api() as server:
+        yield server
 
 
 def check_checks(jobs, tmp_path, api, required="pr-check / result"):
@@ -306,15 +320,31 @@ def test_main_with_a_commit_the_release_lacks_refuses(jobs, clone):
 
 
 def test_a_missing_main_branch_is_created(jobs, clone):
-    result, summary = check_branch(jobs, clone, git(clone, "rev-parse", "HEAD"), branch="release")
+    result, summary = check_branch(jobs, clone, git(clone, "rev-parse", "HEAD"), branch="stable")
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "`release` does not exist and is created at the commit." in summary
+    assert "`stable` does not exist and is created at the commit." in summary
 
 
 def test_an_empty_main_branch_moves_nothing(jobs, clone):
+    # The default: the tag is the release, and no branch follows it.
+    assert trigger(load(ENTRY))["inputs"]["main-branch"]["default"] == ""
+    commit(clone, {"a.kt": "1"}, "one (#1)")
     result, summary = check_branch(jobs, clone, git(clone, "rev-parse", "HEAD"), branch="")
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "No branch is moved" in summary
+    assert "No branch is moved: the tag is the release." in summary
+    assert check_branch.moved == "main-branch=\n"
+
+
+def test_the_source_branch_is_never_the_branch_that_is_moved(jobs, clone):
+    # A repository that releases from main and names main as main-branch: the commit is on the branch
+    # already, and a commit behind its tip is no reason to refuse.
+    target = commit(clone, {"a.kt": "1"}, "one (#1)")
+    commit(clone, {"b.kt": "2"}, "two (#2)")
+    git(clone, "push", "-q", "origin", "develop")
+    result, summary = check_branch(jobs, clone, target, branch="develop")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "No branch is moved: `develop` is the branch the release is cut from." in summary
+    assert check_branch.moved == "main-branch=\n"
 
 
 @pytest.mark.parametrize("branch", ["main..develop", "ma in", "-x", "main~1"])
@@ -449,6 +479,7 @@ def test_the_version_is_planned_again_before_the_push(jobs):
     assert again["with"] == {
         "sha": "${{ needs.plan.outputs.target-sha }}",
         "bump": "${{ inputs.bump }}",
+        "version": "${{ inputs.version }}",
         "source-branch": source,
     }
     env = tag["steps"][ids.index("push")]["env"]
@@ -465,6 +496,8 @@ def test_the_version_is_planned_again_before_the_push(jobs):
         "pr": "${{ inputs.pr }}",
         "sha": "${{ inputs.sha }}",
         "bump": "${{ inputs.bump }}",
+        # An exact version, when the caller gave one; the action then does not read the bump.
+        "version": "${{ inputs.version }}",
         "source-branch": source,
     }
     main = step(jobs["plan"], "Check that the main branch can move")
@@ -557,10 +590,15 @@ def test_only_the_tag_job_writes_and_only_after_the_plan(jobs):
 def test_inputs_secrets_and_outputs(jobs):
     call = trigger(load(ENTRY))
     assert list(call["inputs"]) == [
-        "pr", "sha", "bump", "dry_run", "source-branch", "required-checks", "main-branch", "release-workflow",
-        "environment",
+        "pr", "sha", "bump", "version", "dry_run", "source-branch", "required-checks", "main-branch",
+        "release-workflow", "environment",
     ]
     assert call["inputs"]["dry_run"] == {**call["inputs"]["dry_run"], "type": "boolean", "default": False}
+    assert call["inputs"]["version"]["default"] == ""
+    # The approval has an environment of its own: the one that holds the signing key is the build
+    # job's, and reviewers on that one would also be asked for every other job that signs.
+    assert call["inputs"]["environment"]["default"] == "release-approval"
+    assert trigger(load("android-release.yml"))["inputs"]["environment"]["default"] == "release"
     assert call["secrets"]["RELEASE_PUSH_TOKEN"]["required"] is False
     assert set(call["secrets"]) == {"RELEASE_PUSH_TOKEN"}
     assert {name: output["value"] for name, output in call["outputs"].items()} == {
@@ -590,16 +628,24 @@ def test_the_example_passes_only_what_the_workflow_declares():
     assert job["uses"] == f"asleep-ai/actions/.github/workflows/{ENTRY}@android-ci/v1"
     assert set(job["with"]) <= set(call["inputs"])
     dispatch = example[True]["workflow_dispatch"]["inputs"]
-    assert list(dispatch) == ["pr", "sha", "bump", "dry_run"]
+    assert list(dispatch) == ["pr", "sha", "bump", "version", "dry_run"]
     assert dispatch["bump"]["options"] == ["patch", "minor", "major"]
     for name in dispatch:
         assert job["with"][name] == f"${{{{ inputs.{name} }}}}"
+    # Nothing else is passed: no branch is moved and the approval is asked in release-approval, by default.
+    assert set(job["with"]) == set(dispatch)
     # The called workflow cannot be given more than the caller has.
     assert example["permissions"] == {
         "contents": "write", "actions": "write", "checks": "read", "pull-requests": "read",
     }
     assert "secrets" not in job
     assert example["concurrency"]["cancel-in-progress"] is False
+    # A dry run writes nothing, so it does not wait behind a release that waits for its approval.
+    assert example["concurrency"]["group"] == (
+        "${{ inputs.dry_run && format('version-bump-dry-{0}', github.run_id) || 'version-bump' }}"
+    )
+    usage = README.read_text().split("## android-version-bump.yml", 1)[1].split("```yaml", 1)[1].split("```", 1)[0]
+    assert yaml.safe_load(usage)["concurrency"] == example["concurrency"]
 
 
 def test_readme_lists_every_input_with_its_default():

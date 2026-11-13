@@ -25,16 +25,18 @@ inputs:
     required: false
     default: ''
   bump:
-    description: 'For next. Which part of the last version to raise: patch, minor or major.'
+    description: >-
+      For next. Which part of the last version to raise: patch, minor or
+      major. Not read when version is given.
     required: false
     default: patch
   source-branch:
     description: >-
       For next, optional. The branch releases are normally cut from. When
-      given, the commit has to be on the branch of its release line:
-      release/<major>.x when that branch exists for the major of the next
-      version, otherwise this branch. Branches are read from the remote
-      origin. When empty, no branch is checked.
+      given, the commit has to be in the first-parent history of the branch of
+      its release line: release/<major>.x when that branch exists for the
+      major of the next version, otherwise this branch. Branches are read from
+      the remote origin. When empty, no branch is checked.
     required: false
     default: ''
   tag-prefix:
@@ -50,7 +52,11 @@ inputs:
     required: false
     default: ${{ github.token }}
   version:
-    description: 'For code. The version, as X.Y.Z or as its tag.'
+    description: >-
+      For code: the version, as X.Y.Z or as its tag. For next, optional: the
+      exact version to release instead of raising the last one by bump. It has
+      to be higher than the last release the commit contains and must not be
+      tagged yet.
     required: false
     default: ''
   kind:

@@ -13,14 +13,18 @@ next  Resolve the commit to release, find the last release it builds on,
         contains, compared as numbers. Tags with a suffix (v1.2.3-rc.1), a
         leading zero or another prefix are not release tags. A repository
         without any release tag counts from 0.0.0.
+      - The next version is the last release raised by bump, or the exact
+        version given (version), which then has to be higher than the last
+        release and not tagged yet.
       - A major version is a release line. The next version continues its
         line: the last release of that major anywhere in the repository has to
         be the one the commit contains, and the commit has to add something to
         it. A maintenance branch (v1.4.2 on release/1.x) and the main line
         (v2.1.0) are planned independently this way.
       - With source-branch, the commit also has to be on the branch of its
-        line: release/<major>.x when that branch exists, otherwise the source
-        branch.
+        line, in its first-parent history: release/<major>.x when that branch
+        exists, otherwise the source branch. And that branch must not have
+        released anything after the commit.
       The pull requests between the two are listed from the first-parent
       history, read from the commit subjects.
 
@@ -125,8 +129,17 @@ def release_versions(prefix: str, merged_into: Optional[str] = None) -> list:
     return versions
 
 
-def is_ancestor(commit: str, of: str) -> bool:
-    return git("merge-base", "--is-ancestor", commit, of, check=False).returncode == 0
+def is_on(commit: str, tip: str) -> bool:
+    """Whether the commit is in the first-parent history of a branch tip.
+
+    The first-parent history is what the branch itself pointed at over time:
+    squash and rebase merges, and the merge commits of pull requests. A commit
+    that only came in through a merge commit's second parent, the head of a
+    pull request merged that way, is not in it. Its green check is the check of
+    the pull request, which built the merge with the base branch, not this
+    commit.
+    """
+    return commit in git("rev-list", "--first-parent", tip).stdout.split()
 
 
 def line_branch(version: tuple, target: str, source_branch: str, what: str, tag: str) -> str:
@@ -135,7 +148,8 @@ def line_branch(version: tuple, target: str, source_branch: str, what: str, tag:
     A major version with a branch release/<major>.x is released from that
     branch only. Every other major is released from the source branch. So a
     commit of an open pull request, of an unmerged branch or of another line's
-    branch is refused, however green its own checks are.
+    branch is refused, however green its own checks are, and so is the head
+    commit of a pull request that was merged with a merge commit.
     """
     if not BRANCH.fullmatch(source_branch):
         raise Failure(f"source-branch is not a branch name: {source_branch!r}")
@@ -145,22 +159,27 @@ def line_branch(version: tuple, target: str, source_branch: str, what: str, tag:
     major = version[0]
     maintenance = f"release/{major}.x"
     maintenance_tip = commit_of(f"refs/remotes/origin/{maintenance}")
+    branch, tip = (maintenance, maintenance_tip) if maintenance_tip is not None else (source_branch, source)
+    if is_on(target, tip):
+        return branch
+    if git("merge-base", "--is-ancestor", target, tip, check=False).returncode == 0:
+        raise Failure(
+            f"{what} ({target[:7]}) reached {branch} only through a merge commit: it is a commit of a merged "
+            f"pull request, not a commit {branch} itself pointed at, and no check built it as it is. Release "
+            "the merge commit instead"
+        )
     if maintenance_tip is not None:
-        if not is_ancestor(target, maintenance_tip):
-            raise Failure(
-                f"{tag} is a release of major {major}, which is released from {maintenance}, and {what} "
-                f"({target[:7]}) is not on that branch. On {source_branch}, raise the major version"
-            )
-        return maintenance
-    if is_ancestor(target, source):
-        return source_branch
+        raise Failure(
+            f"{tag} is a release of major {major}, which is released from {maintenance}, and {what} "
+            f"({target[:7]}) is not on that branch. On {source_branch}, raise the major version"
+        )
     # Say which line the commit belongs to, when it is on a maintenance branch of another major.
     refs = git("for-each-ref", "--format=%(refname:short)", "--contains", target, "refs/remotes/origin/release/")
     others = [name[len("origin/"):] for name in refs.stdout.split() if re.fullmatch(r"origin/release/[0-9]+\.x", name)]
     if others:
         raise Failure(
-            f"{what} ({target[:7]}) is on {', '.join(others)}, and the bump gives {tag}, a release of major "
-            f"{major}. A maintenance branch releases its own major version only"
+            f"{what} ({target[:7]}) is on {', '.join(others)}, and {tag} is a release of major {major}. "
+            "A maintenance branch releases its own major version only"
         )
     raise Failure(
         f"{what} ({target[:7]}) is not on {source_branch}. A release is cut from a commit that was merged "
@@ -296,9 +315,12 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
     sha = env.get("SHA", "").strip()
     bump = env.get("BUMP", "").strip()
     prefix = env.get("TAG_PREFIX", "")
+    # An exact version instead of a bump: the first release of a repository that does not start at
+    # 0.x, or a version that skips some. The bump is then not read.
+    exact = env.get("VERSION", "").strip()
     if bool(pr) == bool(sha):
         raise Failure("give exactly one of pr and sha")
-    if bump not in BUMPS:
+    if not exact and bump not in BUMPS:
         raise Failure(f"bump must be one of {', '.join(BUMPS)}, got {bump!r}")
     if not TAG_PREFIX.fullmatch(prefix):
         raise Failure(f"tag-prefix may hold only letters, digits and . _ / -, and not start with -, got {prefix!r}")
@@ -321,9 +343,21 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
             "branch that is released first"
         )
     previous = max(contained) if contained else None
-    version = bump_version(previous or ZERO, bump)
-    tag = prefix + format_version(version)
     previous_tag = prefix + format_version(previous) if previous else ""
+    if exact:
+        # The version may be given as its tag.
+        version = parse_version(exact[len(prefix):] if prefix and exact.startswith(prefix) else exact)
+        tag = prefix + format_version(version)
+        if version in everything:
+            raise Failure(f"version {format_version(version)} was given, and tag {tag} exists already")
+        if previous and version <= previous:
+            raise Failure(
+                f"version {format_version(version)} was given, and {what} ({target[:7]}) builds on {previous_tag}. "
+                "A release has to be higher than the last release its commit contains"
+            )
+    else:
+        version = bump_version(previous or ZERO, bump)
+        tag = prefix + format_version(version)
     try:
         code = release_code(*version)
     except VersionCodeError as exc:
@@ -335,8 +369,9 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
     line = [candidate for candidate in everything if candidate[0] == version[0]]
     if line and max(line) != previous:
         line_last = prefix + format_version(max(line))
+        how = "the version given is" if exact else f"{bump} gives"
         raise Failure(
-            f"{what} ({target[:7]}) builds on {previous_tag or 'no release'}, and {bump} gives {tag}, but the "
+            f"{what} ({target[:7]}) builds on {previous_tag or 'no release'}, and {how} {tag}, but the "
             f"last release of major {version[0]} is {line_last}, which the commit does not contain. Release "
             f"from the branch that carries {line_last}, merge it into this branch first, or raise the major version"
         )
@@ -350,6 +385,17 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
             raise Failure(f"{what} ({target[:7]}) is the commit of {previous_tag}: there is nothing new to release")
 
     branch = line_branch(version, target, source_branch, what, tag) if source_branch else ""
+    if branch:
+        # The commit is on the branch, so the branch contains every release the commit contains. When
+        # it contains a higher one, a release was cut from this branch after the commit. The line
+        # check above does not see that when the bump opens a new major, which has no release yet.
+        released = release_versions(prefix, merged_into=f"refs/remotes/origin/{branch}")
+        if released and max(released) != previous:
+            newer = prefix + format_version(max(released))
+            raise Failure(
+                f"{branch} has released {newer} after {what} ({target[:7]}), which builds on "
+                f"{previous_tag or 'no release'}. Release a commit that contains {newer}"
+            )
     return Plan(
         version=format_version(version),
         tag=tag,
@@ -377,6 +423,8 @@ def write_outputs(env: Mapping[str, str], outputs: Mapping[str, str]) -> None:
 
 def run_next(env: Mapping[str, str], fetch: Fetch) -> None:
     plan = plan_next(env, fetch)
+    if env.get("VERSION", "").strip():
+        print(f"version {plan.version} was given: bump ({env.get('BUMP', '').strip() or 'none'}) is ignored.")
     print(f"Last release the commit contains: {plan.previous_tag or 'none'}")
     print(f"Next release: {plan.tag} (versionCode {plan.version_code}) at {plan.target_sha}")
     if plan.branch:

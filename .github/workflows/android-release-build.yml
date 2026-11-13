@@ -88,8 +88,9 @@ on:
       verdict:
         description: >-
           pass, code or infra; empty when the job never reported (its runner
-          went away). code also stands for a missing secret or variable: no
-          other runner has it either.
+          went away). code also stands for a missing secret or variable and
+          for APKs that cannot be released: another runner would end the same
+          way.
         value: ${{ jobs.build.outputs.verdict }}
 
 permissions:
@@ -110,8 +111,12 @@ jobs:
     environment: ${{ inputs.environment }}
     # No output of this job may hold text that could equal a secret: the runner
     # drops an output that contains the value of one, a key alias for instance.
+    #
+    # code without asking gradle-log-verdict in two cases, because another
+    # runner would end the same way: a missing secret, and APKs the build left
+    # that cannot be released as they are.
     outputs:
-      verdict: ${{ steps.values.outcome == 'failure' && 'code' || steps.verdict.outputs.verdict }}
+      verdict: ${{ (steps.values.outcome == 'failure' || steps.apk.outputs.refused == 'true') && 'code' || steps.verdict.outputs.verdict }}
     steps:
       # A self-hosted runner keeps its work folder between jobs, and the jobs
       # before this one may have built a pull request: files in the folder, git
@@ -384,6 +389,11 @@ jobs:
       # every APK there was built by this job. Each has to carry the version
       # it was built for: a build that ignores -PciVersionName or
       # -PciVersionCode would otherwise be released under the wrong version.
+      #
+      # What the build left is the same on every runner, so a refusal of the
+      # APKs themselves sets the output `refused`, and the job reports code: a
+      # second cold build on the GitHub-hosted runner would end the same way.
+      # A runner without the SDK tool is a failure of the runner, and is not.
       - name: Check the APKs
         id: apk
         env:
@@ -393,23 +403,25 @@ jobs:
           BUILD_TOOLS_VERSION: ${{ inputs.build-tools-version }}
         run: |
           set -euo pipefail
-          if [[ -z "$APK_DIRECTORY" || "$APK_DIRECTORY" == -* || ! -d "$APK_DIRECTORY" ]]; then
-            echo "::error::apk-directory ($APK_DIRECTORY) is not a directory after the build."
+          refuse() {
+            echo "::error::$1"
+            echo "refused=true" >> "$GITHUB_OUTPUT"
             exit 1
+          }
+          if [[ -z "$APK_DIRECTORY" || "$APK_DIRECTORY" == -* || ! -d "$APK_DIRECTORY" ]]; then
+            refuse "apk-directory ($APK_DIRECTORY) is not a directory after the build."
           fi
           apks=()
           while IFS= read -r found; do
             apks+=("$found")
           done < <(find "$APK_DIRECTORY" -type f -name '*.apk' | sort)
           if [[ "${#apks[@]}" == 0 ]]; then
-            echo "::error::ciRelease left no APK under $APK_DIRECTORY."
-            exit 1
+            refuse "ciRelease left no APK under $APK_DIRECTORY."
           fi
           # The APKs become assets of one release, which names them by file name.
           duplicates=$(for apk in "${apks[@]}"; do basename "$apk"; done | sort | uniq -d)
           if [[ -n "$duplicates" ]]; then
-            echo "::error::Several APKs under $APK_DIRECTORY share a file name: ${duplicates//$'\n'/, }. Give each flavor's APK its own name."
-            exit 1
+            refuse "Several APKs under $APK_DIRECTORY share a file name: ${duplicates//$'\n'/, }. Give each flavor's APK its own name."
           fi
 
           sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
@@ -447,6 +459,7 @@ jobs:
             fi
           done
           if [[ "$wrong" != 0 ]]; then
+            echo "refused=true" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           # One path per line. No path can be the closing line: each ends in .apk.
@@ -507,7 +520,8 @@ jobs:
       # The secrets check is left out of setup-outcome: a missing secret is
       # reported as code by the job output, because no other runner has it.
       # job-status covers the steps after the build (the APK check, the
-      # signature, the upload): when one of them fails, the verdict is infra.
+      # signature, the upload): when one of them fails, the verdict is infra,
+      # which the job output turns into code when the APKs were refused.
       - name: Report the verdict
         id: verdict
         if: ${{ always() && steps.values.outcome != 'failure' }}

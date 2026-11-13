@@ -203,28 +203,32 @@ jobs:
       # GIT_TOKEN is used only when submodules are checked out: it reaches
       # private ones, and the job token reads the repository itself. Two
       # commits deep, so the plan step can compare a pull request's merge
-      # commit with its first parent. The token stays in the clone only on a
-      # push, where the plan step may have to fetch the previous commit; a
-      # pull request's code never finds a token in the clone.
+      # commit with its first parent. No token stays in the clone.
       - uses: actions/checkout@v7
         id: checkout
         with:
           token: ${{ inputs.checkout-submodules != 'false' && secrets.GIT_TOKEN || github.token }}
           submodules: ${{ inputs.checkout-submodules }}
           fetch-depth: 2
-          persist-credentials: ${{ github.event_name == 'push' }}
+          persist-credentials: false
 
-      # Lists the files the pull request or push changed with git alone, and
-      # skips the build when all of them match paths-ignore. A skipped build
-      # still ends in a successful job, so a required check built on this
-      # workflow reports on a documentation-only change too. Whenever the
-      # change cannot be listed, the answer is to build.
+      # Lists the files a pull request changed with git alone, and skips the
+      # build when all of them match paths-ignore. A skipped build still ends
+      # in a successful job, so a required check built on this workflow
+      # reports on a documentation-only pull request too. Whenever the change
+      # cannot be listed, the answer is to build.
+      #
+      # A push always builds, whatever it changed. The check of a pushed
+      # commit is what android-version-bump.yml and android-release.yml read
+      # before they release that commit, so it has to mean that this commit
+      # was built and tested. A build skipped for a documentation-only push
+      # would pass a commit whose predecessor failed, was cancelled or never
+      # ran.
       - name: Decide whether to build
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          BEFORE: ${{ github.event.before }}
           PATHS_IGNORE: ${{ inputs.paths-ignore }}
           SKIP_PUSH_BRANCHES: ''
         run: |
@@ -236,7 +240,6 @@ jobs:
 
           event = os.environ["EVENT_NAME"]
           ref = os.environ["REF"]
-          before = os.environ.get("BEFORE", "").strip()
           ignored = [line.strip() for line in os.environ.get("PATHS_IGNORE", "").splitlines() if line.strip()]
           skipped_branches = os.environ.get("SKIP_PUSH_BRANCHES", "").replace(",", " ").split()
 
@@ -260,26 +263,13 @@ jobs:
               return re.compile(regex)
 
 
-          def base_commit():
-              """The commit to compare HEAD with, or None and why there is none."""
-              if event == "pull_request":
-                  # The checkout is the merge commit; its first parent is the base branch.
-                  return "HEAD^1", ""
-              if event != "push":
-                  return None, f"a {event} run always builds"
-              if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", before) or set(before) == {"0"}:
-                  return None, "the push has no previous commit, as on a new branch"
-              if git("cat-file", "-e", before + "^{commit}").returncode != 0:
-                  if git("fetch", "--no-tags", "--depth=1", "origin", before).returncode != 0:
-                      return None, "the push's previous commit cannot be fetched, as after a force push"
-              return before, ""
-
-
           def decide():
-              base, reason = base_commit()
-              if base is None:
-                  return True, reason
-              diff = git("diff", "--name-only", "--no-renames", "-z", base, "HEAD", "--")
+              if event == "push":
+                  return True, "a push always builds: the check of a pushed commit is what a release of it relies on"
+              if event != "pull_request":
+                  return True, f"a {event} run always builds"
+              # The checkout is the merge commit; its first parent is the base branch.
+              diff = git("diff", "--name-only", "--no-renames", "-z", "HEAD^1", "HEAD", "--")
               if diff.returncode != 0:
                   return True, "git cannot list the changed files: " + diff.stderr.decode(errors="replace").strip()
               files = [os.fsdecode(path) for path in diff.stdout.split(b"\0") if path]
@@ -481,14 +471,13 @@ jobs:
           token: ${{ inputs.checkout-submodules != 'false' && secrets.GIT_TOKEN || github.token }}
           submodules: ${{ inputs.checkout-submodules }}
           fetch-depth: 2
-          persist-credentials: ${{ github.event_name == 'push' }}
+          persist-credentials: false
 
       - name: Decide whether to build
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          BEFORE: ${{ github.event.before }}
           PATHS_IGNORE: ${{ inputs.paths-ignore }}
           SKIP_PUSH_BRANCHES: ${{ inputs.release-build-skip-push-branches }}
         run: |
@@ -500,7 +489,6 @@ jobs:
 
           event = os.environ["EVENT_NAME"]
           ref = os.environ["REF"]
-          before = os.environ.get("BEFORE", "").strip()
           ignored = [line.strip() for line in os.environ.get("PATHS_IGNORE", "").splitlines() if line.strip()]
           skipped_branches = os.environ.get("SKIP_PUSH_BRANCHES", "").replace(",", " ").split()
 
@@ -524,26 +512,13 @@ jobs:
               return re.compile(regex)
 
 
-          def base_commit():
-              """The commit to compare HEAD with, or None and why there is none."""
-              if event == "pull_request":
-                  # The checkout is the merge commit; its first parent is the base branch.
-                  return "HEAD^1", ""
-              if event != "push":
-                  return None, f"a {event} run always builds"
-              if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", before) or set(before) == {"0"}:
-                  return None, "the push has no previous commit, as on a new branch"
-              if git("cat-file", "-e", before + "^{commit}").returncode != 0:
-                  if git("fetch", "--no-tags", "--depth=1", "origin", before).returncode != 0:
-                      return None, "the push's previous commit cannot be fetched, as after a force push"
-              return before, ""
-
-
           def decide():
-              base, reason = base_commit()
-              if base is None:
-                  return True, reason
-              diff = git("diff", "--name-only", "--no-renames", "-z", base, "HEAD", "--")
+              if event == "push":
+                  return True, "a push always builds: the check of a pushed commit is what a release of it relies on"
+              if event != "pull_request":
+                  return True, f"a {event} run always builds"
+              # The checkout is the merge commit; its first parent is the base branch.
+              diff = git("diff", "--name-only", "--no-renames", "-z", "HEAD^1", "HEAD", "--")
               if diff.returncode != 0:
                   return True, "git cannot list the changed files: " + diff.stderr.decode(errors="replace").strip()
               files = [os.fsdecode(path) for path in diff.stdout.split(b"\0") if path]
