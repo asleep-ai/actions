@@ -15,7 +15,9 @@ inputs:
     required: false
     default: ''
   apk-file:
-    description: For verify. Path of the signed APK.
+    description: >-
+      For verify. Path of the signed APK, or several paths, one per line.
+      Every APK is verified.
     required: false
     default: ''
   expected-cert-sha256:

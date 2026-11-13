@@ -448,6 +448,54 @@ def test_verify_passes_apksigner_an_absolute_path(runner: Runner, monkeypatch: p
     assert runner.calls() == [["verify", "--verbose", os.path.join(os.getcwd(), "-release.apk")]]
 
 
+def test_verify_checks_every_apk_it_is_given(runner: Runner, capsys: pytest.CaptureFixture[str]) -> None:
+    install_apksigner(runner.sdk, "36.0.0")
+    second = runner.apk.with_name("app-other-release.apk")
+    second.write_bytes(b"not a real apk")
+
+    # One path per line; blank lines and surrounding spaces are not paths.
+    assert runner.run("verify", APK_FILE=f"{runner.apk}\n\n  {second}  \n") == 0
+
+    assert runner.calls() == [["verify", "--verbose", str(runner.apk)], ["verify", "--verbose", str(second)]]
+    printed = capsys.readouterr().out
+    assert printed.count("::notice") == 1
+    assert "The signatures of 2 APKs are valid. The signer certificate was not compared" in printed
+
+
+def test_verify_compares_the_certificate_of_every_apk(runner: Runner, capsys: pytest.CaptureFixture[str]) -> None:
+    install_apksigner(runner.sdk, "36.0.0")
+    second = runner.apk.with_name("app-other-release.apk")
+    second.write_bytes(b"not a real apk")
+
+    assert runner.run("verify", APK_FILE=f"{runner.apk}\n{second}", EXPECTED_CERT_SHA256=DIGEST) == 0
+
+    assert [call[-1] for call in runner.calls()] == [str(runner.apk), str(second)]
+    assert all("--print-certs" in call for call in runner.calls())
+    assert capsys.readouterr().out.count("is valid and the signer certificate is expected") == 2
+
+
+def test_verify_stops_at_the_first_apk_that_does_not_verify(runner: Runner, capsys: pytest.CaptureFixture[str]) -> None:
+    install_apksigner(runner.sdk, "36.0.0")
+    second = runner.apk.with_name("app-other-release.apk")
+    second.write_bytes(b"not a real apk")
+
+    assert runner.run("verify", APK_FILE=f"{runner.apk}\n{second}", FAKE_VERIFY_EXIT="1") == 1
+
+    assert f"apksigner verify failed for {runner.apk}" in errors(capsys)
+    assert len(runner.calls()) == 1
+
+
+def test_verify_checks_that_every_apk_exists_before_verifying_any(
+    runner: Runner, capsys: pytest.CaptureFixture[str]
+) -> None:
+    install_apksigner(runner.sdk, "36.0.0")
+
+    assert runner.run("verify", APK_FILE=f"{runner.apk}\nno-such.apk") == 1
+
+    assert "apk-file does not exist: no-such.apk" in errors(capsys)
+    assert runner.calls() == []
+
+
 @pytest.mark.parametrize(("apk", "message"), [("", "apk-file is required"), ("no-such.apk", "apk-file does not exist")])
 def test_verify_needs_an_apk(runner: Runner, capsys: pytest.CaptureFixture[str], apk: str, message: str) -> None:
     install_apksigner(runner.sdk, "36.0.0")

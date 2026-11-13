@@ -70,7 +70,7 @@ The `android-signing/v1` tag does not exist until the first release; pin a full 
 |------|---------|---------|-------------|
 | `operation` | all | required | `decode`, `verify` or `cleanup`. |
 | `keystore-base64` | `decode` | `''` | The keystore, base64-encoded (`base64 -i release.jks`). Line breaks are ignored. |
-| `apk-file` | `verify` | `''` | Path of the signed APK. |
+| `apk-file` | `verify` | `''` | Path of the signed APK. Several paths may be given, one per line, for a build with one APK per flavor. |
 | `expected-cert-sha256` | `verify` | `''` | Optional SHA-256 digest of the expected signer certificate. See [Comparing the certificate](#comparing-the-certificate). |
 | `build-tools-version` | `verify` | `''` | Optional build-tools version whose `apksigner` is used, as the directory is named under `build-tools` (`36.0.0`). When empty, the highest installed version is used. See [Which apksigner runs](#which-apksigner-runs). |
 | `keystore-file` | `cleanup` | `''` | The keystore to delete, normally the `keystore-file` output of the `decode` step. When empty, the path `decode` writes to is used. |
@@ -103,6 +103,8 @@ Relative paths are resolved against the step's working directory, normally the w
 A missing SDK variable, a missing `apksigner`, a `build-tools-version` that is not installed and a missing APK each fail the step with an `::error::` annotation that says which one it is.
 
 The step runs `apksigner verify --verbose <apk-file>` and fails when apksigner reports the APK as not verified.
+
+With several paths in `apk-file`, the step first checks that every file exists, then verifies them in the order given, each against the same `expected-cert-sha256`, and fails at the first APK that does not pass.
 
 ### Which apksigner runs
 
