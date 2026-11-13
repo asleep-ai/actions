@@ -97,7 +97,7 @@ pick-runner ─▶ primary ─────────▶ fallback ────�
 | `local-properties` | `''` | Lines of `NAME=value` appended to `local.properties` in the Gradle jobs. See [local.properties](#localproperties). |
 | `paths-ignore` | see below | Glob patterns, one per line. See [Skipped builds](#skipped-builds). |
 | `code-style-timeout-minutes` | `10` | Timeout of the `code-style` job. |
-| `verify-timeout-minutes` | `45` | Timeout of the `verify` job. See [Timeouts](#timeouts). |
+| `verify-timeout-minutes` | `60` | Timeout of the `verify` job. See [Timeouts](#timeouts). |
 | `release-build-timeout-minutes` | `45` | Timeout of the `release-build` job. See [Timeouts](#timeouts). |
 | `self-hosted-max-workers` | `32` | Gradle `--max-workers` on a self-hosted runner. Empty leaves Gradle's default. |
 | `self-hosted-gradle-jvmargs` | `-Xmx16g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8` | `org.gradle.jvmargs` on a self-hosted runner. Empty keeps the caller's `gradle.properties` value. |
@@ -187,7 +187,7 @@ The same timeout applies on both kinds of runner, and the two differ widely: a s
 - A job that hits its timeout on the GitHub-hosted runner fails `result`. Size the two build timeouts for that run: about twice what a build without any cache takes there.
 - The cost of a generous timeout is that a hung self-hosted job is noticed that much later.
 
-The defaults, 45 minutes each, are the budgets the first two calling repositories had for the same work on GitHub-hosted runners; neither is a measurement of a cold build with this workflow. Measure one (leave `runner-labels` out for a run) before relying on them.
+Measured cold builds on the GitHub-hosted runner (runs with `runner-labels` left out, November 2026): one calling repository took 40 minutes for `verify` and 28 for `release-build`, the other 6 and 19. The defaults are 60 minutes for `verify` and 45 for `release-build`. Measure again with your own repository before relying on them.
 
 ### Skipped builds
 

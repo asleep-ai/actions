@@ -143,7 +143,7 @@ on:
           build without any cache on the GitHub-hosted runner.
         required: false
         type: number
-        default: 45
+        default: 60
       release-build-timeout-minutes:
         description: >-
           Timeout of the release-build job, on either kind of runner. Size it
