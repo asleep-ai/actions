@@ -1,0 +1,375 @@
+name: Android PR check
+
+# Reusable pull request check for Android app repositories: code style, a
+# verification build and a release build, on self-hosted runners when one is
+# online and on a GitHub-hosted runner otherwise. A self-hosted run that fails
+# for an infrastructure reason (setup, memory, disk, network, a missing tool, a
+# runner that went away, a job that hit its timeout) runs again on a
+# GitHub-hosted runner; a failure of the change itself is final.
+#
+# The caller's contract, every input and the name of the check to require are
+# in android-ci/README.md.
+on:
+  workflow_call:
+    inputs:
+      runner-labels:
+        description: >-
+          Self-hosted runs-on labels as a JSON array of strings, for example
+          '["self-hosted","Linux","X64"]'. Empty runs everything on
+          fallback-runs-on.
+        required: false
+        type: string
+        default: ''
+      fallback-runs-on:
+        description: >-
+          GitHub-hosted runs-on, used when no self-hosted runner is online and
+          for the re-run after an infrastructure failure: one label, or a JSON
+          array of labels.
+        required: false
+        type: string
+        default: ubuntu-latest
+      java-version:
+        description: JDK version for the Gradle jobs.
+        required: false
+        type: string
+        default: '17'
+      java-distribution:
+        description: JDK distribution for actions/setup-java.
+        required: false
+        type: string
+        default: temurin
+      mise-version:
+        description: >-
+          Version of mise that installs pre-commit and the hook tools from the
+          caller's mise configuration.
+        required: false
+        type: string
+        default: '2026.9.2'
+      full-scan-paths:
+        description: >-
+          Glob patterns, one per line. A change to a matching path makes the
+          code-style job run pre-commit on every file instead of on the changed
+          files. The default is the list pre-commit-changed uses. Empty never
+          runs on every file, for a repository whose untouched files do not
+          pass its hooks yet.
+        required: false
+        type: string
+        default: |
+          .pre-commit-config.yaml
+          .pre-commit-hooks.yaml
+          **/mise.toml
+          **/.mise.toml
+          **/mise.lock
+          **/.tool-versions
+          **/.editorconfig
+          **/pyproject.toml
+          **/uv.lock
+          **/ruff.toml
+          **/.ruff.toml
+          config/**
+          scripts/**
+          .github/workflows/**
+      verify-task:
+        description: Gradle task of the verify job. It runs with --continue.
+        required: false
+        type: string
+        default: ciVerify
+      verify-args:
+        description: >-
+          Extra Gradle arguments for the verify job, split on whitespace.
+        required: false
+        type: string
+        default: ''
+      release-build-task:
+        description: Gradle task of the release-build job.
+        required: false
+        type: string
+        default: ciReleaseBuild
+      release-build-args:
+        description: >-
+          Extra Gradle arguments for the release-build job, split on
+          whitespace.
+        required: false
+        type: string
+        default: ''
+      release-build-skip-push-branches:
+        description: >-
+          Branch names, separated by whitespace or commas. A push to one of
+          them skips the release build, for a branch whose pushes another
+          workflow already builds the release variant for.
+        required: false
+        type: string
+        default: ''
+      checkout-submodules:
+        description: >-
+          The submodules input of actions/checkout for the Gradle jobs: false,
+          true or recursive.
+        required: false
+        type: string
+        default: 'false'
+      local-properties:
+        description: >-
+          Lines of NAME=value written to local.properties in the Gradle jobs,
+          after the four signing keys. Placeholder values for a pull request
+          build only: the workflow file is readable by everyone with access to
+          the repository, and no secret is read.
+        required: false
+        type: string
+        default: ''
+      paths-ignore:
+        description: >-
+          Glob patterns, one per line. When every changed file of a pull
+          request or push matches one of them, the Gradle jobs skip the build
+          and pass. Empty builds on every change.
+        required: false
+        type: string
+        default: |
+          *.md
+          docs/**
+          .gitignore
+          LICENSE
+          .github/ISSUE_TEMPLATE/**
+          .github/PULL_REQUEST_TEMPLATE.md
+      code-style-timeout-minutes:
+        description: Timeout of the code-style job.
+        required: false
+        type: number
+        default: 10
+      verify-timeout-minutes:
+        description: Timeout of the verify job.
+        required: false
+        type: number
+        default: 45
+      release-build-timeout-minutes:
+        description: Timeout of the release-build job.
+        required: false
+        type: number
+        default: 30
+      self-hosted-max-workers:
+        description: >-
+          Gradle --max-workers on a self-hosted runner. Empty leaves Gradle's
+          default, one worker per core.
+        required: false
+        type: string
+        default: '32'
+      self-hosted-gradle-jvmargs:
+        description: >-
+          org.gradle.jvmargs on a self-hosted runner, replacing the value in
+          the caller's gradle.properties. Empty keeps the caller's value.
+        required: false
+        type: string
+        default: -Xmx16g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8
+      self-hosted-kotlin-daemon-jvmargs:
+        description: >-
+          kotlin.daemon.jvmargs on a self-hosted runner. Empty keeps the
+          caller's value.
+        required: false
+        type: string
+        default: -Xmx6g
+      report-retention-days:
+        description: Days to keep the test and lint reports of a failed build.
+        required: false
+        type: number
+        default: 14
+    secrets:
+      RUNNER_READ_TOKEN:
+        description: >-
+          Token with the organization permission "Self-hosted runners" (read),
+          for pick-runner. Without it the self-hosted labels are used
+          unchecked.
+        required: false
+      GIT_TOKEN:
+        description: >-
+          Optional. Token that can read the caller's private submodules and
+          private GitHub Packages; the job token is used when it is absent.
+        required: false
+
+permissions:
+  contents: read
+  packages: read
+  # dorny/paths-filter lists a pull request's files through the API.
+  pull-requests: read
+
+jobs:
+  # Decided up front, on a GitHub-hosted runner: a job queued for self-hosted
+  # labels while every matching runner is offline waits instead of failing.
+  pick-runner:
+    if: ${{ inputs.runner-labels != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions: {}
+    outputs:
+      runs-on: ${{ steps.pick.outputs.runs-on }}
+      self-hosted: ${{ steps.pick.outputs.self-hosted }}
+    steps:
+      - id: pick
+        uses: asleep-ai/actions/pick-runner@pick-runner/v1
+        with:
+          labels: ${{ inputs.runner-labels }}
+          token: ${{ secrets.RUNNER_READ_TOKEN }}
+          fallback: ${{ inputs.fallback-runs-on }}
+
+  # !cancelled(): when pick-runner itself fails, the jobs still go to the
+  # self-hosted labels instead of being skipped, and a skipped job would count
+  # as passing. Without runner-labels pick-runner is skipped and the jobs run
+  # on fallback-runs-on.
+  primary:
+    needs: pick-runner
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/android-pr-check-jobs.yml
+    with:
+      runs-on: ${{ needs.pick-runner.outputs.runs-on || inputs.runner-labels || (startsWith(inputs.fallback-runs-on, '[') && inputs.fallback-runs-on) || toJSON(inputs.fallback-runs-on || 'ubuntu-latest') }}
+      attempt: primary
+      java-version: ${{ inputs.java-version }}
+      java-distribution: ${{ inputs.java-distribution }}
+      mise-version: ${{ inputs.mise-version }}
+      full-scan-paths: ${{ inputs.full-scan-paths }}
+      verify-task: ${{ inputs.verify-task }}
+      verify-args: ${{ inputs.verify-args }}
+      release-build-task: ${{ inputs.release-build-task }}
+      release-build-args: ${{ inputs.release-build-args }}
+      release-build-skip-push-branches: ${{ inputs.release-build-skip-push-branches }}
+      checkout-submodules: ${{ inputs.checkout-submodules }}
+      local-properties: ${{ inputs.local-properties }}
+      paths-ignore: ${{ inputs.paths-ignore }}
+      code-style-timeout-minutes: ${{ inputs.code-style-timeout-minutes }}
+      verify-timeout-minutes: ${{ inputs.verify-timeout-minutes }}
+      release-build-timeout-minutes: ${{ inputs.release-build-timeout-minutes }}
+      self-hosted-max-workers: ${{ inputs.self-hosted-max-workers }}
+      self-hosted-gradle-jvmargs: ${{ inputs.self-hosted-gradle-jvmargs }}
+      self-hosted-kotlin-daemon-jvmargs: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
+      report-retention-days: ${{ inputs.report-retention-days }}
+    secrets:
+      GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+
+  # Only after a primary run on self-hosted runners, and never after a code
+  # verdict. A job that never reported (its runner went away) has an empty
+  # verdict, which is not code. A primary result of cancelled while the run
+  # itself is not cancelled means a job hit its timeout. A run cancelled by a
+  # person or by a newer push fails !cancelled() and is not run again.
+  fallback:
+    needs: [pick-runner, primary]
+    if: >-
+      ${{
+        !cancelled()
+        && inputs.runner-labels != ''
+        && needs.pick-runner.outputs.self-hosted != 'false'
+        && (needs.primary.result == 'failure' || needs.primary.result == 'cancelled')
+        && needs.primary.outputs.code-style-verdict != 'code'
+        && needs.primary.outputs.verify-verdict != 'code'
+        && needs.primary.outputs.release-build-verdict != 'code'
+      }}
+    uses: ./.github/workflows/android-pr-check-jobs.yml
+    with:
+      runs-on: ${{ (startsWith(inputs.fallback-runs-on, '[') && inputs.fallback-runs-on) || toJSON(inputs.fallback-runs-on || 'ubuntu-latest') }}
+      attempt: fallback
+      java-version: ${{ inputs.java-version }}
+      java-distribution: ${{ inputs.java-distribution }}
+      mise-version: ${{ inputs.mise-version }}
+      full-scan-paths: ${{ inputs.full-scan-paths }}
+      verify-task: ${{ inputs.verify-task }}
+      verify-args: ${{ inputs.verify-args }}
+      release-build-task: ${{ inputs.release-build-task }}
+      release-build-args: ${{ inputs.release-build-args }}
+      release-build-skip-push-branches: ${{ inputs.release-build-skip-push-branches }}
+      checkout-submodules: ${{ inputs.checkout-submodules }}
+      local-properties: ${{ inputs.local-properties }}
+      paths-ignore: ${{ inputs.paths-ignore }}
+      code-style-timeout-minutes: ${{ inputs.code-style-timeout-minutes }}
+      verify-timeout-minutes: ${{ inputs.verify-timeout-minutes }}
+      release-build-timeout-minutes: ${{ inputs.release-build-timeout-minutes }}
+      self-hosted-max-workers: ${{ inputs.self-hosted-max-workers }}
+      self-hosted-gradle-jvmargs: ${{ inputs.self-hosted-gradle-jvmargs }}
+      self-hosted-kotlin-daemon-jvmargs: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
+      report-retention-days: ${{ inputs.report-retention-days }}
+    secrets:
+      GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+
+  # The one check that states the outcome, and the one to require. A primary
+  # job that failed for an infrastructure reason stays red after the fallback
+  # passes, so the individual jobs cannot be required. It runs on GitHub so it
+  # still reports when the self-hosted host is the problem, and with always():
+  # a skipped job counts as passing for a required check, so a cancelled run
+  # has to end here in a failure.
+  result:
+    needs: [pick-runner, primary, fallback]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Combine the runs
+        shell: bash
+        env:
+          RUNNER_LABELS: ${{ inputs.runner-labels }}
+          FALLBACK_RUNS_ON: ${{ inputs.fallback-runs-on || 'ubuntu-latest' }}
+          SELF_HOSTED: ${{ needs.pick-runner.outputs.self-hosted }}
+          PRIMARY: ${{ needs.primary.result }}
+          PRIMARY_CODE_STYLE: ${{ needs.primary.outputs.code-style-verdict }}
+          PRIMARY_VERIFY: ${{ needs.primary.outputs.verify-verdict }}
+          PRIMARY_RELEASE_BUILD: ${{ needs.primary.outputs.release-build-verdict }}
+          FALLBACK: ${{ needs.fallback.result }}
+          FALLBACK_CODE_STYLE: ${{ needs.fallback.outputs.code-style-verdict }}
+          FALLBACK_VERIFY: ${{ needs.fallback.outputs.verify-verdict }}
+          FALLBACK_RELEASE_BUILD: ${{ needs.fallback.outputs.release-build-verdict }}
+        run: |
+          set -euo pipefail
+          primary="result=${PRIMARY:-none}, code-style=${PRIMARY_CODE_STYLE:-none}, verify=${PRIMARY_VERIFY:-none}, release-build=${PRIMARY_RELEASE_BUILD:-none}"
+          fallback="result=${FALLBACK:-none}, code-style=${FALLBACK_CODE_STYLE:-none}, verify=${FALLBACK_VERIFY:-none}, release-build=${FALLBACK_RELEASE_BUILD:-none}"
+          if [[ -z "$RUNNER_LABELS" ]]; then
+            where="$FALLBACK_RUNS_ON"
+          elif [[ "$SELF_HOSTED" == false ]]; then
+            where="$FALLBACK_RUNS_ON (no self-hosted runner was online)"
+          else
+            where="the self-hosted runners"
+          fi
+
+          # A run passed only when its result is success and every job said
+          # pass: the verdict speaks for the build step, the result for the job.
+          passed() {
+            [[ "$1" == success && "$2" == pass && "$3" == pass && "$4" == pass ]]
+          }
+
+          status=0
+          if passed "$PRIMARY" "$PRIMARY_CODE_STYLE" "$PRIMARY_VERIFY" "$PRIMARY_RELEASE_BUILD"; then
+            outcome="Passed on $where."
+            if [[ -n "$RUNNER_LABELS" && "$SELF_HOSTED" == false ]]; then
+              echo "::warning title=Self-hosted runners offline::The check ran on $FALLBACK_RUNS_ON because no self-hosted runner was online. Check the host."
+            fi
+          elif [[ "$PRIMARY" == success ]]; then
+            outcome="The run on $where succeeded without a pass verdict from every job ($primary)."
+            status=1
+          elif passed "$FALLBACK" "$FALLBACK_CODE_STYLE" "$FALLBACK_VERIFY" "$FALLBACK_RELEASE_BUILD"; then
+            outcome="Passed on the re-run on $FALLBACK_RUNS_ON."
+            echo "::warning title=Self-hosted runner problem::The self-hosted run did not pass for a reason outside the change ($primary) and passed on $FALLBACK_RUNS_ON. Check the host."
+          elif [[ "$FALLBACK" == success ]]; then
+            outcome="The re-run on $FALLBACK_RUNS_ON succeeded without a pass verdict from every job ($fallback)."
+            status=1
+          elif [[ "$FALLBACK" == skipped || -z "$FALLBACK" ]]; then
+            if [[ "$PRIMARY" == failure ]]; then
+              outcome="Failed on $where ($primary)."
+            else
+              outcome="Did not finish on $where ($primary): the run was cancelled, or a job hit its timeout next to a code failure."
+            fi
+            status=1
+          else
+            outcome="Did not pass on the self-hosted runners ($primary) or on the re-run on $FALLBACK_RUNS_ON ($fallback)."
+            status=1
+          fi
+
+          {
+            echo "### Android PR check"
+            echo
+            echo "$outcome"
+            echo
+            echo "| run | result | code-style | verify | release-build |"
+            echo "|-----|--------|------------|--------|---------------|"
+            echo "| primary | ${PRIMARY:-none} | ${PRIMARY_CODE_STYLE:-none} | ${PRIMARY_VERIFY:-none} | ${PRIMARY_RELEASE_BUILD:-none} |"
+            echo "| fallback | ${FALLBACK:-none} | ${FALLBACK_CODE_STYLE:-none} | ${FALLBACK_VERIFY:-none} | ${FALLBACK_RELEASE_BUILD:-none} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$status" != 0 ]]; then
+            echo "::error::$outcome"
+            exit 1
+          fi
+          echo "$outcome"
