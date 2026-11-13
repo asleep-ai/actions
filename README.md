@@ -13,6 +13,8 @@ Shared GitHub Actions, local lint hooks, and adoption templates for `asleep-ai` 
 
 [`ktfmt/`](./ktfmt/) provides a shared pre-commit hook using KotlinLang style and the caller's `.editorconfig`. Its optional content-hash baseline supports gradual adoption: untouched legacy files stay exempt, edited files must pass, and routine refreshes cannot add exemptions.
 
+[`detekt/`](./detekt/) provides a shared pre-commit hook that runs `detekt-cli` on the selected Kotlin files with the caller's configuration, baseline and plugin jars.
+
 The CI action runs the same `.pre-commit-config.yaml` used locally. Formatting rules, tool versions, detekt configuration, and Gradle task selection remain caller-owned. See each component's README for setup and migration examples.
 
 [`ruff/`](./ruff/) contains native Ruff adoption examples rather than another installer action, including independent lint and format checks with a combined failure result.

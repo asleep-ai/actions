@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/lint-tools.yml'
       - '.pre-commit-hooks.yaml'
+      - 'detekt/**'
       - 'ktfmt/**'
       - 'pre-commit-changed/**'
       - 'ruff/**'
@@ -13,6 +14,7 @@ on:
     paths:
       - '.github/workflows/lint-tools.yml'
       - '.pre-commit-hooks.yaml'
+      - 'detekt/**'
       - 'ktfmt/**'
       - 'pre-commit-changed/**'
       - 'ruff/**'
@@ -43,10 +45,25 @@ jobs:
       - name: Validate composite action metadata
         run: uvx check-jsonschema --schemafile https://json.schemastore.org/github-action.json pre-commit-changed/action.yml
 
-      - name: Test lint execution and real ktfmt integration
+      # The detekt tests run the hook against a real detekt-cli on PATH. The
+      # checksum pins the release asset; java is on the runner image.
+      - name: Install detekt-cli
+        env:
+          DETEKT_VERSION: '1.23.8'
+          DETEKT_SHA256: ff9f9258879ff2ec4349114740221498afec46a85cf6302c9f80b06eb4429501
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/detekt-cli.zip" \
+            "https://github.com/detekt/detekt/releases/download/v$DETEKT_VERSION/detekt-cli-$DETEKT_VERSION.zip"
+          echo "$DETEKT_SHA256  $RUNNER_TEMP/detekt-cli.zip" | sha256sum --check -
+          unzip -q "$RUNNER_TEMP/detekt-cli.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/detekt-cli-$DETEKT_VERSION/bin" >> "$GITHUB_PATH"
+
+      - name: Test lint execution and real ktfmt and detekt integration
         env:
           KTFMT_INTEGRATION: '1'
-        run: uv run --with pytest --with pre-commit python -m pytest ktfmt pre-commit-changed -q
+          DETEKT_INTEGRATION: '1'
+        run: uv run --with pytest --with pre-commit python -m pytest ktfmt detekt pre-commit-changed -q
 
   examples:
     runs-on: ubuntu-latest
