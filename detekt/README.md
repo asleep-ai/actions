@@ -36,10 +36,21 @@ runs the hook with exactly these lines:
 # mise.toml
 [tools]
 java = "temurin-17.0.20+8"
-"aqua:detekt/detekt" = "1.23.8"
+"github:detekt/detekt" = { version = "1.23.8", asset_pattern = "detekt-cli-1.23.8.zip", checksum = "sha256:ff9f9258879ff2ec4349114740221498afec46a85cf6302c9f80b06eb4429501", bin_path = "bin", strip_components = 1 }
 ```
 
-Exact versions and a committed `mise.lock` (`mise lock`) are recommended, so
+The `github:` backend installs straight from detekt's GitHub release:
+`asset_pattern` picks the command-line runner among the release's assets,
+`checksum` pins that file, and `strip_components` with `bin_path` put the
+archive's `bin/detekt-cli` on `PATH`. The version appears twice and the
+checksum belongs to it, so change all three together.
+
+detekt is not in the aqua registry: `"aqua:detekt/detekt"` fails with
+`no aqua-registry found for detekt/detekt`. After changing the entry, check it
+with `mise exec -- detekt-cli --version`, which is also the first thing the
+integration tests run.
+
+An exact version and a committed `mise.lock` (`mise lock`) are recommended, so
 local runs and CI report the same findings.
 
 Unlike the [`ktfmt`](../ktfmt/) hook, this one does not check that the mise

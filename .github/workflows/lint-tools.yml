@@ -49,11 +49,14 @@ jobs:
       # hooks through the real mise: each throwaway caller repository declares
       # java and the tool in its mise.toml, and `mise exec` installs them. The
       # detekt tests take that mise.toml from detekt/README.md, so this step is
-      # what verifies the example there.
+      # what verifies the example there. mise installs detekt from its GitHub
+      # release and asks the GitHub API for it; the job's read-only token keeps
+      # that request clear of the rate limit shared by unauthenticated runners.
       - name: Test lint execution and real ktfmt and detekt integration
         env:
           KTFMT_INTEGRATION: '1'
           DETEKT_INTEGRATION: '1'
+          MISE_GITHUB_TOKEN: ${{ github.token }}
         run: uv run --with pytest --with pre-commit python -m pytest ktfmt detekt pre-commit-changed -q
 
   examples:

@@ -115,6 +115,25 @@ def readme_mise_toml() -> str:
     return block
 
 
+def require_detekt_cli_from_mise(mise_toml: str, directory: Path, env: dict[str, str]) -> str:
+    """Return `mise_toml` once mise has installed its tools and runs detekt-cli from it.
+
+    A tool key mise cannot install, or one that installs no detekt-cli, would
+    otherwise fail every scenario somewhere inside the hook. Failing here names
+    the cause, mise's own message included, before any scenario runs.
+    """
+    (directory / "mise.toml").write_text(mise_toml)
+    result = subprocess.run(["mise", "exec", "--", "detekt-cli", "--version"], cwd=directory, text=True,
+                            env={**env, "MISE_TRUSTED_CONFIG_PATHS": str(directory)},
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+    if result.returncode != 0:
+        pytest.fail("mise does not provide detekt-cli from the mise.toml in detekt/README.md, so no scenario can run "
+                    f"with the real toolchain.\n--- mise.toml ---\n{mise_toml}"
+                    f"--- mise exec -- detekt-cli --version (exit status {result.returncode}) ---\n{result.stdout}",
+                    pytrace=False)
+    return mise_toml
+
+
 @pytest.fixture(scope="session")
 def pre_commit_home(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return tmp_path_factory.mktemp("pre-commit-home")
@@ -135,15 +154,21 @@ def base_env(pre_commit_home: Path) -> dict[str, str]:
     return env
 
 
+@pytest.fixture(scope="session")
+def real_mise_toml(tmp_path_factory: pytest.TempPathFactory, base_env: dict[str, str]) -> str:
+    """The README's mise.toml, checked once against the real mise before any scenario uses it."""
+    if shutil.which("mise", path=base_env["PATH"]) is None:
+        pytest.fail("DETEKT_INTEGRATION=1 needs mise on PATH; use DETEKT_INTEGRATION=path without it", pytrace=False)
+    return require_detekt_cli_from_mise(readme_mise_toml(), tmp_path_factory.mktemp("mise-check"), base_env)
+
+
 @pytest.fixture(params=["fake", "real"])
 def toolchain(request: pytest.FixtureRequest, tmp_path: Path, base_env: dict[str, str]) -> Toolchain:
     if request.param == "real":
         if INTEGRATION not in ("1", "path"):
             pytest.skip("the real detekt-cli runs only with DETEKT_INTEGRATION=1 or DETEKT_INTEGRATION=path")
         if INTEGRATION == "1":
-            if shutil.which("mise", path=base_env["PATH"]) is None:
-                pytest.fail("DETEKT_INTEGRATION=1 needs mise on PATH; use DETEKT_INTEGRATION=path without it")
-            return Toolchain("real", dict(base_env), mise_toml=readme_mise_toml())
+            return Toolchain("real", dict(base_env), mise_toml=request.getfixturevalue("real_mise_toml"))
         if shutil.which("detekt-cli", path=base_env["PATH"]) is None:
             pytest.fail("DETEKT_INTEGRATION=path needs detekt-cli on PATH")
     fake = tmp_path / "fake"
@@ -203,9 +228,11 @@ class Caller:
         (self.root / baseline).parent.mkdir(parents=True, exist_ok=True)
         if self.toolchain.name == "real":
             mise = ["mise", "exec", "--"] if self.toolchain.mise_toml else []
-            subprocess.run([*mise, "detekt-cli", "--build-upon-default-config", "--config", config,
-                            "--baseline", baseline, "--create-baseline", "--input", ",".join(files)],
-                           cwd=self.root, env=self.env, capture_output=True, check=False)
+            result = subprocess.run([*mise, "detekt-cli", "--build-upon-default-config", "--config", config,
+                                     "--baseline", baseline, "--create-baseline", "--input", ",".join(files)],
+                                    cwd=self.root, env=self.env, text=True, capture_output=True, check=False)
+            # Whatever kept detekt from writing the file is in its output, not in a later FileNotFoundError.
+            assert (self.root / baseline).is_file(), f"no baseline was written:\n{result.stdout}{result.stderr}"
         else:
             ids = "".join(f"    <ID>EmptyCatchBlock:{Path(name).name}$catch (e: Exception) {{ }}</ID>\n" for name in files)
             (self.root / baseline).write_text(
@@ -473,6 +500,34 @@ def test_readme_shows_the_mise_configuration_the_integration_run_uses() -> None:
     block = readme_mise_toml()
     assert block.count("[tools]") == 1
     assert re.search(r'^java = "', block, re.MULTILINE) and "detekt" in block
+    # The version is written twice in the entry, and the two have to agree.
+    [(version, asset)] = re.findall(r'version = "([^"]+)", asset_pattern = "detekt-cli-([^"]+)\.zip"', block)
+    assert version == asset
+
+
+def test_mise_configuration_that_cannot_provide_detekt_cli_is_named_as_the_cause(
+        tmp_path: Path, base_env: dict[str, str]) -> None:
+    # What a tool key mise does not know looked like in CI: eight scenarios
+    # failing inside the hook, each for the same reason. The check that runs
+    # before them fails once, with the configuration and mise's own message.
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    error = "mise ERROR Failed to install aqua:detekt/detekt@1.23.8: no aqua-registry found for detekt/detekt"
+    executable(stub / "mise", f"#!/bin/sh\necho '{error}' >&2\nexit 1\n")
+    env = {**base_env, "PATH": f"{stub}{os.pathsep}{base_env['PATH']}"}
+    toml = '[tools]\n"aqua:detekt/detekt" = "1.23.8"\n'
+
+    with pytest.raises(pytest.fail.Exception) as failure:
+        require_detekt_cli_from_mise(toml, tmp_path, env)
+
+    message = str(failure.value)
+    assert "mise does not provide detekt-cli from the mise.toml in detekt/README.md" in message
+    assert toml in message and error in message and "exit status 1" in message
+
+    # A configuration mise can install passes through unchanged.
+    executable(stub / "mise", '#!/bin/sh\n[ "$*" = "exec -- detekt-cli --version" ] && echo 1.23.8\n')
+    assert require_detekt_cli_from_mise(toml, tmp_path, env) == toml
+    assert (tmp_path / "mise.toml").read_text() == toml
 
 
 def pre_commit_command(env: dict[str, str]) -> list[str]:
