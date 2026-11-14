@@ -126,8 +126,8 @@ inputs:
   version-code:
     description: >-
       For changes, optional. The versionCode of the build that is about to
-      be published as the since tag. code-taken-by then says whether another
-      rolling tag holds a build of that versionCode.
+      be published as the since tag. code-taken-by then says whether a
+      rolling tag holds a build of that versionCode already.
     required: false
     default: ''
 
@@ -218,9 +218,9 @@ outputs:
     value: ${{ steps.version.outputs.unchanged }}
   code-taken-by:
     description: >-
-      For changes with version-code. The rolling tag (qa-*), other than the
-      since tag, whose message names a build of that versionCode; empty when
-      there is none.
+      For changes with version-code. The rolling tag (qa-*) whose message
+      names a build of that versionCode; empty when there is none. The since
+      tag counts unless it names this very commit.
     value: ${{ steps.version.outputs.code-taken-by }}
 
 runs:

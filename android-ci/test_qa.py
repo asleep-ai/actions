@@ -8,10 +8,14 @@ it shares with android-release.yml, and the copy of the checks script.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import sys
+import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
@@ -58,7 +62,7 @@ def test_the_plan_is_the_qa_operation_of_release_version_for_the_ref_of_the_run(
     names = [item.get("name") or item.get("uses") for item in plan["steps"]]
     assert names == [
         "Check the wait for the checks", "Check qa-gradle-home", "actions/checkout@v7", "Plan the QA build",
-        "Write the plan to the summary", "Pick the runner",
+        "Write the plan to the summary", "Cancel the runs of earlier commits", "Pick the runner",
     ]
     # Every tag and the whole history of the commit the run started for, and no token left behind.
     assert plan["steps"][2]["with"] == {"ref": "${{ github.sha }}", "fetch-depth": 0, "persist-credentials": False}
@@ -79,8 +83,8 @@ def test_the_plan_is_the_qa_operation_of_release_version_for_the_ref_of_the_run(
         "qa-sequence-offset": "${{ inputs.sequence-offset }}",
     }
     assert "if" not in qa
-    # Read-only, and no signing secret is near: the build needs the plan.
-    assert plan["permissions"] == {"contents": "read"}
+    # It reads the repository and cancels runs, and no signing secret is near: the build needs the plan.
+    assert plan["permissions"] == {"contents": "read", "actions": "write"}
     assert "environment" not in plan
     assert entry["jobs"]["primary"]["needs"] == "plan"
     pick = step(plan, "Pick the runner")
@@ -213,6 +217,377 @@ def test_the_plan_of_a_label_build_says_what_it_installs_over(entry, tmp_path):
     assert "- versionCode: 101350002\n" in text
 
 
+# --- plan: the runs of earlier commits are cancelled ------------------------------------------------
+
+OWN_RUN = "9300"
+PUSH_QUERY = {"branch": ["develop"], "event": ["push"], "per_page": ["100"]}
+
+
+def qa_run(number: int, sha: str, status: str = "in_progress", event: str = "push", branch: str = "develop") -> dict:
+    """A run of the calling workflow as the list of its runs has it."""
+    return {
+        "id": 9000 + number, "run_number": number, "head_sha": sha, "status": status, "event": event,
+        "head_branch": branch, "html_url": f"https://github.invalid/acme/app/actions/runs/{9000 + number}",
+    }
+
+
+def job_of(name: str, status: str = "in_progress") -> dict:
+    return {"name": name, "status": status, "conclusion": "success" if status == "completed" else None}
+
+
+# The jobs of a run under a calling job `qa`, at three moments: while it builds, while it waits for
+# its checks, and while it publishes.
+BUILDING = [job_of("qa / plan", "completed"), job_of("qa / primary / build")]
+WAITING = [job_of("qa / plan", "completed"), job_of("qa / primary / build", "completed"), job_of("qa / built", "completed"), job_of("qa / checks")]
+PUBLISHING = [*WAITING[:3], job_of("qa / checks", "completed"), job_of("qa / publish")]
+
+
+@contextlib.contextmanager
+def runs_api():
+    """A local GitHub API with the runs of qa.yml, their jobs and their artifacts.
+
+    It answers the list of runs with all of `runs`, whatever branch and event the request names,
+    so a test can hand the step runs it did not ask for. `failing` maps (method, start of the
+    route) to the status such a request is answered with.
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        def answer(self, status, document=None):
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            if document is not None:
+                self.wfile.write(json.dumps(document).encode())
+
+        def serve(self):
+            url = urllib.parse.urlsplit(self.path)
+            route = url.path.removeprefix("/repos/acme/app/")
+            server.requests.append((self.command, route, self.headers.get("Authorization")))
+            for (method, start), status in server.failing.items():
+                if self.command == method and route.startswith(start):
+                    return self.answer(status, {"message": "Resource not accessible by integration"})
+            run = re.fullmatch(r"actions/runs/(\d+)/(jobs|cancel|artifacts)", route)
+            if self.command == "GET" and route == "actions/workflows/qa.yml/runs":
+                server.queries.append(urllib.parse.parse_qs(url.query))
+                return self.answer(200, {"total_count": len(server.runs), "workflow_runs": server.runs})
+            if self.command == "GET" and run and run[2] == "jobs":
+                jobs = server.jobs.get(int(run[1]), [])
+                return self.answer(200, {"total_count": len(jobs), "jobs": jobs})
+            if self.command == "POST" and run and run[2] == "cancel":
+                server.cancelled.append(int(run[1]))
+                return self.answer(202, {})
+            if self.command == "GET" and run and run[2] == "artifacts":
+                artifacts = server.artifacts.get(int(run[1]), [])
+                return self.answer(200, {"total_count": len(artifacts), "artifacts": artifacts})
+            if self.command == "DELETE" and re.fullmatch(r"actions/artifacts/\d+", route):
+                server.deleted.append(int(route.rsplit("/", 1)[1]))
+                # As GitHub answers: 204, and no body.
+                return self.answer(204)
+            return self.answer(404, {"message": "Not Found"})
+
+        do_GET = do_POST = do_DELETE = serve  # noqa: N815
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.runs, server.jobs, server.artifacts, server.failing = [], {}, {}, {}
+    server.requests, server.queries, server.cancelled, server.deleted = [], [], [], []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        thread.join()
+        # Closed, so that a request made afterwards is refused at once instead of timing out.
+        server.server_close()
+
+
+@pytest.fixture
+def pushes(tmp_path) -> tuple[Path, dict]:
+    """develop as four pushes left it, a, b, c and d, and a commit x that is on another history."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "develop")
+    shas = {name: commit(repo, {"file": f"{name}\n"}, f"Change {name}") for name in ("a", "b", "c", "d")}
+    git(repo, "checkout", "-q", "-b", "side", shas["a"])
+    shas["x"] = commit(repo, {"side": "x\n"}, "On another history")
+    git(repo, "checkout", "-q", "develop")
+    return repo, shas
+
+
+def cancel_earlier(entry, repo: Path, api, sha: str, **overrides):
+    """Run the step of the plan that cancels earlier runs, in the checkout of the plan job."""
+    summary = repo.parent / "cancel-summary"
+    summary.write_text("")
+    env = {
+        "TOKEN": "job-token",
+        "TARGET_SHA": sha,
+        "WORKFLOW_REF": "acme/app/.github/workflows/qa.yml@refs/heads/develop",
+        "EVENT_NAME": "push",
+        "BRANCH": "develop",
+        "PLAN_JOB": "plan",
+        "GITHUB_API_URL": f"http://127.0.0.1:{api.server_port}",
+        "GITHUB_REPOSITORY": "acme/app",
+        "GITHUB_RUN_ID": OWN_RUN,
+        "GITHUB_STEP_SUMMARY": str(summary),
+        **overrides,
+    }
+    result = run_script(step(entry["jobs"]["plan"], "Cancel the runs of earlier commits")["run"], env, repo)
+    # Whatever happens, the plan goes on: a build that is not cancelled is only a build too many.
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result, summary.read_text()
+
+
+def test_the_run_of_a_push_cancels_the_runs_of_earlier_pushes_that_are_still_building(entry, pushes):
+    # Three merges in a row. The run of c is planned while the run of a builds and the run of b
+    # has not got further than its plan: both are cancelled, and c alone is built to the end.
+    repo, shas = pushes
+    with runs_api() as api:
+        api.runs = [qa_run(53, shas["c"]), qa_run(52, shas["b"], status="queued"), qa_run(51, shas["a"])]
+        api.runs[0]["id"] = int(OWN_RUN)
+        api.jobs = {9051: BUILDING, 9052: [job_of("qa / plan")]}
+        result, summary = cancel_earlier(entry, repo, api, shas["c"])
+        assert api.cancelled == [9052, 9051]
+        assert api.queries == [PUSH_QUERY]
+        assert all(authorization == "Bearer job-token" for _, _, authorization in api.requests)
+        # Its own run is not asked about, and nothing is asked twice.
+        assert [route for _, route, _ in api.requests] == [
+            "actions/workflows/qa.yml/runs",
+            "actions/runs/9052/jobs", "actions/runs/9052/cancel", "actions/runs/9052/artifacts",
+            "actions/runs/9051/jobs", "actions/runs/9051/cancel", "actions/runs/9051/artifacts",
+        ]
+    notices = [line for line in result.stdout.splitlines() if line.startswith("::")]
+    assert notices == [
+        f"::notice title=Earlier build cancelled::Run {number} was building {shas[name][:7]}, an earlier commit of develop "
+        f"than {shas['c'][:7]}, and had not started to publish. It is cancelled: only the newest commit is built to the "
+        "end. To release that commit, start its run again."
+        for number, name in ((52, "b"), (51, "a"))
+    ]
+    assert summary == (
+        "#### Earlier builds cancelled\n\n"
+        f"- [run 52](https://github.invalid/acme/app/actions/runs/9052) of `{shas['b'][:7]}`: this run builds a later commit of `develop`.\n"
+        f"- [run 51](https://github.invalid/acme/app/actions/runs/9051) of `{shas['a'][:7]}`: this run builds a later commit of `develop`.\n\n"
+    )
+
+
+def test_a_run_that_waits_for_its_checks_is_cancelled_and_its_artifact_deleted(entry, pushes):
+    # The run of b was built and waits for a pull request check that the next push replaced. Its
+    # `built` check succeeded and stays: the commit was built. Its APK is of no use any more, and
+    # no job of a cancelled run deletes it.
+    repo, shas = pushes
+    with runs_api() as api:
+        api.runs = [qa_run(52, shas["b"])]
+        api.jobs = {9052: WAITING}
+        api.artifacts = {9052: [{"id": 71, "name": "android-qa-apk-primary"}, {"id": 72, "name": "android-qa-apk-fallback"}, {"id": 73, "name": "reports"}]}
+        result, _ = cancel_earlier(entry, repo, api, shas["c"])
+        assert api.cancelled == [9052] and api.deleted == [71, 72]
+    assert "Deleted artifact 71 of run 52." in result.stdout and "::warning" not in result.stdout
+    # A publish job that waits for its turn has not started either.
+    with runs_api() as api:
+        api.runs = [qa_run(52, shas["b"])]
+        api.jobs = {9052: [*WAITING[:3], job_of("qa / checks", "completed"), job_of("qa / publish", "queued")]}
+        cancel_earlier(entry, repo, api, shas["c"])
+        assert api.cancelled == [9052]
+
+
+@pytest.mark.parametrize("publish_job", ["qa / publish", "publish", "android / qa / publish"])
+@pytest.mark.parametrize("status", ["in_progress", "completed"])
+def test_a_run_that_publishes_is_never_cancelled(entry, publish, pushes, publish_job, status):
+    # The rolling tag and the APKs of the pre-release are changed by the publish job alone, in
+    # several calls. A run that is stopped between them would leave the tag at its commit and the
+    # APKs half replaced. So a run whose publish job has started is left to finish, whatever the
+    # calling job is named: the newer build is published after it, in its turn.
+    repo, shas = pushes
+    with runs_api() as api:
+        api.runs = [qa_run(52, shas["b"]), qa_run(51, shas["a"])]
+        api.jobs = {9052: BUILDING, 9051: [*PUBLISHING[:4], job_of(publish_job, status)]}
+        result, summary = cancel_earlier(entry, repo, api, shas["c"])
+        assert api.cancelled == [9052]
+        assert ("POST", "actions/runs/9051/cancel", "Bearer job-token") not in api.requests
+        assert [route for method, route, _ in api.requests if method == "DELETE"] == []
+    assert f"Run 51 ({shas['a'][:7]}) is publishing: left to finish." in result.stdout
+    assert "run 51" not in summary
+    # And GitHub cancels nothing by itself: no group of this workflow cancels what is in progress.
+    assert publish["concurrency"]["cancel-in-progress"] is False
+    assert "cancel-in-progress: true" not in (WORKFLOWS / ENTRY).read_text()
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        # The same commit: another run of it, or this one started again.
+        lambda shas: qa_run(52, shas["c"]),
+        # A later commit. This run is one of an earlier commit that was started again, to get that
+        # commit its `built` check, and it must not stop the build of the newest one.
+        lambda shas: qa_run(54, shas["d"]),
+        # Another history: the branch was rewritten.
+        lambda shas: qa_run(52, shas["x"]),
+        # A commit this checkout does not have, and no commit at all.
+        lambda shas: qa_run(52, "f" * 40),
+        lambda shas: qa_run(52, ""),
+        lambda shas: {**qa_run(52, shas["b"]), "head_sha": None},
+        # A run that is over.
+        lambda shas: qa_run(52, shas["b"], status="completed"),
+        # Not what was asked for: another branch, and a run that was not started by a push.
+        lambda shas: qa_run(52, shas["b"], branch="release/1.x"),
+        lambda shas: qa_run(52, shas["b"], event="workflow_dispatch"),
+        lambda shas: qa_run(52, shas["b"], event="schedule"),
+    ],
+)
+def test_no_other_run_is_cancelled(entry, pushes, other):
+    repo, shas = pushes
+    with runs_api() as api:
+        api.runs = [other(shas)]
+        api.jobs = {9052: BUILDING, 9054: BUILDING}
+        result, summary = cancel_earlier(entry, repo, api, shas["c"])
+        assert api.cancelled == [] and api.deleted == []
+        assert [method for method, _, _ in api.requests] == ["GET"], "its jobs are not even asked for"
+    assert "No run of an earlier commit of develop is building." in result.stdout
+    assert "::" not in result.stdout and summary == ""
+
+
+# The name of the plan job, which is how a manual run says which line of builds it is.
+PLAN_NAME = "${{ github.event_name == 'push' && 'plan' || format('plan ({0})', inputs.label || inputs.version || 'manual run') }}"
+
+
+def plan_name(event: str, label: str = "", version: str = "") -> str:
+    """PLAN_NAME as GitHub evaluates it."""
+    return "plan" if event == "push" else f"plan ({label or version or 'manual run'})"
+
+
+@pytest.mark.parametrize(("label", "version"), [("ble-test", ""), ("", "1.14.0"), ("", "")])
+def test_a_manual_run_cancels_only_the_earlier_manual_runs_of_its_own_label_or_version(entry, pushes, label, version):
+    # A label build is run again for a fix before the first run has finished. The first run is
+    # cancelled: its APK would be replaced, and published under the number both were planned with.
+    # The runs of other labels, of a version, of neither, and the runs of pushes go on. Which is
+    # which is in the name of each run's plan job, because the inputs of a run are not in the API.
+    repo, shas = pushes
+    mine = plan_name("workflow_dispatch", label, version)
+    others = [name for name in ("plan (ble-test)", "plan (knox)", "plan (1.14.0)", "plan (manual run)", "plan") if name != mine]
+    with runs_api() as api:
+        api.runs = [qa_run(61, shas["a"], event="workflow_dispatch")]
+        api.jobs = {9061: [job_of(f"qa / {mine}", "completed"), job_of("qa / primary / build")]}
+        for number, name in enumerate(others, start=62):
+            api.runs.append(qa_run(number, shas["a"], event="workflow_dispatch"))
+            api.jobs[9000 + number] = [job_of(f"qa / {name}", "completed"), job_of("qa / primary / build")]
+        # A run whose jobs are not listed yet is not known to be of this line.
+        api.runs.append(qa_run(70, shas["a"], event="workflow_dispatch", status="queued"))
+        # The run of the push of a, which builds the rolling pre-release of the branch.
+        api.runs.append(qa_run(71, shas["a"]))
+        api.jobs[9071] = BUILDING
+        result, _ = cancel_earlier(entry, repo, api, shas["c"], EVENT_NAME="workflow_dispatch", PLAN_JOB=mine)
+        assert api.cancelled == [9061]
+        assert api.queries == [{"branch": ["develop"], "event": ["workflow_dispatch"], "per_page": ["100"]}]
+        assert "actions/runs/9071/jobs" not in [route for _, route, _ in api.requests]
+    assert f"has no job '{mine}': another manual build, left alone." in result.stdout
+    # And the other way round: the run of a push cancels no manual run, whatever it builds.
+    with runs_api() as api:
+        api.runs = [qa_run(61, shas["a"], event="workflow_dispatch")]
+        api.jobs = {9061: [job_of("qa / plan"), job_of("qa / plan (ble-test)")]}
+        cancel_earlier(entry, repo, api, shas["c"])
+        assert api.cancelled == []
+    # The job is named by the expression the step is handed, so the two cannot differ.
+    plan = entry["jobs"]["plan"]
+    assert plan["name"] == PLAN_NAME == step(plan, "Cancel the runs of earlier commits")["env"]["PLAN_JOB"]
+    # A label holds lowercase letters, digits and hyphens, and a version holds dots: neither can be
+    # the other, and neither can be the words of a run that names none.
+    assert release_version.LABEL.fullmatch("ble-test") and not release_version.LABEL.fullmatch("1.14.0")
+    assert not release_version.LABEL.fullmatch("manual run")
+
+
+@pytest.mark.parametrize(
+    ("failing", "cancelled", "warning"),
+    [
+        # The runs cannot be listed: a token without the permission, or a server error.
+        ({("GET", "actions/workflows/"): 403}, [], "::warning title=Earlier builds not cancelled::Cannot list the runs of qa.yml on develop (HTTP 403: "),
+        ({("GET", "actions/workflows/"): 502}, [], "::warning title=Earlier builds not cancelled::Cannot list the runs of qa.yml on develop (HTTP 502: "),
+        # Whether one run publishes cannot be told: that run is left alone, and the other is cancelled.
+        ({("GET", "actions/runs/9052/jobs"): 502}, [9051], "::warning title=Earlier build not cancelled::Run 52 "),
+        # GitHub refuses to cancel one run: it had just ended.
+        ({("POST", "actions/runs/9052/cancel"): 409}, [9051], "::warning title=Earlier build not cancelled::Run 52 "),
+        # The artifact of a cancelled run cannot be listed or deleted: it goes after a day.
+        ({("GET", "actions/runs/9052/artifacts"): 502}, [9052, 9051], "::warning::Could not delete the build artifact of run 52 (HTTP 502: "),
+        ({("DELETE", "actions/artifacts/"): 403}, [9052, 9051], "::warning::Could not delete the build artifact of run 52 (HTTP 403: "),
+    ],
+)
+def test_what_cannot_be_asked_or_cancelled_is_a_warning_and_the_plan_goes_on(entry, pushes, failing, cancelled, warning):
+    repo, shas = pushes
+    with runs_api() as api:
+        api.runs = [qa_run(52, shas["b"]), qa_run(51, shas["a"])]
+        api.jobs = {9052: WAITING, 9051: BUILDING}
+        api.artifacts = {9052: [{"id": 71, "name": "android-qa-apk-primary"}]}
+        api.failing = failing
+        result, _ = cancel_earlier(entry, repo, api, shas["c"])
+        assert api.cancelled == cancelled
+    assert warning in result.stdout
+    # An earlier run that goes on is built and may be published; the newer build replaces it, and
+    # is not replaced by it.
+    assert "::error" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"WORKFLOW_REF": ""}, {"WORKFLOW_REF": "acme/app/.github/workflows/qa.yml"}, {"WORKFLOW_REF": "qa.yml@refs/heads/develop"},
+        {"BRANCH": ""}, {"EVENT_NAME": ""}, {"TARGET_SHA": ""}, {"TARGET_SHA": "develop"},
+    ],
+)
+def test_a_run_that_does_not_say_what_it_is_cancels_nothing(entry, pushes, overrides):
+    repo, shas = pushes
+    with runs_api() as api:
+        api.runs = [qa_run(52, shas["b"])]
+        api.jobs = {9052: BUILDING}
+        result, _ = cancel_earlier(entry, repo, api, shas["c"], **overrides)
+        assert api.requests == []
+    assert "::warning title=Earlier builds not cancelled::The run does not say which workflow, branch and commit it is for" in result.stdout
+
+
+def test_an_unreachable_api_cancels_nothing_and_fails_nothing(entry, pushes):
+    repo, shas = pushes
+    with runs_api() as api:
+        port = api.server_port
+    result = run_script(
+        step(entry["jobs"]["plan"], "Cancel the runs of earlier commits")["run"],
+        {
+            "TOKEN": "job-token", "TARGET_SHA": shas["c"], "WORKFLOW_REF": "acme/app/.github/workflows/qa.yml@refs/heads/develop",
+            "EVENT_NAME": "push", "BRANCH": "develop", "PLAN_JOB": "plan", "GITHUB_API_URL": f"http://127.0.0.1:{port}",
+            "GITHUB_REPOSITORY": "acme/app", "GITHUB_RUN_ID": OWN_RUN, "GITHUB_STEP_SUMMARY": str(repo.parent / "summary"),
+        },
+        repo,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "::warning title=Earlier builds not cancelled::Cannot list the runs of qa.yml on develop (" in result.stdout
+
+
+def test_the_runs_are_cancelled_by_the_plan_once_it_has_planned_its_own(entry):
+    plan = entry["jobs"]["plan"]
+    names = [item.get("name") or item.get("uses") for item in plan["steps"]]
+    cancel = step(plan, "Cancel the runs of earlier commits")
+    # After the plan of this run: a run the plan refuses (another ref, a version that cannot be
+    # built) replaces nothing. And in the plan job, which is the first of the run: the build of
+    # the earlier commit gives up its runner before this build asks for one.
+    assert names.index("Plan the QA build") < names.index("Cancel the runs of earlier commits") < names.index("Pick the runner")
+    assert "if" not in cancel and "continue-on-error" not in cancel
+    assert cancel["env"] == {
+        "TOKEN": "${{ github.token }}",
+        "TARGET_SHA": "${{ steps.qa.outputs.target-sha }}",
+        # The calling workflow's file and the branch of the run, as the run has them: no input.
+        "WORKFLOW_REF": "${{ github.workflow_ref }}",
+        "EVENT_NAME": "${{ github.event_name }}",
+        "BRANCH": "${{ github.ref_name }}",
+        "PLAN_JOB": PLAN_NAME,
+    }
+    assert "python3 -I - <<'CANCEL'" in cancel["run"]
+    # Earlier means in the history of this commit, which the full checkout of the plan job can tell.
+    assert '["git", "merge-base", "--is-ancestor", commit, sha]' in cancel["run"]
+    assert plan["steps"][2]["with"]["fetch-depth"] == 0
+    # The one job that may cancel runs; the two that delete artifacts had the permission before.
+    assert plan["permissions"]["actions"] == "write"
+    assert "/cancel" not in json.dumps({name: job for name, job in entry["jobs"].items() if name != "plan"})
+
+
 # --- the build -----------------------------------------------------------------------------------
 
 
@@ -282,6 +657,30 @@ def test_the_qa_gradle_home_is_used_only_when_the_calling_file_asks_for_it(entry
         if name not in ("primary", "fallback"):
             assert job["runs-on"] == "ubuntu-latest", name
             assert "GRADLE_USER_HOME" not in json.dumps(job) and "android-qa-gradle" not in json.dumps(job), name
+
+
+def test_only_the_first_qa_build_may_read_the_runs_of_the_repository(entry):
+    # A build that finds the QA Gradle home taken asks GitHub whether the job that took it is over.
+    # The build workflow declares no permissions, so its job has those of the job that calls it: a
+    # declaration there would have to hold for a release as well, whose calling files grant no
+    # `actions`, and a called workflow that asks for more than its caller has does not start.
+    build = load(BUILD)
+    assert "permissions" not in build and "permissions" not in build["jobs"]["build"]
+    primary, fallback = entry["jobs"]["primary"], entry["jobs"]["fallback"]
+    assert primary["permissions"] == {"contents": "read", "packages": "read", "actions": "read"}
+    # The second build is cold and on a GitHub-hosted runner: it has what the workflow gives every job.
+    assert "permissions" not in fallback and entry["permissions"] == {"contents": "read", "packages": "read"}
+    # A release gets what it got while the build workflow named its permissions itself.
+    release = load(RELEASE)
+    assert release["permissions"] == {"contents": "read", "packages": "read"}
+    for name in ("primary", "fallback"):
+        assert "permissions" not in release["jobs"][name], name
+    released = yaml.safe_load((ROOT / "android-ci" / "release.yml.example").read_text())["permissions"]
+    assert "actions" not in released
+    # The token reaches the one step that asks, by name.
+    asking = [item.get("name") for item in build["jobs"]["build"]["steps"] if "github.token }}" in json.dumps(item.get("env", {}))]
+    assert "Choose the Gradle user home" in asking
+    assert step(build["jobs"]["build"], "Choose the Gradle user home")["env"]["TOKEN"] == "${{ github.token }}"
 
 
 def test_a_qa_build_runs_in_no_environment_and_uploads_nothing_to_sentry_unless_asked(entry):
@@ -402,9 +801,9 @@ def test_an_output_the_runner_dropped_ends_the_publish_job_with_the_reason(publi
     assert f"::error title=The plan is incomplete::Empty: {empty}. The plan job passed, so the runner dropped the output" in result.stdout
     assert names == {}
     assert publish["steps"][0] is step(publish, "Name the build")
-    # The job that waits for the checks names the build the same way, to know the tag of the
-    # pre-release: a name does not cross from one job to the other.
-    assert checks["steps"][0] == publish["steps"][0]
+    # The job that waits for the checks needs no name: it reads the checks of the commit, by its id.
+    assert "Name the build" not in [item.get("name") for item in checks["steps"]]
+    assert "steps.names" not in json.dumps(checks)
     env = step(publish, "Name the build")["env"]
     assert env["SOURCE_BRANCH"] == "${{ inputs.source-branch || github.event.repository.default_branch }}"
     assert env["LABEL"] == "${{ inputs.label }}" and env["VERSION_GIVEN"] == "${{ inputs.version }}"
@@ -444,6 +843,28 @@ def test_built_succeeds_only_when_a_build_of_the_commit_passed(entry, tmp_path, 
     else:
         assert "::error title=The commit was not built::3ff9b1a: plan " in result.stdout
         assert "A release of this commit requires this check" in result.stdout
+        # A run that was stopped, with nothing failed, says what stops a run and what to do.
+        stopped = "cancelled" in results.values() and "failure" not in results.values()
+        assert ("by the run of a later commit of the branch" in result.stdout) == stopped
+        assert ("to release this commit, run this run again." in result.stdout) == stopped
+
+
+def test_a_run_that_a_later_push_cancelled_while_it_built_has_no_successful_check(entry, tmp_path):
+    # A1: a commit that was not built cannot be tagged. The run of the next push cancels this one
+    # while Gradle runs. `built` runs all the same (always()), reads the build as cancelled and
+    # fails; the second build is not started for a cancelled run; nothing waits and nothing publishes.
+    result = state_built(entry, tmp_path, PRIMARY="cancelled", FALLBACK="skipped")
+    assert result.returncode == 1
+    assert "plan success, build cancelled, build on the GitHub-hosted runner skipped." in result.stdout
+    jobs = entry["jobs"]
+    assert jobs["built"]["if"] == "${{ always() }}"
+    for name in ("fallback", "checks", "publish"):
+        assert "!cancelled()" in jobs[name]["if"], name
+    # Cancelled after the build passed, while the run waited for its checks: `built` had succeeded
+    # by then, and that check stays. The commit was built, and can be released once its other
+    # checks are there.
+    assert jobs["built"]["needs"] == ["plan", "primary", "fallback"] and "checks" not in jobs["built"]["needs"]
+    assert state_built(entry, tmp_path, PRIMARY="success", FALLBACK="skipped").returncode == 0
 
 
 def test_built_is_the_check_of_a_push_and_states_the_build_whatever_publish_does(entry):
@@ -483,30 +904,33 @@ def test_the_checks_are_waited_for_after_the_build_and_outside_the_queue_of_the_
     assert checks["runs-on"] == "ubuntu-latest"
     # The wait of one commit holds up no other: a commit whose pull request check was replaced
     # while it waited never gets the check, and inside the group of the pre-release its wait
-    # would keep every later build from being published for as long as it lasts.
+    # would keep every later build from being published for as long as it lasts. And a job that
+    # only waits can be cancelled for a later commit, which a job in that group cannot.
     assert "concurrency" not in checks
-    # It reads the checks and how the tag compares with the commit, and deletes the artifact of a
-    # build that is not published. It cannot write a release or a tag.
+    # It reads the checks, and deletes the artifact of a build that is not published. It cannot
+    # write a release or a tag.
     assert checks["permissions"] == {"contents": "read", "checks": "read", "actions": "write"}
-    assert [item["name"] for item in checks["steps"]] == [
-        "Name the build", "Check the commit's checks", "Delete the build artifact",
-    ]
-    assert "if" not in checks["steps"][0] and "if" not in checks["steps"][1]
+    assert [item["name"] for item in checks["steps"]] == ["Check the commit's checks", "Delete the build artifact"]
+    assert "if" not in checks["steps"][0]
     # The job waits, so its own timeout has to leave room for the longest wait.
     assert checks["timeout-minutes"] == 120
     assert "At most 100" in trigger(entry)["inputs"]["checks-timeout-minutes"]["description"]
-    # One word crosses to the publish job, and it is not a name: the runner would drop an output
-    # that held the value of a secret.
-    assert checks["outputs"] == {"superseded": "${{ steps.checks.outputs.superseded }}"}
-    assert 'output.write("superseded=true\\n")' in step(checks, "Check the commit's checks")["run"]
+    # Nothing crosses to the publish job but the result of this one. The job no longer decides
+    # that a build was overtaken: the run of the later commit cancels this run instead, so there
+    # is no word that says "do not publish", and none that could get lost on the way.
+    assert "outputs" not in checks
+    text = (WORKFLOWS / ENTRY).read_text()
+    for gone in ("superseded", "ROLLING_TAG", "commits_past", "/compare/"):
+        assert gone not in text, gone
 
 
 def test_publish_follows_the_checks_and_is_the_only_job_that_writes(entry, publish, checks):
     assert publish["needs"] == ["plan", "primary", "fallback", "checks"]
-    # Only for a commit whose checks passed. A commit that failed them and one the job could not
-    # read them for end `checks` in a failure; one that a newer build overtook ends it in success
-    # with `superseded`, and is not published either.
-    assert publish["if"] == "${{ !cancelled() && needs.checks.result == 'success' && needs.checks.outputs.superseded != 'true' }}"
+    # Only for a commit whose checks passed: a commit that failed them and one the job could not
+    # read them for end `checks` in a failure. The condition reads the result of that job and no
+    # output of it. A result cannot be dropped the way an output can, so whatever goes wrong
+    # between the two jobs ends in nothing published.
+    assert publish["if"] == "${{ !cancelled() && needs.checks.result == 'success' }}"
     assert publish["runs-on"] == "ubuntu-latest"
     # The release and its tag, and the artifact it deletes.
     assert publish["permissions"] == {"contents": "write", "actions": "write"}
@@ -546,21 +970,28 @@ def test_publish_follows_the_checks_and_is_the_only_job_that_writes(entry, publi
     # Nothing in the job waits for anything but its own uploads.
     assert "Check the commit's checks" not in names
     assert publish["timeout-minutes"] == 30
-    # Both jobs name the build, each for itself, with one script.
-    assert step(checks, "Name the build") == step(publish, "Name the build")
 
 
 def test_one_publish_job_at_a_time_per_pre_release_and_none_is_cancelled(entry, publish):
     # Two builds that finish together would each delete the APK of the other. The group is the
     # pre-release: the line, and what keeps a build apart from the line's rolling one.
+    pre_release = (
+        "format('android-qa-publish-{0}-{1}', needs.plan.outputs.major || 'source', "
+        "inputs.label || (inputs.version != '' && needs.plan.outputs.version) || 'rolling')"
+    )
+    # Only a job that will publish is in that group. GitHub keeps one waiting job per group, and
+    # should it put a job into its group before it looks at the job's `if`, a job that is about to
+    # be skipped would replace the one that waits. Such a job is in a group of its own run. The
+    # condition is that of `if`, without the cancelling.
+    alone = "format('android-qa-no-publish-{0}-{1}', github.run_id, github.run_attempt)"
     assert publish["concurrency"] == {
-        "group": "android-qa-publish-${{ needs.plan.outputs.major || 'source' }}-"
-        "${{ inputs.label || (inputs.version != '' && needs.plan.outputs.version) || 'rolling' }}",
+        "group": "${{ needs.checks.result == 'success' && " + pre_release + " || " + alone + " }}",
         "cancel-in-progress": False,
     }
-    # Nothing else is serialized, and no run is cancelled for a later one: every pushed commit is
-    # built, because a release of it requires the check of that build. The wait for the checks in
-    # particular is in no group.
+    assert "needs.checks.result == 'success'" in publish["if"]
+    # Nothing else is in a group. No run is cancelled by GitHub for a later one, which would stop
+    # a publish job half way and could not tell an earlier commit from a later one: the plan job
+    # of the later commit's run cancels, and it leaves a run that publishes alone.
     assert "concurrency" not in entry
     for name, job in entry["jobs"].items():
         if name != "publish":
@@ -569,7 +1000,7 @@ def test_one_publish_job_at_a_time_per_pre_release_and_none_is_cancelled(entry, 
 
 def test_the_checks_are_decided_by_the_script_of_the_version_bump(entry, checks):
     # One rule in three workflows: an APK is handed out for a commit that passed what a pull
-    # request has to pass. Only the wait is this workflow's, and what ends it early.
+    # request has to pass. Only the wait is this workflow's.
     ours = step(checks, "Check the commit's checks")
     bump = step(load("android-version-bump.yml")["jobs"]["plan"], "Check the commit's checks")
     release = step(load(RELEASE)["jobs"]["plan"], "Check the commit's checks")
@@ -581,12 +1012,12 @@ def test_the_checks_are_decided_by_the_script_of_the_version_bump(entry, checks)
         "TARGET_SHA": "${{ needs.plan.outputs.sha }}",
         "REQUIRED_CHECKS": "${{ inputs.required-checks }}",
         "CHECKS_WAIT_MINUTES": "${{ inputs.checks-timeout-minutes }}",
-        # The tag of the pre-release the build would be published as.
-        "ROLLING_TAG": "${{ steps.names.outputs.tag }}",
     }
-    # A release is decided from the checks as they are, and no tag is a reason to pass over them.
+    # A release is decided from the checks as they are. And nothing in the script passes over a
+    # check: it has one way to end without an error, which is that every required check succeeded.
     for other in (bump, release):
-        assert "CHECKS_WAIT_MINUTES" not in other["env"] and "ROLLING_TAG" not in other["env"]
+        assert "CHECKS_WAIT_MINUTES" not in other["env"]
+    assert "sys.exit(0)" not in ours["run"] and ours["run"].count("sys.exit(") == 3
     inputs = trigger(entry)["inputs"]
     # The APK waits for the pull request check alone: the other check a release requires is this
     # very workflow's.
@@ -607,7 +1038,7 @@ class Answers:
         return iter(answer)
 
 
-def wait_for_checks(checks, tmp_path, api, minutes="1", required="pr-check / result", tag=""):
+def wait_for_checks(checks, tmp_path, api, minutes="1", required="pr-check / result"):
     tmp_path.mkdir(parents=True, exist_ok=True)
     summary, output = tmp_path / "summary", tmp_path / "checks-output"
     summary.write_text("")
@@ -618,149 +1049,40 @@ def wait_for_checks(checks, tmp_path, api, minutes="1", required="pr-check / res
         "REQUIRED_CHECKS": required,
         "CHECKS_WAIT_MINUTES": minutes,
         "CHECKS_POLL_SECONDS": "0.01",
-        "ROLLING_TAG": tag,
         "GITHUB_API_URL": f"http://127.0.0.1:{api.server_port}",
         "GITHUB_REPOSITORY": "acme/app",
         "GITHUB_STEP_SUMMARY": str(summary),
         "GITHUB_OUTPUT": str(output),
     }
     result = run_script(step(checks, "Check the commit's checks")["run"], env, tmp_path)
-    # What the step tells the steps and the job after it: refused=true, superseded=true or nothing.
+    # What the step tells the step after it: refused=true or nothing.
     result.refused = output.read_text()
     return result, summary.read_text()
 
 
-def compared(requests: list) -> list:
-    """The requests that asked how the tag compares with the commit."""
-    return [path for path, _ in requests if "/compare/" in path]
-
-
-# How GitHub compares base...head, the commit with the tag of the pre-release.
-BEHIND = {"status": "behind", "ahead_by": 0, "behind_by": 1}
-PAST = {"status": "ahead", "ahead_by": 1, "behind_by": 0}
-
-
-def test_a_commit_whose_check_never_comes_does_not_hold_up_the_build_after_it(checks, publish, tmp_path):
+def test_a_commit_whose_check_never_comes_does_not_hold_up_the_build_after_it(entry, checks, publish, tmp_path):
     # Three merges in a row, A, B and C, while a pull request check is running. That workflow
     # keeps one waiting run per branch, so the run of B is replaced by the run of C: B never gets
-    # `pr-check / result`. All three are built here, because a release requires the build of each.
+    # `pr-check / result`.
     #
     # Were the wait part of the job that publishes, B would hold the turn of the pre-release for
-    # the whole of checks-timeout-minutes, and C behind it. It is a job of its own instead.
+    # the whole of checks-timeout-minutes, and C behind it. It is a job of its own instead, and
+    # what ends it is the run of C: that run cancels the run of B, which is waiting and not
+    # publishing. The job itself asks about nothing but the checks of its commit.
     assert "concurrency" not in checks and "concurrency" in publish
     assert "checks" in publish["needs"] and "Check the commit's checks" not in [item.get("name") for item in publish["steps"]]
-
-    # C: its check passes while B still waits. Nothing about B is asked, and C goes on to publish.
-    with check_runs_api() as api:
-        api.runs = Answers([check_run(conclusion=None, status="in_progress")], [check_run()])
-        api.compare = [BEHIND]
-        result, _ = wait_for_checks(checks, tmp_path / "c", api, minutes="100", tag="qa-develop")
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert result.refused == ""
-        assert len(compared(api.requests)) == 1, "asked once, before the one wait"
-
-    # B: no check. The pre-release is at A while C is being built and checked, and B waits. Then C
-    # is published, the tag is one commit past B, and B stops at once: it would not be published
-    # even if its check came.
     with check_runs_api() as api:
         api.runs = []
-        api.compare = [BEHIND, BEHIND, PAST]
-        result, summary = wait_for_checks(checks, tmp_path / "b", api, minutes="100", tag="qa-develop")
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert [path.split("?")[0] for path, _ in api.requests] == [
-            f"/repos/acme/app/commits/{SHA}/check-runs", f"/repos/acme/app/compare/{SHA}...qa-develop",
-        ] * 3
+        result, summary = wait_for_checks(checks, tmp_path, api, minutes="0.002")
+        assert len(api.requests) >= 2
+        assert {path.split("?")[0] for path, _ in api.requests} == {f"/repos/acme/app/commits/{SHA}/check-runs"}
         assert all(authorization == "Bearer job-token" for _, authorization in api.requests)
-    assert result.stdout.count("Waiting for pr-check / result") == 2
-    assert (
-        f"::notice title=A newer build is published::qa-develop is 1 commit past {SHA[:7]}. This build is not "
-        "published, so its checks are not waited for ('pr-check / result' did not run on the commit)."
-    ) in result.stdout
-    # Not a failure, and not the checks' refusal: nothing is wrong with a commit that was overtaken.
-    assert "::error" not in result.stdout + result.stderr
-    assert result.refused == "superseded=true\n"
+    # Without a later push nothing ends the wait but its time, and then the commit is not published.
+    assert result.returncode == 1 and result.refused == "refused=true\n"
     assert "| pr-check / result | not run |" in summary
-    assert f"qa-develop is 1 commit past {SHA[:7]}: a newer build is published." in summary
-    # The publish job does not start for B, and the job that waited deletes the artifact.
-    assert "needs.checks.outputs.superseded != 'true'" in publish["if"]
-    assert "steps.checks.outputs.superseded == 'true'" in step(checks, "Delete the build artifact")["if"]
-
-
-@pytest.mark.parametrize("minutes", ["100", "0"])
-@pytest.mark.parametrize("runs", [[], [check_run(conclusion=None, status="queued")], [check_run(conclusion=None, status="in_progress")]])
-def test_a_build_that_was_overtaken_is_not_waited_for_whatever_its_check_is_doing(checks, tmp_path, runs, minutes):
-    # A run that was started again long after, or a build that took longer than the one after it.
-    with check_runs_api() as api:
-        api.runs = runs
-        api.compare = [{"status": "ahead", "ahead_by": 3, "behind_by": 0}]
-        result, _ = wait_for_checks(checks, tmp_path, api, minutes=minutes, tag="qa-release-1.x-ble-test")
-        assert len(api.requests) == 2, "the checks once, the tag once"
-        assert compared(api.requests) == [f"/repos/acme/app/compare/{SHA}...qa-release-1.x-ble-test?per_page=1"]
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert f"qa-release-1.x-ble-test is 3 commits past {SHA[:7]}." in result.stdout
-    assert result.refused == "superseded=true\n"
-
-
-def test_a_check_that_failed_is_the_answer_even_when_a_newer_build_is_published(checks, tmp_path):
-    # The checks answered. That is reported as it is, and the tag is not asked.
-    with check_runs_api() as api:
-        api.runs = [check_run(conclusion="failure")]
-        api.compare = [PAST]
-        result, _ = wait_for_checks(checks, tmp_path, api, minutes="100", tag="qa-develop")
-        assert compared(api.requests) == []
-    assert result.returncode == 1
-    assert result.refused == "refused=true\n"
-    # And a commit whose checks passed goes on to the publish job, which decides about its build.
-    with check_runs_api() as api:
-        api.runs = [check_run()]
-        api.compare = [PAST]
-        result, _ = wait_for_checks(checks, tmp_path, api, minutes="100", tag="qa-develop")
-        assert compared(api.requests) == []
-    assert (result.returncode, result.refused) == (0, "")
-
-
-@pytest.mark.parametrize(
-    "answers",
-    [
-        # No such tag: the first build of the line.
-        [],
-        # The tag is where the build before left it, or at this very commit (the same run again).
-        [BEHIND],
-        [{"status": "identical", "ahead_by": 0, "behind_by": 0}],
-        # The branch was rewritten: the tag is on a history the commit does not have.
-        [{"status": "diverged", "ahead_by": 2, "behind_by": 1}],
-        # Not an answer.
-        [{"message": "no status here"}],
-        [{"status": "ahead"}],
-        [["a list"]],
-    ],
-)
-def test_only_a_tag_that_is_past_the_commit_ends_the_wait(checks, tmp_path, answers):
-    with check_runs_api() as api:
-        api.runs = []
-        api.compare = answers
-        result, _ = wait_for_checks(checks, tmp_path, api, minutes="0.002", tag="qa-develop")
-        assert len(compared(api.requests)) >= 2, "asked before each wait"
-    assert result.returncode == 1
-    assert f"::error title=The commit has not passed its checks::{SHA[:7]}: 'pr-check / result' did not run on the commit after waiting 0.002 minutes. " in result.stdout
-    assert result.refused == "refused=true\n"
-
-
-def test_a_tag_that_cannot_be_compared_is_no_reason_to_stop_waiting_and_none_to_fail(checks, tmp_path):
-    # The question is an extra one. When it meets a server error, or a token that may not ask it,
-    # the step waits for the checks as if it had not asked, and publishes when they pass.
-    with check_runs_api() as api:
-        # The answers in order: the checks, the tag, the checks, the tag, and so on.
-        api.statuses = [200, 502, 200, 403, 200, 404]
-        api.runs = Answers(
-            [], [check_run(conclusion=None, status="queued")], [check_run(conclusion=None, status="in_progress")], [check_run()],
-        )
-        api.compare = [PAST]
-        result, _ = wait_for_checks(checks, tmp_path, api, tag="qa-develop")
-        assert len(api.requests) == 7 and len(compared(api.requests)) == 3
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "Cannot read the checks" not in result.stdout + result.stderr
-    assert result.refused == ""
+    # The cancelling is the plan's, of the run of the later commit: its tests are further up.
+    assert "Cancel the runs of earlier commits" in [item.get("name") for item in entry["jobs"]["plan"]["steps"]]
+    assert "cancel" not in json.dumps(checks).replace("cancelled", "")
 
 
 def test_publish_waits_for_a_check_that_has_not_finished(checks, tmp_path):
@@ -1636,15 +1958,15 @@ def test_an_artifact_that_cannot_be_deleted_is_a_warning_not_a_failure(publish, 
 
 def test_the_artifact_is_kept_only_for_a_run_that_can_be_finished(publish, checks):
     # Deleted by the job that is done with it. The publish job: the APK is published, or a newer
-    # build is. The job that waits for the checks: they refused the commit, or a newer build
-    # overtook it, and the publish job does not start for either. After any other failure, checks
-    # that could not be read included, the artifact stays for the day GitHub keeps it, so the job
-    # can run again.
+    # build is. The job that waits for the checks: they refused the commit, and the publish job
+    # does not start for it. After any other failure, checks that could not be read included, the
+    # artifact stays for the day GitHub keeps it, so the job can run again. (The artifact of a run
+    # that is cancelled for a later commit is deleted by the run of that commit.)
     delete = step(publish, "Delete the build artifact")
     assert delete["if"] == "${{ always() && steps.publish.outcome == 'success' }}"
     assert step(publish, "Publish the rolling pre-release")["id"] == "publish"
     early = step(checks, "Delete the build artifact")
-    assert early["if"] == "${{ always() && (steps.checks.outputs.refused == 'true' || steps.checks.outputs.superseded == 'true') }}"
+    assert early["if"] == "${{ always() && steps.checks.outputs.refused == 'true' }}"
     assert step(checks, "Check the commit's checks")["id"] == "checks"
     assert 'output.write("refused=true\\n")' in step(checks, "Check the commit's checks")["run"]
     # One script and one set of values in both jobs; both may delete an artifact.
@@ -1718,8 +2040,9 @@ def test_the_example_passes_only_what_the_workflow_declares(entry):
     # there, commented out, with where to read first.
     assert "qa-gradle-home" not in job["with"]
     assert "      # qa-gradle-home: warm\n" in EXAMPLE.read_text()
-    # No run is cancelled for a later one, and none waits behind another: the publish job of the
-    # called workflow keeps the order of what is published.
+    # The calling file names no concurrency group. The called workflow cancels the runs of earlier
+    # commits itself and keeps the order of what is published; a group here would cancel a run
+    # that is publishing, or make the newest commit wait behind an older one.
     assert "concurrency" not in example
     usage = yaml.safe_load(README.read_text().split("## android-qa.yml", 1)[1].split("```yaml", 1)[1].split("```", 1)[0])
     assert "concurrency" not in usage

@@ -92,9 +92,11 @@ on:
       verify-verdict:
         description: 'pass, code or infra; empty when the job never reported (its runner went away)'
         value: ${{ jobs.verify.outputs.verdict }}
+      # pass without asking the job when the job is not started at all: the
+      # condition is the `if` of the release-build job, word for word.
       release-build-verdict:
         description: 'pass, code or infra; empty when the job never reported (its runner went away)'
-        value: ${{ jobs.release-build.outputs.verdict }}
+        value: ${{ (github.event_name == 'push' && !inputs.release-build-on-push && github.ref == format('refs/heads/{0}', inputs.source-branch || github.event.repository.default_branch)) && 'pass' || jobs.release-build.outputs.verdict }}
 
 permissions:
   contents: read
@@ -468,9 +470,20 @@ jobs:
   # skipped unless release-build-on-push is set: android-qa.yml builds the
   # release variant of that very commit with the release key, and its check
   # ("qa / built") is required by a release next to the check of this
-  # workflow. The job still runs and reports pass, as for a pull request that
-  # changed documentation only.
+  # workflow.
+  #
+  # For a push to the source branch the job is not started at all, so that
+  # the check does not wait for a self-hosted runner only to decide that it
+  # has nothing to build: the `if` below says so before the job is given to
+  # a runner, and the output release-build-verdict of this file is then pass.
+  # The name of the source branch is all an expression can compare. A push to
+  # release/<major>.x is recognised by the step that decides whether to
+  # build, which can match the pattern; that job starts, builds nothing and
+  # reports pass, as for a pull request that changed documentation only. A
+  # looser match here (starts with release/, ends in .x) would also skip the
+  # build on branches that android-qa.yml does not build.
   release-build:
+    if: ${{ !(github.event_name == 'push' && !inputs.release-build-on-push && github.ref == format('refs/heads/{0}', inputs.source-branch || github.event.repository.default_branch)) }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: ${{ inputs.release-build-timeout-minutes }}
     outputs:

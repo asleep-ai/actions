@@ -7,8 +7,14 @@ name: QA Build
 #
 # The build of a push is also what a release of that commit requires: the
 # check `qa / built`, next to `pr-check / result`. So every push starts a run
-# (no paths filter), and no run is cancelled for a later one (no concurrency
-# block): a commit whose build was skipped or cancelled could not be released.
+# (no paths filter): a commit whose build was skipped could not be released.
+#
+# Only the newest commit of a branch is built to the end. The run of a push
+# cancels the runs of earlier commits that are still building, and a commit
+# whose build was cancelled cannot be released until its run is started
+# again. The called workflow does that itself, and leaves a run that is
+# publishing alone. So there is no concurrency block here: one would cancel
+# such a run half way.
 #
 # A manual run on any other branch fails in its first job and says why: a QA
 # build is signed with the release key, so it is built from merged code only.
@@ -33,7 +39,7 @@ permissions:
   contents: write       # the rolling pre-release and its tag
   packages: read        # private GitHub Packages of this repository
   checks: read          # the checks of the commit
-  actions: write        # delete the build's artifact once it is done with
+  actions: write        # cancel the runs of earlier commits, delete a build's artifact
 
 jobs:
   # The name of this job is part of the check a release requires by default,

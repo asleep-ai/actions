@@ -71,7 +71,7 @@ The `release-version/v1` tag does not exist until the first release; pin a full 
 | `next-version` | `qa` | `''` | Optional. The version the branch is heading for, used while it is higher than the last release, no higher than the next major version after it, and not released. |
 | `label` | `qa` | `''` | Optional. Makes the build a label build: a named test build numbered right after the last release of its line. |
 | `since` | `changes` | `''` | Name of the tag that marks the earlier build. It need not exist. |
-| `version-code` | `changes` | `''` | Optional. The versionCode of the build that is about to be published as the `since` tag; `code-taken-by` then says whether another rolling tag holds it. |
+| `version-code` | `changes` | `''` | Optional. The versionCode of the build that is about to be published as the `since` tag; `code-taken-by` then says whether a rolling tag holds it already. |
 
 Inputs reach the script as environment variables, never through shell interpolation.
 
@@ -98,7 +98,7 @@ Inputs reach the script as environment variables, never through shell interpolat
 | `since-object` | `changes` | The id of the object the `since` tag names in the checkout: the tag object of an annotated tag. Empty when the tag does not exist. A caller that moves the tag afterwards compares it with the tag as it is then. |
 | `stale` | `changes` | `true` when the `since` tag names a later commit that contains this one. |
 | `unchanged` | `changes` | `true` when the `since` tag names this very commit. |
-| `code-taken-by` | `changes` with `version-code` | The rolling tag, other than `since`, that holds a build of that versionCode. Empty when there is none. |
+| `code-taken-by` | `changes` with `version-code` | The rolling tag that holds a build of that versionCode; `since` itself counts unless it names `sha`. Empty when there is none. |
 
 ## next
 
@@ -255,7 +255,7 @@ Lists what the commit `sha` adds to the commit the tag `since` names, in the for
 - When the tag names `sha` itself, `unchanged` is `true` and the list is empty.
 - When the tag names a later commit that contains `sha`, `stale` is `true` and the list is empty: the caller decides what an older build means.
 - Otherwise (no such tag, or a tag on a history the commit does not have) the list starts at the last release the commit contains, and `since` is that tag, or empty when there is none and the list covers the whole history.
-- With `version-code`, the versionCode of the build that is about to be published as `since`: `code-taken-by` is the name of another rolling tag (`qa-*`) whose message names a build of that versionCode, and empty when there is none. A versionCode is published once; the number of a label build was read from the same tags when it was planned, and may have been taken since.
+- With `version-code`, the versionCode of the build that is about to be published as `since`: `code-taken-by` is the name of a rolling tag (`qa-*`) whose message names a build of that versionCode, and empty when there is none. The `since` tag itself counts unless it names `sha` (the same build, published again). A versionCode is published once; the number of a label build was read from the same tags when it was planned, and may have been taken since, by a build of another label or by a run of the same label on another commit.
 
 ## Requirements
 

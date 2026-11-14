@@ -19,15 +19,21 @@ name: Android QA build
 #
 # The APK is published only when the checks of the same commit succeeded. The
 # job `checks` waits for them, because the push that starts this workflow
-# starts them too. It waits outside the queue of the pre-release, so the build
-# of a later commit is published while an earlier one still waits, and it
-# stops waiting once that later build is published.
+# starts them too.
+#
+# Only the newest commit of a branch is built to the end. A run that a push
+# started cancels the runs that earlier pushes to the same branch started and
+# that are still building or waiting for their checks: the plan job does it,
+# once its own run is planned. A run that is already publishing is left to
+# finish. A manual run does the same among the manual runs of its branch with
+# the same label or version, and neither kind cancels the other.
 #
 # The build of a push is also what a release of that commit requires: the job
 # `built` reports it as the check "<calling job> / built", which
 # android-version-bump.yml and android-release.yml require by default next to
-# the pull request check. So every push to a branch that is released from has
-# to be built here, and no run is cancelled for a later one.
+# the pull request check. A commit whose run was cancelled before its build
+# ended has no successful check of that name, and is released only after its
+# run was started again.
 #
 # A manual run can make a label build instead (input label): a named test
 # build, numbered right after the last release of its line, in a pre-release
@@ -315,11 +321,19 @@ jobs:
   # and a branch (release/1.x), a line or a label may well hold one ("release"
   # is a likely key alias). The jobs below put the names together themselves,
   # from these outputs and the inputs.
+  #
+  # The name of the job says which line of builds a manual run belongs to: its
+  # label, its version, or neither. The inputs of a run cannot be read from
+  # another run, and the names of its jobs can. That is how the step that
+  # cancels earlier runs finds the manual runs of the same label.
   plan:
+    name: ${{ github.event_name == 'push' && 'plan' || format('plan ({0})', inputs.label || inputs.version || 'manual run') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
+      # Cancels the runs of earlier commits and deletes their build artifacts.
+      actions: write
     outputs:
       sha: ${{ steps.qa.outputs.target-sha }}
       major: ${{ steps.qa.outputs.major }}
@@ -427,6 +441,182 @@ jobs:
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Only the newest commit of a line is built to the end: a build of an
+      # earlier commit keeps a runner busy for an APK that the next build
+      # replaces. So this run, now that it is planned, cancels the runs it
+      # makes pointless. Those are the runs
+      # - of the calling workflow, on the same branch, started the same way (a
+      #   push cancels the runs of pushes, a manual run the manual runs whose
+      #   plan job carries the same name: the same label, the same version, or
+      #   neither),
+      # - of a commit that is in the history of this one, so a run of an
+      #   earlier commit that is started again later cancels nothing newer,
+      # - that are not done and whose publish job has not started. A run that
+      #   publishes is left alone: it is nearly done, and stopping it half way
+      #   would leave the tag moved and the APKs half replaced.
+      #
+      # A run that is cancelled while it builds ends without a successful
+      # "built" check, which is what keeps its commit from being released; one
+      # that was cancelled after its build keeps the check. Its build artifact
+      # is deleted here, because no job of it will.
+      #
+      # Whatever cannot be asked or done is a warning, never a failure: the
+      # earlier run then goes on as it would have, and the publish job keeps
+      # an older build from replacing a newer one.
+      #
+      # python3 -I: the script comes from standard input, and without -I
+      # Python would look for the modules it imports in the work folder first.
+      - name: Cancel the runs of earlier commits
+        env:
+          TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.qa.outputs.target-sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+          PLAN_JOB: ${{ github.event_name == 'push' && 'plan' || format('plan ({0})', inputs.label || inputs.version || 'manual run') }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'CANCEL'
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ.get("TOKEN", "").strip()
+          sha = os.environ.get("TARGET_SHA", "").strip()
+          event = os.environ.get("EVENT_NAME", "")
+          branch = os.environ.get("BRANCH", "")
+          plan_job = os.environ.get("PLAN_JOB", "")
+          own = os.environ.get("GITHUB_RUN_ID", "")
+          # owner/repo/.github/workflows/qa.yml@refs/heads/develop: the file of the calling workflow.
+          workflow = re.fullmatch(r"[^@]+/([^/@]+\.ya?ml)@.+", os.environ.get("WORKFLOW_REF", ""))
+
+
+          class Unanswered(Exception):
+              """GitHub did not answer a request with what was asked for."""
+
+
+          def call(method, path):
+              request = urllib.request.Request(
+                  f"{api}/repos/{repository}/{path}",
+                  method=method,
+                  # A POST without a body still says how long its body is.
+                  data=b"" if method == "POST" else None,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "asleep-ai-actions-android-ci",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      body = response.read()
+                  return json.loads(body) if body.strip() else {}
+              except urllib.error.HTTPError as error:
+                  detail = error.read(300).decode(errors="replace").strip()
+                  raise Unanswered(f"HTTP {error.code}: {detail}") from None
+              except (OSError, ValueError) as error:
+                  raise Unanswered(str(error) or type(error).__name__) from None
+
+
+          def listed(path, key):
+              document = call("GET", path)
+              items = document.get(key) if isinstance(document, dict) else None
+              if not isinstance(items, list):
+                  raise Unanswered(f"the response has no {key} list")
+              return [item for item in items if isinstance(item, dict)]
+
+
+          def named(job, name):
+              """Whether a job of a run is the job `name` of this workflow: "<calling job> / <name>"."""
+              return isinstance(job.get("name"), str) and (job["name"] == name or job["name"].endswith(f" / {name}"))
+
+
+          def earlier(commit):
+              """Whether `commit` is in the history of the commit this run builds, and is not that commit."""
+              if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit) or commit == sha:
+                  return False
+              asked = subprocess.run(["git", "merge-base", "--is-ancestor", commit, sha], capture_output=True, check=False)
+              return asked.returncode == 0
+
+
+          def replace(run):
+              """Cancel one run of an earlier commit, unless it is another line's or publishes. True when cancelled."""
+              number, theirs = run.get("run_number"), run["head_sha"]
+              jobs = listed(f"actions/runs/{run['id']}/jobs?per_page=100", "jobs")
+              # A push builds the one line of its branch. A manual run says in the name of its plan
+              # job which line it builds; a run that has no such job yet is not known to be this one.
+              if event != "push" and not any(named(job, plan_job) for job in jobs):
+                  print(f"Run {number} ({theirs[:7]}) has no job '{plan_job}': another manual build, left alone.")
+                  return False
+              if any(named(job, "publish") and job.get("status") in ("in_progress", "completed") for job in jobs):
+                  print(f"Run {number} ({theirs[:7]}) is publishing: left to finish.")
+                  return False
+              call("POST", f"actions/runs/{run['id']}/cancel")
+              print(f"::notice title=Earlier build cancelled::Run {number} was building {theirs[:7]}, an earlier commit of "
+                    f"{branch} than {sha[:7]}, and had not started to publish. It is cancelled: only the newest commit "
+                    "is built to the end. To release that commit, start its run again.")
+              # What that run built is of no use to it any more, and its own jobs do not get to delete it.
+              try:
+                  for artifact in listed(f"actions/runs/{run['id']}/artifacts?per_page=100", "artifacts"):
+                      if str(artifact.get("name", "")).startswith("android-qa-apk-"):
+                          call("DELETE", f"actions/artifacts/{artifact['id']}")
+                          print(f"Deleted artifact {artifact['id']} of run {number}.")
+              except (Unanswered, KeyError) as error:
+                  print(f"::warning::Could not delete the build artifact of run {number} ({error}). It is kept for one day.")
+              return True
+
+
+          def main():
+              if not workflow or not re.fullmatch(r"[0-9a-f]{40}", sha) or not branch or not event:
+                  print("::warning title=Earlier builds not cancelled::The run does not say which workflow, branch and "
+                        "commit it is for, so no earlier run is cancelled.")
+                  return
+              query = urllib.parse.urlencode({"branch": branch, "event": event, "per_page": 100})
+              try:
+                  runs = listed(f"actions/workflows/{urllib.parse.quote(workflow[1])}/runs?{query}", "workflow_runs")
+              except Unanswered as error:
+                  print(f"::warning title=Earlier builds not cancelled::Cannot list the runs of {workflow[1]} on {branch} "
+                        f"({error}). A run of an earlier commit goes on; its build is not published over a newer one.")
+                  return
+              cancelled = []
+              for run in runs:
+                  # The request names the branch and the event, and the answer is checked all the same.
+                  if run.get("status") == "completed" or str(run.get("id")) == own:
+                      continue
+                  if run.get("event") != event or run.get("head_branch") != branch or not earlier(run.get("head_sha")):
+                      continue
+                  try:
+                      if replace(run):
+                          cancelled.append(run)
+                  except (Unanswered, KeyError) as error:
+                      print(f"::warning title=Earlier build not cancelled::Run {run.get('run_number')} "
+                            f"({run['head_sha'][:7]}) could not be cancelled ({error}). It goes on; its build is not "
+                            "published over a newer one.")
+              if not cancelled:
+                  print(f"No run of an earlier commit of {branch} is building.")
+                  return
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write("#### Earlier builds cancelled\n\n")
+                  for run in cancelled:
+                      link = f"[run {run.get('run_number')}]({run['html_url']})" if run.get("html_url") else f"run {run.get('run_number')}"
+                      summary.write(f"- {link} of `{run['head_sha'][:7]}`: this run builds a later commit of `{branch}`.\n")
+                  summary.write("\n")
+
+
+          # Nothing here is worth failing the plan for.
+          try:
+              main()
+          except Exception as error:
+              print(f"::warning title=Earlier builds not cancelled::{type(error).__name__}: {error}")
+          CANCEL
+
       - name: Pick the runner
         id: pick
         if: ${{ inputs.runner-labels != '' }}
@@ -452,8 +642,19 @@ jobs:
   # The version name is put together here, as release-version does it in the
   # plan (android-ci's tests compare the two): <version>-qa.<number>, or
   # <version>-<label>.<number> for a label build.
+  #
+  # The build workflow declares no permissions: its job has what the job that
+  # calls it has. Here that is what every build has, and the right to read the
+  # jobs of this repository's runs. A build that finds the QA Gradle home
+  # taken asks with it whether the job that took it is over, which is how a
+  # home is taken back from a job that died or was cancelled without giving
+  # it back. The second build is cold and does not ask.
   primary:
     needs: plan
+    permissions:
+      contents: read
+      packages: read
+      actions: read
     uses: ./.github/workflows/android-release-build.yml
     with:
       runs-on: ${{ needs.plan.outputs.runs-on || (startsWith(inputs.fallback-runs-on, '[') && inputs.fallback-runs-on) || toJSON(inputs.fallback-runs-on || 'ubuntu-latest') }}
@@ -527,16 +728,17 @@ jobs:
   # not build the release variant on a push to a branch that is released from,
   # because this workflow does, signed. The check of the calling job
   # `qa` is "qa / built". It succeeds when the build passed on either runner,
-  # whatever the publish job does afterwards: a commit whose APK was not
-  # published (a newer build was there first, or its publish job was replaced
-  # by a later one) was still built.
+  # whatever happens to the run afterwards: a commit whose APK was not
+  # published (its checks failed, or the run was cancelled for a later commit
+  # while it waited for them) was still built.
   #
   # Only the build of a push carries that name. A manual run builds what its
   # inputs say (a label, a version, another flavor through gradle-args), and
   # its result must neither stand in for the build of the push nor hide it:
   # the newest check run of a name is the one a release reads. always(): a
   # plan that failed and a run that was cancelled end here in a failure, not
-  # in a skipped job.
+  # in a skipped job. That is the end of a run that a later push cancelled
+  # while it was building: the check fails, and says what to do about it.
   built:
     name: ${{ github.event_name == 'push' && 'built' || 'built (manual run)' }}
     needs: [plan, primary, fallback]
@@ -557,6 +759,10 @@ jobs:
             where="the runner that was picked"
           elif [[ "$FALLBACK" == success ]]; then
             where="the GitHub-hosted runner, after the self-hosted build did not pass for a reason outside the code"
+          elif [[ "$PLAN $PRIMARY $FALLBACK" != *failure* && "$PLAN $PRIMARY $FALLBACK" == *cancelled* ]]; then
+            # Nothing failed: the run was stopped. The usual reason is the run of a later commit.
+            echo "::error title=The commit was not built::${SHA:0:7}: plan ${PLAN:-none}, build ${PRIMARY:-none}, build on the GitHub-hosted runner ${FALLBACK:-none}. The run was cancelled before a build of the commit passed: by the run of a later commit of the branch (only the newest commit is built to the end), by a person, or by the timeout of the build. A release of this commit requires this check; to release this commit, run this run again."
+            exit 1
           else
             echo "::error title=The commit was not built::${SHA:0:7}: plan ${PLAN:-none}, build ${PRIMARY:-none}, build on the GitHub-hosted runner ${FALLBACK:-none}. A release of this commit requires this check; run the jobs that failed again once the reason is gone."
             exit 1
@@ -569,17 +775,12 @@ jobs:
   # waits for them.
   #
   # The wait is a job of its own, in no concurrency group. `publish` below
-  # takes its turn per pre-release, and a wait inside that turn would hold up
-  # every build behind it: a commit whose pull request check was replaced
-  # while it waited never gets the check, and its job would keep the build of
-  # the next commit from being published for the whole of
-  # checks-timeout-minutes. Here each commit waits on its own.
-  #
-  # And it stops waiting when the pre-release is past the commit: the build of
-  # a later commit was published meanwhile, so this one would not be published
-  # whatever its checks say. The job then succeeds with `superseded`, which
-  # keeps `publish` from starting. That is the usual end of the commit whose
-  # check never comes.
+  # takes its turn per pre-release, and a job that has that turn is not
+  # cancelled for a later commit; a job that only waits is. That is the end of
+  # the commit whose check never comes (its pull request check was replaced by
+  # the check of the next push): the run of the next push cancels this run
+  # while it waits here. Without a next push the job fails after
+  # checks-timeout-minutes.
   checks:
     needs: [plan, primary, fallback]
     if: ${{ !cancelled() && (needs.primary.result == 'success' || needs.fallback.result == 'success') }}
@@ -590,81 +791,16 @@ jobs:
       contents: read
       checks: read
       actions: write
-    outputs:
-      # 'true' or empty, never a name: the runner drops an output that
-      # contains the value of a secret.
-      superseded: ${{ steps.checks.outputs.superseded }}
     steps:
-      # The names of the build, put together from the plan's outputs and the
-      # inputs the way release-version does it (android-ci's tests compare the
-      # two). An output that arrives empty was dropped by the runner because
-      # it held the value of a secret; the job says so instead of going on
-      # with half a name. `publish` has the same step: a name does not cross
-      # from one job to another.
-      - name: Name the build
-        id: names
-        env:
-          SHA: ${{ needs.plan.outputs.sha }}
-          MAJOR: ${{ needs.plan.outputs.major }}
-          VERSION: ${{ needs.plan.outputs.version }}
-          NUMBER: ${{ needs.plan.outputs.number }}
-          VERSION_CODE: ${{ needs.plan.outputs.version-code }}
-          SOURCE_BRANCH: ${{ inputs.source-branch || github.event.repository.default_branch }}
-          LABEL: ${{ inputs.label }}
-          VERSION_GIVEN: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          missing=""
-          for name in SHA VERSION NUMBER VERSION_CODE; do
-            if [[ -z "${!name}" ]]; then
-              missing="${missing:+$missing, }$name"
-            fi
-          done
-          if [[ -n "$missing" ]]; then
-            echo "::error title=The plan is incomplete::Empty: $missing. The plan job passed, so the runner dropped the output: it does that to an output that contains the value of a secret. Look for a secret whose value is a short word or number."
-            exit 1
-          fi
-          if [[ -n "$MAJOR" ]]; then
-            branch="release/$MAJOR.x"
-          else
-            branch="$SOURCE_BRANCH"
-          fi
-          line="${branch//\//-}"
-          if [[ -n "$LABEL" ]]; then
-            kind=label
-            apart="$LABEL"
-            version_name="$VERSION-$LABEL.$NUMBER"
-          else
-            kind=qa
-            # A build of a version that was given is kept apart under that version.
-            apart="${VERSION_GIVEN:+$VERSION}"
-            version_name="$VERSION-qa.$NUMBER"
-          fi
-          tag="qa-$line${apart:+-$apart}"
-          {
-            echo "branch=$branch"
-            echo "line=$line"
-            echo "kind=$kind"
-            echo "apart=$apart"
-            echo "version-name=$version_name"
-            echo "tag=$tag"
-          } >> "$GITHUB_OUTPUT"
-          echo "$kind build $version_name ($VERSION_CODE) of $branch, published as $tag."
-
       # A check that failed or was cancelled ends the wait at once, and one
       # that is still missing or running after checks-timeout-minutes fails
       # the job. Nothing is published then, and the build's artifact is
       # deleted below. A request that fails while the step waits (a server
       # error, a timeout) is made again; it is not the checks' answer.
       #
-      # Before each wait the step asks whether ROLLING_TAG, the tag of the
-      # pre-release, is at a later commit that contains this one. Then it
-      # stops with the output `superseded` and without an error. A question
-      # that cannot be answered is not a yes: the step goes on waiting.
-      #
       # The script is the one android-version-bump.yml and android-release.yml
-      # decide a release with, which neither wait nor name a tag.
-      # android-ci's tests fail when the copies differ.
+      # decide a release with, which do not wait. android-ci's tests fail when
+      # the copies differ.
       #
       # python3 -I: the script comes from standard input, and without -I
       # Python would look for the modules it imports in the work folder first.
@@ -675,7 +811,6 @@ jobs:
           TARGET_SHA: ${{ needs.plan.outputs.sha }}
           REQUIRED_CHECKS: ${{ inputs.required-checks }}
           CHECKS_WAIT_MINUTES: ${{ inputs.checks-timeout-minutes }}
-          ROLLING_TAG: ${{ steps.names.outputs.tag }}
         run: |
           set -euo pipefail
           python3 -I - <<'CHECKS'
@@ -700,10 +835,6 @@ jobs:
           except ValueError:
               sys.exit("::error::The time to wait for the checks is not a number.")
           deadline = time.monotonic() + wait_minutes * 60
-          # And only android-qa.yml names a tag: the one of the pre-release its build is published as. A
-          # build that pre-release is already past is not published whatever its checks say, so the step
-          # does not wait for them.
-          rolling_tag = os.environ.get("ROLLING_TAG", "").strip()
 
 
           class Unreadable(Exception):
@@ -744,26 +875,6 @@ jobs:
               return [run for run in runs if isinstance(run, dict) and run.get("name") == name]
 
 
-          def commits_past():
-              """How many commits the rolling tag is past this one: 0 when it is not, or when that cannot be told.
-
-              "ahead" is GitHub's word for a head (the tag) that contains the base (this commit) and more.
-              A tag that does not exist yet, a tag on another history and a request that failed are no
-              reason to stop waiting.
-              """
-              if not rolling_tag:
-                  return 0
-              try:
-                  document = read(f"compare/{sha}...{urllib.parse.quote(rolling_tag, safe='')}?per_page=1")
-              except Unreadable:
-                  return 0
-              if not isinstance(document, dict) or document.get("status") != "ahead":
-                  return 0
-              ahead = document.get("ahead_by")
-              return ahead if isinstance(ahead, int) and ahead > 0 else 0
-
-
-          past = 0
           while True:
               rows = []
               refused = []
@@ -797,15 +908,12 @@ jobs:
               # A check that finished without success is final: waiting for the others changes nothing.
               if not unfinished or len(refused) > len(unfinished):
                   break
-              # Nor is anything waited for on behalf of a build that would not be published.
-              past = commits_past()
               remaining = deadline - time.monotonic()
-              if past or remaining <= 0:
+              if remaining <= 0:
                   break
               print(f"Waiting for {', '.join(unfinished)} ({'; '.join(refused)}).", flush=True)
               time.sleep(min(poll_seconds, remaining))
 
-          newer = f"{rolling_tag} is {past} commit{'' if past == 1 else 's'} past {sha[:7]}"
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write("#### Checks on the commit\n\n")
               if not rows:
@@ -815,22 +923,11 @@ jobs:
                   for name, state, url in rows:
                       summary.write(f"| {name} | {f'[{state}]({url})' if url else state} |\n")
                   summary.write("\n")
-              if past:
-                  summary.write(f"{newer}: a newer build is published. This build is not, and its checks are not waited for.\n\n")
 
           if not required:
               print("::notice::No check is required: required-checks is empty.")
           for name, state, _ in rows:
               print(f"{name}: {state}")
-          if past:
-              # Neither the checks' answer nor a failure: every pushed commit is built, and the build of
-              # a later one was published first. The output keeps the job that publishes from starting.
-              if os.environ.get("GITHUB_OUTPUT"):
-                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-                      output.write("superseded=true\n")
-              print(f"::notice title=A newer build is published::{newer}. This build is not published, so its "
-                    f"checks are not waited for ({'; '.join(refused)}).")
-              sys.exit(0)
           if refused:
               # The checks answered, and the answer is no. A step that could not read them never gets
               # here, so the output tells the two apart for the steps that follow.
@@ -844,13 +941,14 @@ jobs:
               sys.exit(1)
           CHECKS
 
-      # The APK of a commit that did not pass is kept nowhere, and neither is
-      # one that a newer build has overtaken: `publish` does not start for
-      # either. After any other failure of this job, checks that could not be
-      # read included, the artifact stays for the day GitHub keeps it, so the
-      # job can be run again. The script is the one `publish` ends with.
+      # The APK of a commit that did not pass is kept nowhere: `publish` does
+      # not start for it. After any other failure of this job, checks that
+      # could not be read included, the artifact stays for the day GitHub
+      # keeps it, so the job can be run again. (When the run is cancelled for
+      # a later commit, that commit's run deletes the artifact.) The script is
+      # the one `publish` ends with.
       - name: Delete the build artifact
-        if: ${{ always() && (steps.checks.outputs.refused == 'true' || steps.checks.outputs.superseded == 'true') }}
+        if: ${{ always() && steps.checks.outputs.refused == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -876,23 +974,35 @@ jobs:
   #
   # One publish job at a time per pre-release, and none is cancelled half way:
   # two builds that finish together would otherwise each delete the APK of the
-  # other. Nothing in the job waits for anything but its own uploads, so a
-  # turn is short. GitHub keeps one waiting job per group, the one that
-  # arrived last, and the step below does not publish a commit that the
-  # pre-release is already past.
+  # other, and a job that is stopped between moving the tag and replacing the
+  # APKs leaves the pre-release half replaced. So the group does not cancel,
+  # and the run of a later commit cancels no run whose publish job has
+  # started. Nothing in the job waits for anything but its own uploads, so a
+  # turn is short, and the step below does not publish a commit that the
+  # pre-release is already past (a run of an earlier commit that was started
+  # again).
+  #
+  # The group is the pre-release only for a job that will publish. GitHub
+  # keeps one waiting job per group, the one that arrived last, and a job that
+  # `if` is about to skip must not be the one that replaces it: such a job
+  # gets a group of its own run.
   publish:
     needs: [plan, primary, fallback, checks]
-    if: ${{ !cancelled() && needs.checks.result == 'success' && needs.checks.outputs.superseded != 'true' }}
+    if: ${{ !cancelled() && needs.checks.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
-      group: android-qa-publish-${{ needs.plan.outputs.major || 'source' }}-${{ inputs.label || (inputs.version != '' && needs.plan.outputs.version) || 'rolling' }}
+      group: ${{ needs.checks.result == 'success' && format('android-qa-publish-{0}-{1}', needs.plan.outputs.major || 'source', inputs.label || (inputs.version != '' && needs.plan.outputs.version) || 'rolling') || format('android-qa-no-publish-{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: false
     permissions:
       contents: write
       actions: write
     steps:
-      # As in `checks`, word for word.
+      # The names of the build, put together from the plan's outputs and the
+      # inputs the way release-version does it (android-ci's tests compare the
+      # two). An output that arrives empty was dropped by the runner because
+      # it held the value of a secret; the job says so instead of going on
+      # with half a name.
       - name: Name the build
         id: names
         env:
@@ -1041,10 +1151,10 @@ jobs:
           fi
           url="$GITHUB_SERVER_URL/$GH_REPO/releases/tag/$TAG"
 
-          # The pre-release is past this commit: a build that finished after
-          # the build of a later commit, or a run that was started again. The
-          # commit was built, which is what its check says; its APK is not
-          # what the line offers.
+          # The pre-release is past this commit: a run that was started again
+          # after the build of a later commit was published, or one whose
+          # cancelling did not work. The commit was built, which is what its
+          # check says; its APK is not what the line offers.
           if [[ "$STALE" == true ]]; then
             echo "::notice title=A newer build is published::$TAG is at ${SINCE:0:7}, a later commit that contains ${SHA:0:7}. This build is not published: an older build does not replace a newer one."
             {
@@ -1328,7 +1438,8 @@ jobs:
       # is deleted once the step above is done with it: the APK is published,
       # or a newer build is. After a failure it stays, so this job can be run
       # again; GitHub removes it after a day. (`checks` deletes it for a
-      # commit that this job never starts for.)
+      # commit whose checks failed, and the run of a later commit for a run it
+      # cancels: this job starts for neither.)
       - name: Delete the build artifact
         if: ${{ always() && steps.publish.outcome == 'success' }}
         env:

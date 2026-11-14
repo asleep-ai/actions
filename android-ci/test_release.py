@@ -8,11 +8,14 @@ secrets, and the two calls of the build workflow.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import subprocess
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
@@ -645,6 +648,33 @@ def test_the_work_folder_is_emptied_before_checkout_and_after_the_build_whatever
     assert "if" not in step(build, "Empty the work folder")
 
 
+def test_a_build_that_is_cancelled_leaves_no_key_and_no_home_taken(build):
+    # A QA build is cancelled whenever a push follows closely. The runner stops the step that runs
+    # and then runs the steps that say always(), in order: the keystore and local.properties are
+    # deleted, the work folder is emptied, the QA Gradle home is seen to, the verdict is reported.
+    last = build["steps"][-4:]
+    assert [item["name"] for item in last] == [
+        "Delete the keystore and local.properties", "Empty the work folder again", "Tidy or discard the QA Gradle home",
+        "Report the verdict",
+    ]
+    for item in last:
+        assert item["if"].startswith("${{ always()"), item["name"]
+        assert "success()" not in item["if"] and "cancelled()" not in item["if"], item["name"]
+    # The keystore is deleted by the path the step that decoded it gave, and is in the job's temp
+    # directory, like the prepared values: not in the work folder and not in a Gradle user home.
+    cleanup = last[0]["with"]
+    assert cleanup["keystore-file"] == "${{ steps.keystore.outputs.keystore-file }}"
+    assert "${{ runner.temp }}/android-release.properties" in cleanup["paths"].splitlines()
+    # And when the runner stops the job so that no step runs at all, which no condition can help:
+    # the next build that signs on that runner empties the work folder before any other step, the
+    # home is taken over by the next build that asks GitHub, and nothing was published, because
+    # this job publishes nothing and moves no tag.
+    assert build["steps"][0]["name"] == "Empty the work folder" and "if" not in build["steps"][0]
+    assert "over \"$holder\" \"$holder_runner\"" in step_by_id(build, "gradle-home")["run"]
+    text = json.dumps(build)
+    assert "gh release" not in text and "git/refs" not in text and "contents: write" not in (WORKFLOWS / BUILD).read_text()
+
+
 def test_the_checkout_is_the_tag_and_keeps_no_token(build, entry):
     checkout = step_by_id(build, "checkout")["with"]
     assert checkout == {
@@ -693,6 +723,9 @@ QA_HOME = f"{QA_BASE}/home"
 # The file that names the build that has the home, and the one that says a build finished in it.
 QA_LOCK = f"{QA_BASE}/in-use"
 QA_MARK = f"{QA_BASE}/intact"
+# When the step after the build runs: for a build that took the home (the step that chose it says
+# under which name), unless that step gave the home back itself and went on cold.
+TIDY_IF = "${{ always() && steps.gradle-home.outputs.token != '' && steps.gradle-home.outputs.warm != 'false' }}"
 
 
 def choose_home(build, tmp_path, **overrides):
@@ -731,6 +764,7 @@ def finish_home(build, tmp_path, outcome: str, outputs: dict):
         "QA_ROOT": outputs.get("root", ""),
         "QA_HOME": outputs.get("home", ""),
         "QA_TOKEN": outputs.get("token", ""),
+        "QA_READY": outputs.get("warm", ""),
         "BUILD_OUTCOME": outcome,
         "GITHUB_RUN_ID": "77",
         "GITHUB_RUN_ATTEMPT": "1",
@@ -934,6 +968,8 @@ def test_no_caller_says_which_run_may_use_the_qa_home(build, tmp_path):
         "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
         "REPOSITORY": "${{ github.repository }}",
         "BUILD_TIMEOUT_MINUTES": "${{ inputs.build-timeout-minutes }}",
+        # To ask GitHub whether the job that has the home is over, which can only free the home.
+        "TOKEN": "${{ github.token }}",
     }
     assert "if" not in chosen
     # The inputs it reads can only make a build cold, or say how long the job may run.
@@ -1021,7 +1057,10 @@ def test_a_qa_home_that_cannot_be_cleared_of_configuration_is_not_built_in(build
     try:
         result, cold, outputs = choose_home(build, tmp_path)
         assert result.returncode == 0, result.stdout + result.stderr
-        assert cold == tmp_path / "temp" / "gradle-user-home" and outputs == {"warm": "false"}
+        # The step had taken the home and says so, and then that the build is cold: the step after
+        # the build has nothing to do, because this one gave the home back itself.
+        assert cold == tmp_path / "temp" / "gradle-user-home" and outputs["warm"] == "false"
+        assert set(outputs) == {"root", "home", "token", "warm"}
         leftover, warning = [line for line in result.stdout.splitlines() if line.startswith("::")]
         assert leftover.startswith("::warning title=QA Gradle home not deleted completely::")
         assert warning == "::warning title=QA Gradle home not used::The QA home could not be prepared; the reason is in the lines above. The build is cold."
@@ -1121,7 +1160,16 @@ def test_what_an_interrupted_discard_left_is_deleted_by_the_next_build(build, tm
     assert (home / CACHES[0]).exists() and "::" not in result.stdout
 
 
-@pytest.mark.parametrize("linked", ["home", "caches", "wrapper", "init.d", "caches/modules-2", "wrapper/dists", "jdks/temurin-17"])
+@pytest.mark.parametrize(
+    "linked",
+    [
+        "home", "caches", "wrapper", "init.d", "caches/modules-2", "wrapper/dists", "jdks/temurin-17",
+        # Further down, where the review found the deleting to follow a link into the other home
+        # (the init.d and the gradle.properties of a distribution) and the build to read its jars.
+        "wrapper/dists/gradle-8.9-bin", "wrapper/dists/gradle-8.9-bin/abc", "wrapper/dists/gradle-8.9-bin/abc/gradle-8.9",
+        "caches/modules-2/files-2.1",
+    ],
+)
 def test_a_link_to_another_gradle_user_home_is_not_followed(build, tmp_path, linked):
     # The home the pull request builds share, with what a pull request's build may have put there.
     shared = tmp_path / "host" / ".gradle"
@@ -1167,13 +1215,16 @@ def test_a_linked_directory_above_the_qa_home_is_not_used(build, tmp_path, linke
 
 def test_one_build_at_a_time_has_the_qa_home(build, tmp_path):
     host = tmp_path / "host"
-    result, home, first = choose_home(build, tmp_path, GITHUB_RUN_ID="77")
+    result, home, first = choose_home(build, tmp_path, GITHUB_RUN_ID="77", RUNNER_NAME="tr-r5")
     assert result.returncode == 0 and first["warm"] == "true"
     fill(home, *CACHES, "daemon/8.9/daemon-1.out.log")
     held = (host / QA_LOCK).read_text()
-    # The time by which the job of the build is over: its timeout, a minute for a fraction, and ten more.
-    token, expires = held.split()
+    # The build, and the time by which its job is over: its timeout, a minute for a fraction, and
+    # ten more. The second line is the runner the job is on.
+    named, runner = held.splitlines()
+    token, expires = named.split()
     assert token == first["token"] and 0 <= 60 * 61 + 600 - (int(expires) - int(time.time())) <= 60
+    assert runner == "tr-r5"
 
     # A build that starts on another runner of the host meanwhile is cold. It reads nothing of the
     # home, deletes nothing in it and does not get to discard it.
@@ -1181,9 +1232,12 @@ def test_one_build_at_a_time_has_the_qa_home(build, tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert other == tmp_path / "temp" / "gradle-user-home" and second == {"warm": "false"}
     (notice,) = [line for line in result.stdout.splitlines() if line.startswith("::")]
+    # Which run has it, and until when at the latest: the time in the file, as a time of day.
+    until = time.strftime("%H:%M UTC", time.gmtime(int(expires)))
     assert notice == (
         "::notice title=QA Gradle home in use::Another QA build of acme/app has the QA home (run 77), "
-        "and one build at a time uses it. The build is cold."
+        f"and one build at a time uses it. The build is cold. It is that build's until {until} at the latest, "
+        "and sooner when its job ends."
     )
     assert "(cold: the QA home is in use)" in result.stdout
     assert files(home) == sorted([*CACHES, "daemon/8.9/daemon-1.out.log"]) and (host / QA_LOCK).read_text() == held
@@ -1191,8 +1245,10 @@ def test_one_build_at_a_time_has_the_qa_home(build, tmp_path):
     result, _, second = choose_home(build, tmp_path, GITHUB_RUN_ID="78", GRADLE_HOME="reset")
     assert second == {"warm": "false"} and "The home was not emptied: start the run again when that build has ended." in result.stdout
     assert files(home) == sorted([*CACHES, "daemon/8.9/daemon-1.out.log"]) and (host / QA_LOCK).read_text() == held
-    # The step after the build is not run for a build that did not get the home.
-    assert step(build, "Tidy or discard the QA Gradle home")["if"] == "${{ always() && steps.gradle-home.outputs.warm == 'true' }}"
+    # The step after the build is not run for a build that did not get the home: it took none
+    # (no token), and the step that chose says that the build is cold.
+    assert step(build, "Tidy or discard the QA Gradle home")["if"] == TIDY_IF
+    assert "token" not in second
 
     # The first build gives the home back, and the build after it has it.
     assert finish_home(build, tmp_path, "success", first).returncode == 0
@@ -1258,6 +1314,287 @@ def test_a_qa_home_that_a_dead_job_never_gave_back_is_taken_over_and_discarded(b
     assert "The QA home is new: this build fills it." in result.stdout
     assert sorted(path.name for path in home.parent.iterdir()) == ["home", "in-use"]
     assert (host / QA_LOCK).read_text().split()[0] == outputs["token"]
+
+
+@contextlib.contextmanager
+def jobs_api():
+    """A local GitHub API that lists the jobs of a run attempt: `jobs` maps (run, attempt) to them.
+
+    `total` is the total_count of the answer when it is not the number of jobs listed, `body` the
+    whole answer when it is not a list of jobs at all, `status` the status of every answer.
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            server.requests.append((self.path, self.headers.get("Authorization")))
+            asked = re.fullmatch(r"/repos/acme/app/actions/runs/(\d+)/attempts/(\d+)/jobs\?per_page=100", self.path)
+            jobs = server.jobs.get((int(asked[1]), int(asked[2]))) if asked else None
+            if server.status != 200 or (jobs is None and server.body is None):
+                self.send_response(server.status if server.status != 200 else 404)
+                self.end_headers()
+                self.wfile.write(b'{"message": "Not Found"}')
+                return
+            body = server.body if server.body is not None else {"total_count": len(jobs) if server.total is None else server.total, "jobs": jobs}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(body).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.jobs, server.requests, server.status, server.total, server.body = {}, [], 200, None, None
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        thread.join()
+        # Closed, so that a request made afterwards is refused at once instead of timing out.
+        server.server_close()
+
+
+def job_on(runner: str, status: str = "completed", conclusion: str | None = "success", name: str = "qa / primary / build") -> dict:
+    return {"name": name, "runner_name": runner, "status": status, "conclusion": conclusion if status == "completed" else None}
+
+
+# sleephub-android on 2026-11-14. Run 43564408430 had the QA home on the runner tr-r5 when its
+# Gradle step was stopped after 46 seconds ("The operation was canceled"), and no step of the job
+# ran after that, the ones with always() included: the home was never given back. The run went on,
+# with a second build on a GitHub-hosted runner. Run 43566745095 started on tr-r1 meanwhile.
+STOPPED = 43564408430
+NEXT = 43566745095
+
+
+def stopped_build(tmp_path: Path, minutes_left: int = 55) -> Path:
+    """The QA home as the stopped job left it: half used, named by its build, and no `intact`."""
+    host = tmp_path / "host"
+    home = host / QA_HOME
+    fill(home, *CACHES, "caches/8.9/transforms/half-written/metadata.bin", "daemon/8.9/daemon-1.out.log")
+    (host / QA_LOCK).write_text(f"{STOPPED}-1-4242-7 {int(time.time()) + minutes_left * 60}\ntr-r5\n")
+    return home
+
+
+def next_build(build, tmp_path, api, **overrides):
+    env = {
+        "GITHUB_RUN_ID": str(NEXT), "RUNNER_NAME": "tr-r1", "TOKEN": "job-token",
+        "GITHUB_API_URL": f"http://127.0.0.1:{api.server_port}", **overrides,
+    }
+    return choose_home(build, tmp_path, **env)
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled"])
+def test_a_home_that_a_stopped_job_never_gave_back_is_taken_over_once_github_says_the_job_is_over(build, tmp_path, conclusion):
+    # The next build does not wait for the time the stopped job had, which was an hour and more:
+    # it asks GitHub for the jobs of that run attempt, and the one on tr-r5 is completed. That the
+    # run itself is still going, with its second build, does not keep the home taken.
+    host = tmp_path / "host"
+    home = stopped_build(tmp_path)
+    with jobs_api() as api:
+        api.jobs[(STOPPED, 1)] = [
+            job_on("GitHub Actions 12", name="qa / plan"),
+            job_on("tr-r5", conclusion=conclusion),
+            job_on("GitHub Actions 13", status="in_progress", name="qa / fallback / build"),
+        ]
+        result, again, outputs = next_build(build, tmp_path, api)
+        assert api.requests == [(f"/repos/acme/app/actions/runs/{STOPPED}/attempts/1/jobs?per_page=100", "Bearer job-token")]
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert again == home and outputs["warm"] == "true" and outputs["token"].startswith(f"{NEXT}-1-")
+    assert f"GitHub says the job is over, as {conclusion} (run {STOPPED}, attempt 1, runner tr-r5)." in result.stdout
+    assert f"Taking the QA home over from the build of run {STOPPED}, which did not give it back." in result.stdout
+    # What the stopped build left half written is not built in: the home is new, and says why.
+    assert home.is_dir() and list(home.iterdir()) == []
+    (warning,) = [line for line in result.stdout.splitlines() if line.startswith("::")]
+    assert warning.startswith(
+        f"::warning title=QA Gradle home discarded::The build that had the QA home before (run {STOPPED}) did not finish in it"
+    )
+    # It is this build's now, under its own name and runner, and the builds after it find a home.
+    named, runner = (host / QA_LOCK).read_text().splitlines()
+    assert named.split()[0] == outputs["token"] and runner == "tr-r1"
+    assert sorted(path.name for path in home.parent.iterdir()) == ["home", "in-use"]
+    fill(home, *CACHES)
+    assert finish_home(build, tmp_path, "success", outputs).returncode == 0
+    result, again, outputs = choose_home(build, tmp_path, GITHUB_RUN_ID="43566800000")
+    assert outputs["warm"] == "true" and "The QA home exists" in result.stdout and "::" not in result.stdout
+
+
+def test_the_attempt_that_took_the_home_is_the_one_github_is_asked_about(build, tmp_path):
+    # The run of the stopped job was started again, and its new attempt is building on the same
+    # runner, in a cold home because the old attempt still holds this one. The old attempt is over.
+    home = stopped_build(tmp_path)
+    with jobs_api() as api:
+        api.jobs[(STOPPED, 1)] = [job_on("tr-r5", conclusion="failure")]
+        api.jobs[(STOPPED, 2)] = [job_on("tr-r5", status="in_progress")]
+        result, again, outputs = next_build(build, tmp_path, api)
+    assert again == home and outputs["warm"] == "true"
+
+
+@pytest.mark.parametrize(
+    ("jobs", "answer", "said"),
+    [
+        # The job runs, or waits: the build has the home.
+        ([job_on("tr-r5", status="in_progress")], {}, "GitHub says the job is in_progress"),
+        ([job_on("tr-r5", status="queued")], {}, "GitHub says the job is queued"),
+        # Another job of the attempt is on that runner now. Which of the two took the home is not
+        # told apart: while one of them runs, the home is taken.
+        ([job_on("tr-r5", conclusion="failure"), job_on("tr-r5", status="in_progress", name="qa / other")], {}, "GitHub says the job is in_progress"),
+        # No job of the attempt names the runner: nothing says that the build is over.
+        ([job_on("tr-r1"), job_on("GitHub Actions 12")], {}, "GitHub lists no job of the run on that runner"),
+        ([{"name": "qa / primary / build", "status": "completed"}], {}, "GitHub lists no job of the run on that runner"),
+        ([], {}, "GitHub lists no job of the run on that runner"),
+        # More jobs than the answer lists: the one that has the home may be among the rest.
+        ([job_on("tr-r5")], {"total": 101}, "GitHub did not list every job of the run"),
+        # Not an answer.
+        ([job_on("tr-r5")], {"body": {"message": "no jobs here"}}, "GitHub did not list every job of the run"),
+        ([job_on("tr-r5")], {"body": ["a list"]}, "GitHub did not list every job of the run"),
+        # A token that may not read the runs, a run that is gone, a server error.
+        ([job_on("tr-r5")], {"status": 403}, "GitHub did not say whether the job is over (run 43564408430, attempt 1, runner tr-r5): HTTP 403."),
+        ([job_on("tr-r5")], {"status": 404}, "GitHub did not say whether the job is over (run 43564408430, attempt 1, runner tr-r5): HTTP 404."),
+        ([job_on("tr-r5")], {"status": 502}, "GitHub did not say whether the job is over (run 43564408430, attempt 1, runner tr-r5): HTTP 502."),
+    ],
+)
+def test_only_a_job_that_github_says_is_over_gives_up_the_home_before_its_time(build, tmp_path, jobs, answer, said):
+    # Anything but "every job of that attempt on that runner is completed" is not a yes. The home
+    # stays the other build's until the time in its file, as before, and this build is cold.
+    host = tmp_path / "host"
+    home = stopped_build(tmp_path)
+    held, before = (host / QA_LOCK).read_text(), files(home)
+    with jobs_api() as api:
+        api.jobs[(STOPPED, 1)] = jobs
+        for name, value in answer.items():
+            setattr(api, name, value)
+        result, cold, outputs = next_build(build, tmp_path, api)
+        assert len(api.requests) == 1
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert cold == tmp_path / "temp" / "gradle-user-home" and outputs == {"warm": "false"}
+    assert said in result.stdout
+    (notice,) = [line for line in result.stdout.splitlines() if line.startswith("::")]
+    assert notice.startswith(f"::notice title=QA Gradle home in use::Another QA build of acme/app has the QA home (run {STOPPED})")
+    assert (host / QA_LOCK).read_text() == held and files(home) == before
+    # When the time is up, the home is taken over without asking, as it always was.
+    stopped_build(tmp_path, minutes_left=-1)
+    with jobs_api() as api:
+        api.status = 502
+        result, again, outputs = next_build(build, tmp_path, api)
+        assert api.requests == []
+    assert again == home and outputs["warm"] == "true"
+
+
+@pytest.mark.parametrize("without", ["runner", "token", "api"])
+def test_github_is_not_asked_without_a_runner_to_ask_about_or_a_token(build, tmp_path, without):
+    host = tmp_path / "host"
+    home = stopped_build(tmp_path)
+    if without == "runner":
+        # A file that a build of an earlier version of the workflow wrote: one line.
+        (host / QA_LOCK).write_text(f"{STOPPED}-1-4242-7 {int(time.time()) + 900}\n")
+    with jobs_api() as api:
+        api.jobs[(STOPPED, 1)] = [job_on("tr-r5", conclusion="failure"), job_on("", conclusion="failure")]
+        if without != "api":
+            result, cold, outputs = next_build(build, tmp_path, api, **({"TOKEN": ""} if without == "token" else {}))
+            assert api.requests == []
+    if without == "api":
+        # The server is gone. The request fails, and that is not a yes either.
+        result, cold, outputs = next_build(build, tmp_path, api)
+        assert "GitHub could not be asked whether the job is over (run 43564408430, attempt 1, runner tr-r5): " in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs == {"warm": "false"} and "::notice title=QA Gradle home in use::" in result.stdout
+    assert (home / "caches/8.9/transforms/half-written/metadata.bin").exists()
+
+
+def test_the_question_is_asked_with_the_job_token_and_a_script_that_reads_no_module_of_the_checkout(build):
+    chosen = step_by_id(build, "gradle-home")
+    assert chosen["env"]["TOKEN"] == "${{ github.token }}"
+    # The step runs in the checkout of the commit that is built: -I keeps Python from importing
+    # json or urllib from there. The script is handed over as an argument, and reads the run, the
+    # attempt and the runner from the environment, never from its own text.
+    assert 'python3 -I -c "$ask_github"' in chosen["run"]
+    script = chosen["run"].split("ask_github=$(cat <<'OVER'\n", 1)[1].split("\nOVER\n", 1)[0]
+    compile(script, "ask_github", "exec")
+    assert "actions/runs/{run}/attempts/{attempt}/jobs?per_page=100" in script
+    # What is asked about comes from the file next to the home, and is numbers before it is used.
+    assert '[[ ! "$holder" =~ ^[0-9]+-[0-9]+-[0-9]+-[0-9]+$' in chosen["run"]
+    # An answer can only free the home sooner. No answer makes a build wait, fail or share a home.
+    assert 'if (( now <= 10#$held_until )) && ! over "$holder" "$holder_runner"; then\n    return 2\n  fi' in chosen["run"]
+    assert chosen["run"].count('over "$') == 1
+
+
+def write_ln(directory: Path, body: str) -> dict:
+    """An `ln` that does what `body` says, first on the PATH of the step."""
+    directory.mkdir()
+    executable(directory / "ln", "#!/usr/bin/env bash\n" + body)
+    return {"PATH": f"{directory}{os.pathsep}{os.environ['PATH']}"}
+
+
+def test_a_file_that_cannot_be_made_is_not_reported_as_a_file_to_delete(build, tmp_path):
+    # The host cannot make the link (a file system without hard links). There is no `in-use`, so
+    # "delete it on the host" would send someone looking for a file that is not there.
+    host = tmp_path / "host"
+    home = earlier_home(tmp_path, *CACHES)
+    stub = write_ln(tmp_path / "stub", 'echo "ln: failed to create hard link: Operation not permitted" >&2\nexit 1\n')
+    result, cold, outputs = choose_home(build, tmp_path, **stub)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert cold == tmp_path / "temp" / "gradle-user-home" and outputs == {"warm": "false"}
+    (warning,) = [line for line in result.stdout.splitlines() if line.startswith("::")]
+    assert warning == (
+        f"::warning title=QA Gradle home not used::{host / QA_LOCK}, the file that names the build that has the QA home, "
+        "could not be made, and no other build has made it: ln: failed to create hard link: Operation not permitted. "
+        "The build is cold."
+    )
+    assert "Delete it on the host" not in result.stdout
+    assert files(home) == sorted(CACHES) and sorted(path.name for path in home.parent.iterdir()) == ["home", "intact"]
+
+
+def test_a_home_that_another_build_took_between_two_tries_is_that_builds(build, tmp_path):
+    # The file was not there when this build read it (given back a moment before), and another
+    # build made it before this one tried again. Its name is read then: the home is in use, by a
+    # build that runs, and nobody is told to delete its file.
+    host = tmp_path / "host"
+    home = earlier_home(tmp_path, *CACHES)
+    lock, expires = host / QA_LOCK, int(time.time()) + 900
+    stub = write_ln(
+        tmp_path / "stub",
+        f'if [[ -e "{tmp_path}/tried" ]]; then printf \'90-1-4242-7 {expires}\\ntr-r2\\n\' > "{lock}"; fi\n'
+        f'touch "{tmp_path}/tried"\necho "ln: File exists" >&2\nexit 1\n',
+    )
+    result, cold, outputs = choose_home(build, tmp_path, **stub)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs == {"warm": "false"}
+    (notice,) = [line for line in result.stdout.splitlines() if line.startswith("::")]
+    assert notice.startswith("::notice title=QA Gradle home in use::Another QA build of acme/app has the QA home (run 90)")
+    assert lock.read_text() == f"90-1-4242-7 {expires}\ntr-r2\n" and files(home) == sorted(CACHES)
+
+
+def test_a_build_whose_home_was_not_ready_when_it_was_stopped_gives_it_back(build, tmp_path):
+    # The run is cancelled while the step that chose the home deletes an old one, which can take
+    # long. That step had taken the home and had said so, but not yet that the home is ready.
+    host = tmp_path / "host"
+    home = earlier_home(tmp_path, *CACHES)
+    result, again, outputs = choose_home(build, tmp_path)
+    assert outputs["warm"] == "true"
+    stopped = {name: outputs[name] for name in ("root", "home", "token")}
+    result = finish_home(build, tmp_path, "skipped", stopped)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "The step that chose the QA home was stopped before the home was ready, and Gradle did not run in it. The home is given back as it is." in result.stdout
+    assert "::" not in result.stdout
+    # Given back, and nothing in it touched. Its preparing was begun, so it has no `intact`, and
+    # the next build starts with an empty home and can use it at once.
+    assert sorted(path.name for path in home.parent.iterdir()) == ["home"] and files(home) == sorted(CACHES)
+    result, again, later = choose_home(build, tmp_path, GITHUB_RUN_ID="78")
+    assert again == home and later["warm"] == "true" and list(home.iterdir()) == []
+    # The step that chose the home says that it has it before it makes it ready, and the step
+    # after the build runs on that word alone. `warm=false` is what a step says that gave the
+    # home back itself, and `warm=true` comes last.
+    script = step_by_id(build, "gradle-home")["run"]
+    assert script.index('echo "token=$token"') < script.index("if ! prepare; then") < script.index('echo "warm=true" >> "$GITHUB_OUTPUT"')
+    assert script.index("take || state=$?") < script.index('echo "token=$token"')
+    assert step(build, "Tidy or discard the QA Gradle home")["if"] == TIDY_IF
+    # A build that is not the one the file names touches nothing, ready or not.
+    result, again, current = choose_home(build, tmp_path, GITHUB_RUN_ID="79")
+    held = (host / QA_LOCK).read_text()
+    assert finish_home(build, tmp_path, "skipped", stopped).returncode == 0
+    assert (host / QA_LOCK).read_text() == held
 
 
 @pytest.mark.parametrize("gradle_home", ["warm", "reset"])
@@ -1327,8 +1664,7 @@ def test_a_mark_that_no_build_of_the_workflow_made_keeps_the_qa_home_unused(buil
 # --- build: the QA home after the build ----------------------------------------------------
 
 
-@pytest.mark.parametrize("outcome", ["failure", "cancelled"])
-def test_a_qa_home_that_a_failed_gradle_run_used_is_not_used_again(build, tmp_path, outcome):
+def test_a_qa_home_that_a_failed_gradle_run_used_is_not_used_again(build, tmp_path, outcome="failure"):
     other = tmp_path / "host" / "android-qa-gradle" / "acme" / "other" / "home"
     fill(other, *CACHES)
     result, home, outputs = choose_home(build, tmp_path)
@@ -1345,6 +1681,65 @@ def test_a_qa_home_that_a_failed_gradle_run_used_is_not_used_again(build, tmp_pa
     assert (other / CACHES[0]).exists()
     again, chosen, _ = choose_home(build, tmp_path)
     assert again.returncode == 0 and chosen == home and "The QA home is new" in again.stdout
+
+
+def test_after_a_cancelled_gradle_run_the_home_is_discarded_and_stays_taken_until_the_job_is_over(build, tmp_path):
+    # The run of a later commit cancels this one while Gradle runs, which happens with every two
+    # merges in a row; a person cancels it; or the job runs into its timeout. The runner stops the
+    # step, and ends what Gradle started only when the job ends, after this step. Were the home
+    # given back now, the build that took it next would share it with those processes.
+    host = tmp_path / "host"
+    result, home, outputs = choose_home(build, tmp_path, GITHUB_RUN_ID="77", RUNNER_NAME="tr-r5")
+    assert result.returncode == 0, result.stdout + result.stderr
+    fill(home, *CACHES, "caches/8.9/transforms/half-written/metadata.bin", "daemon/8.9/daemon-1.out.log")
+    before = time.time()
+    result = finish_home(build, tmp_path, "cancelled", outputs)
+    assert result.returncode == 0, result.stdout + result.stderr
+    (notice,) = [line for line in result.stdout.splitlines() if line.startswith("::")]
+    assert notice.startswith("::notice title=QA Gradle home discarded::The Gradle run in the QA home ended as cancelled, so the home is not used again")
+    assert notice.endswith(
+        "It stays this build's until the job is over: the next QA build takes it over when GitHub says so, or two minutes from now."
+    )
+    # The home is gone, all of it. What is left is the name of this build, with two minutes to go
+    # instead of the rest of an hour, and the runner as it was.
+    assert [path.name for path in home.parent.iterdir()] == ["in-use"]
+    named, runner = (host / QA_LOCK).read_text().splitlines()
+    token, expires = named.split()
+    assert token == outputs["token"] and runner == "tr-r5"
+    assert 118 <= int(expires) - before <= 122
+
+    # The build of the later commit starts on another runner of the host within those two minutes
+    # and cannot ask GitHub: it is cold, and touches nothing.
+    result, cold, later = choose_home(build, tmp_path, GITHUB_RUN_ID="78", RUNNER_NAME="tr-r1")
+    assert later == {"warm": "false"} and "::notice title=QA Gradle home in use::Another QA build of acme/app has the QA home (run 77)" in result.stdout
+    # After them the home is taken over without a word of warning: nothing went wrong, and there
+    # is no half-written home to discard.
+    (host / QA_LOCK).write_text(f"{token} {int(time.time()) - 1}\ntr-r5\n")
+    result, again, later = choose_home(build, tmp_path, GITHUB_RUN_ID="79", RUNNER_NAME="tr-r1")
+    assert result.returncode == 0 and again == home and later["warm"] == "true"
+    assert "Taking the QA home over from the build of run 77, which did not give it back." in result.stdout
+    assert "The QA home is new: this build fills it." in result.stdout and "::" not in result.stdout
+
+
+def test_a_cancelled_gradle_run_whose_home_cannot_be_moved_away_leaves_it_to_the_next_build(build, tmp_path):
+    host = tmp_path / "host"
+    result, home, outputs = choose_home(build, tmp_path)
+    fill(home, *CACHES)
+    home.parent.chmod(0o500)
+    try:
+        result = finish_home(build, tmp_path, "cancelled", outputs)
+        assert result.returncode == 0, result.stdout + result.stderr
+        (warning,) = [line for line in result.stdout.splitlines() if line.startswith("::")]
+        assert warning.startswith("::warning title=QA Gradle home not discarded::The Gradle run in the QA home ended as cancelled")
+        assert warning.endswith("or after the time this build had. That build discards it.")
+    finally:
+        home.parent.chmod(0o700)
+    # Still this build's, and without `intact`: whoever takes it over discards it.
+    assert home.is_dir() and (host / QA_LOCK).read_text().split()[0] == outputs["token"] and not (host / QA_MARK).exists()
+    (host / QA_LOCK).write_text(f"{outputs['token']} {int(time.time()) - 1}\n")
+    result, again, later = choose_home(build, tmp_path, GITHUB_RUN_ID="79")
+    assert result.returncode == 0 and again == home and later["warm"] == "true" and list(home.iterdir()) == []
+    assert "::warning title=QA Gradle home discarded::The build that had the QA home before (run 77) did not finish in it" in result.stdout
 
 
 @pytest.mark.parametrize("outcome", ["success", "skipped"])
@@ -1399,8 +1794,8 @@ def test_nothing_is_discarded_without_the_outputs_of_the_step_that_chose_the_hom
 def test_the_step_after_the_build_reads_nothing_the_build_could_have_changed(build, tmp_path):
     names = [item.get("name") for item in build["steps"]]
     tidy = step(build, "Tidy or discard the QA Gradle home")
-    # Whatever happened to the build, and only after a build that was given the QA home.
-    assert tidy["if"] == "${{ always() && steps.gradle-home.outputs.warm == 'true' }}"
+    # Whatever happened to the build, and only after a build that took the QA home.
+    assert tidy["if"] == TIDY_IF
     # The paths and the name of the build are what the step that chose the home said before any code
     # of the repository ran, not variables the build could have set for the steps after it:
     # GRADLE_USER_HOME, or HOME, which finish_home() sets to another directory in every test here.
@@ -1408,6 +1803,7 @@ def test_the_step_after_the_build_reads_nothing_the_build_could_have_changed(bui
         "QA_ROOT": "${{ steps.gradle-home.outputs.root }}",
         "QA_HOME": "${{ steps.gradle-home.outputs.home }}",
         "QA_TOKEN": "${{ steps.gradle-home.outputs.token }}",
+        "QA_READY": "${{ steps.gradle-home.outputs.warm }}",
         "BUILD_OUTCOME": "${{ steps.build.outcome }}",
     }
     assert "GRADLE_USER_HOME" not in tidy["run"] and "$HOME" not in tidy["run"] and "${HOME" not in tidy["run"]
@@ -1420,7 +1816,10 @@ def test_the_step_after_the_build_reads_nothing_the_build_could_have_changed(bui
 def test_a_qa_home_that_is_gone_or_became_a_link_is_not_followed(build, tmp_path):
     host = tmp_path / "host"
     shared = host / ".gradle"
-    fill(shared, "caches/shared.jar", "caches/build-cache-1/entry", "init.d/theirs.gradle")
+    fill(
+        shared, "caches/shared.jar", "caches/build-cache-1/entry", "init.d/theirs.gradle", "caches/modules-2/files-2.1/shared.jar",
+        "wrapper/dists/gradle-8.9-bin/abc/gradle-8.9/init.d/theirs.gradle", "wrapper/dists/gradle-8.9-bin/abc/gradle-8.9/gradle.properties",
+    )
     before = files(shared)
     # Deleted on the host during the build.
     result, home, outputs = choose_home(build, tmp_path)
@@ -1429,12 +1828,20 @@ def test_a_qa_home_that_is_gone_or_became_a_link_is_not_followed(build, tmp_path
     assert result.returncode == 0 and "The QA home is gone: it was deleted on the host." in result.stdout
     assert list(home.parent.iterdir()) == []
     # The build put a link where the home was, or inside it. What deletes does not follow it.
-    for linked, outcome in [("", "success"), ("", "failure"), ("caches", "success"), ("wrapper/dists", "success"), ("caches", "cancelled")]:
+    cases = [
+        ("", "success"), ("", "failure"), ("", "cancelled"), ("caches", "success"), ("wrapper/dists", "success"), ("caches", "cancelled"),
+        # As deep as the deleting looks: a distribution, the directory it was unpacked to, and the
+        # downloads. A link there is where another home's init.d or jars would come in.
+        ("wrapper/dists/gradle-8.9-bin", "success"), ("wrapper/dists/gradle-8.9-bin/abc", "success"),
+        ("wrapper/dists/gradle-8.9-bin/abc/gradle-8.9", "success"), ("caches/modules-2/files-2.1", "success"),
+        ("caches/modules-2", "failure"),
+    ]
+    for linked, outcome in cases:
         result, home, outputs = choose_home(build, tmp_path)
         assert result.returncode == 0 and outputs["warm"] == "true", result.stdout + result.stderr
         if linked:
             (home / linked).parent.mkdir(parents=True, exist_ok=True)
-            (home / linked).symlink_to(shared / linked.split("/")[0], target_is_directory=True)
+            (home / linked).symlink_to(shared / linked, target_is_directory=True)
         else:
             home.rmdir()
             home.symlink_to(shared, target_is_directory=True)
@@ -1442,9 +1849,11 @@ def test_a_qa_home_that_is_gone_or_became_a_link_is_not_followed(build, tmp_path
         assert result.returncode == 0, result.stdout + result.stderr
         assert "QA Gradle home discarded::" in result.stdout
         if outcome == "success":
-            assert "is a symbolic link" in result.stdout
+            assert f"{home / linked}".rstrip("/") + " is a symbolic link" in result.stdout
         assert files(shared) == before
-        assert list(home.parent.iterdir()) == []
+        # Nothing of it is left. After a cancelled run the home stays taken for its two minutes.
+        assert [path.name for path in home.parent.iterdir()] == (["in-use"] if outcome == "cancelled" else [])
+        (host / QA_LOCK).unlink(missing_ok=True)
 
 
 def test_a_discard_that_cannot_delete_everything_says_so_and_frees_the_home(build, tmp_path):
@@ -2079,8 +2488,13 @@ def test_the_verdict_covers_every_step_before_the_build(build):
 def test_the_build_job_reads_its_secrets_from_the_environment(build):
     assert build["environment"] == "${{ inputs.environment }}"
     assert build["runs-on"] == "${{ fromJSON(inputs.runs-on) }}"
-    assert load(BUILD)["permissions"] == {"contents": "read", "packages": "read"}
-    assert "permissions" not in build
+    # The job has the permissions of the job that calls the build workflow, which declares none:
+    # for a release, what android-release.yml gives every job. (test_qa.py has why, and what the
+    # QA build gets on top.)
+    assert "permissions" not in load(BUILD) and "permissions" not in build
+    assert load(ENTRY)["permissions"] == {"contents": "read", "packages": "read"}
+    for name in ("primary", "fallback"):
+        assert "permissions" not in load(ENTRY)["jobs"][name]
 
 
 # --- wiring ------------------------------------------------------------------------------------

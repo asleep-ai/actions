@@ -961,11 +961,17 @@ def run_changes(env: Mapping[str, str]) -> None:
     # A versionCode is published once. The number of a label build was taken from these tags when
     # the build was planned, and another build may have been published under it since: the caller
     # asks again here, with the tags as they are when it is about to publish.
+    #
+    # The since tag itself counts unless it names this very commit: the same build published again
+    # is no second build, but two runs of one label on two commits were planned with one number,
+    # and the one that publishes second finds its own tag holding the code for another commit.
     taken_by = ""
     given_code = env.get("VERSION_CODE", "").strip()
     if given_code:
         code = whole_number(given_code, "version-code")
-        taken_by = next((tag for tag, held in rolling_builds() if held == code and tag != since_tag), "")
+        taken_by = next(
+            (tag for tag, held in rolling_builds() if held == code and (tag != since_tag or not changes.unchanged)), ""
+        )
         if taken_by:
             print(f"{taken_by} holds a build of the versionCode {code}.")
     if changes.stale:

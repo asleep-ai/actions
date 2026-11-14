@@ -138,9 +138,13 @@ on:
           way.
         value: ${{ jobs.build.outputs.verdict }}
 
-permissions:
-  contents: read
-  packages: read
+# No permissions are declared here: the build job has those of the job that
+# calls this file, and a called workflow can only be given less than its
+# caller has, never more. android-release.yml gives contents: read and
+# packages: read. android-qa.yml gives its first build actions: read on top,
+# for the one question the step that chooses the Gradle user home asks
+# GitHub; a declaration here would have to name it for the release too, whose
+# calling files do not grant it. android-ci's tests pin what the two give.
 
 defaults:
   run:
@@ -394,14 +398,23 @@ jobs:
       # builds that branch cold.
       #
       # One build at a time. The file `in-use` next to the home names the
-      # build that has it. It is made in one step (a hard link, which fails
-      # when the name exists), so two builds never both get the home, and a
-      # build that finds it taken is cold. The build deletes the file at its
-      # end. A file that is still there after the time its build had (the
-      # timeout of the job and ten minutes) was left by a job that died, and
-      # the next build takes the home over. So nothing is deleted or
-      # discarded under a build that runs, and no build reads what another
-      # one is writing.
+      # build that has it: its run, the attempt of the run and the runner it
+      # is on. It is made in one step (a hard link, which fails when the name
+      # exists), so two builds never both get the home, and a build that
+      # finds it taken is cold. The build deletes the file at its end.
+      #
+      # A job that dies does not get to its end, and neither does one that
+      # its runner stops: no step of it runs any more, the ones with always()
+      # included. So a build that finds the home taken asks GitHub for the
+      # jobs of the run attempt the file names. When every job of it that ran
+      # on the named runner is completed, the build that took the home is
+      # over, and this one takes the home over. That needs a token that may
+      # read the runs of the repository (actions: read); android-qa.yml gives
+      # it. Whenever GitHub cannot be asked or does not say that the job is
+      # over, the file counts until the time written in it: the timeout of
+      # the job and ten minutes, or two minutes after a Gradle run that was
+      # cancelled. So nothing is deleted or discarded under a build that
+      # runs, and no build reads what another one is writing.
       #
       # Only a home that a build finished in is used again. The file `intact`
       # next to the home says so: the build takes it away before it uses the
@@ -422,9 +435,13 @@ jobs:
       # something looks wrong: whatever the home held, the build starts with
       # no init script and no gradle.properties in it. setup-gradle writes
       # its own init scripts in the next step, and no code of the repository
-      # runs between that step and Gradle. A symbolic link in place of the
-      # home or up to two levels inside it, which is how another home would
-      # get back in, ends in an empty home. So does gradle-home reset.
+      # runs between that step and Gradle. A symbolic link is how another
+      # home would get back in. One in place of the home, up to two levels
+      # inside it, up to two levels below caches or up to three below
+      # wrapper/dists ends in an empty home: that covers every directory the
+      # deleting walks through, so it never deletes in another home, and the
+      # places a whole cache or a Gradle distribution would be linked at. So
+      # does gradle-home reset.
       #
       # That guards against accidents, not against a build that means harm:
       # the jars in caches and wrapper are code the next build runs, and
@@ -445,6 +462,8 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           REPOSITORY: ${{ github.repository }}
           BUILD_TIMEOUT_MINUTES: ${{ inputs.build-timeout-minutes }}
+          # Only to ask whether the job that has the QA home is over.
+          TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cold="$RUNNER_TEMP/gradle-user-home"
@@ -506,11 +525,67 @@ jobs:
           home="$base/home"
           lock="$base/in-use"
           mark="$base/intact"
-          # The name this build takes the home under, and the time by which
-          # its job is over at the latest.
+          # The name this build takes the home under (its run and the attempt
+          # of the run come first), the time by which its job is over at the
+          # latest, and the runner the job is on.
           token="${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}-$$-$RANDOM"
           now=$(date +%s)
           expires=$(( now + (10#$minutes + 1) * 60 + 600 ))
+          runner="${RUNNER_NAME:-}"
+          runner="${runner//[$'\n\r']/ }"
+
+          # What GitHub is asked about the build that has the home: the jobs
+          # of its run attempt, and whether every one of them that ran on its
+          # runner is completed. Exit status 0 is "over". Anything else is
+          # not a yes: a job that is not completed, a runner that no job of
+          # the attempt names, more jobs than one answer lists, a request
+          # that failed or a token that may not ask. One line says which.
+          #
+          # python3 -I: without -I Python would look for the modules it
+          # imports in the work folder first.
+          ask_github=$(cat <<'OVER'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+          run, attempt, runner = os.environ["HOLDER_RUN"], os.environ["HOLDER_ATTEMPT"], os.environ["HOLDER_RUNNER"]
+          asked = f"run {run}, attempt {attempt}, runner {runner}"
+          request = urllib.request.Request(
+              f"{api}/repos/{os.environ['REPOSITORY']}/actions/runs/{run}/attempts/{attempt}/jobs?per_page=100",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ.get('TOKEN', '').strip()}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "asleep-ai-actions-android-ci",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  document = json.load(response)
+          except urllib.error.HTTPError as error:
+              print(f"GitHub did not say whether the job is over ({asked}): HTTP {error.code}.")
+              sys.exit(1)
+          except (OSError, ValueError) as error:
+              print(f"GitHub could not be asked whether the job is over ({asked}): {str(error) or type(error).__name__}.")
+              sys.exit(1)
+          jobs = document.get("jobs") if isinstance(document, dict) else None
+          if not isinstance(jobs, list) or document.get("total_count") != len(jobs):
+              print(f"GitHub did not list every job of the run ({asked}).")
+              sys.exit(1)
+          held = [job for job in jobs if isinstance(job, dict) and job.get("runner_name") == runner]
+          if not held:
+              print(f"GitHub lists no job of the run on that runner ({asked}).")
+              sys.exit(1)
+          running = [job for job in held if job.get("status") != "completed"]
+          if running:
+              print(f"GitHub says the job is {running[0].get('status') or 'not completed'} ({asked}).")
+              sys.exit(1)
+          print(f"GitHub says the job is over, as {', '.join(str(job.get('conclusion')) for job in held)} ({asked}).")
+          OVER
+          )
 
           # A function that is asked "did it work" runs without errexit, so
           # each of these returns at its first failure itself.
@@ -526,26 +601,49 @@ jobs:
             mkdir -p "$base" || return 1
             chmod 700 "$root" || return 1
           }
-          # 0: `in-use` names this build. 2: the name is taken. 1: the file
-          # could not be written.
+          # 0: `in-use` names this build. 2: the name is taken, or the file
+          # could not be made for another reason, which `claim_error` then
+          # holds. 1: the file could not be written. The second line of the
+          # file is the runner; a build of an earlier version of this
+          # workflow reads the first line only.
+          claim_error=""
           claim() {
             local mine="$base/claim-$token"
-            if ! printf '%s %s\n' "$token" "$expires" > "$mine"; then
+            if ! printf '%s %s\n%s\n' "$token" "$expires" "$runner" > "$mine"; then
               return 1
             fi
-            if ln "$mine" "$lock" 2> /dev/null; then
+            if claim_error=$(ln "$mine" "$lock" 2>&1); then
               rm -f "$mine"
               return 0
             fi
             rm -f "$mine"
             return 2
           }
+          # Whether GitHub says that the job of the build $1, on the runner
+          # $2, is over. Not asked without a runner to ask about (a file that
+          # an earlier version of this workflow wrote) or without a token.
+          over() {
+            local run rest answer
+            run="${1%%-*}"
+            rest="${1#*-}"
+            if [[ -z "$2" || -z "${TOKEN:-}" ]]; then
+              return 1
+            fi
+            if answer=$(HOLDER_RUN="$run" HOLDER_ATTEMPT="${rest%%-*}" HOLDER_RUNNER="$2" python3 -I -c "$ask_github" 2>&1); then
+              echo "$answer"
+              return 0
+            fi
+            echo "$answer"
+            return 1
+          }
           # 0: the home is this build's. 2: another build has it. 1: that
           # cannot be told, and `problem` says why. `holder` is the build
-          # whose name was found there.
+          # whose name was found there, and `held_until` the time in its
+          # file.
           holder=""
+          held_until=""
           take() {
-            local held_until="" moved found result=0
+            local seen holder_runner="" moved found result=0
             if [[ -d "$lock" ]]; then
               problem="$lock is a directory, and it is the file that names the build that has the QA home. Delete it on the host."
               return 1
@@ -554,47 +652,69 @@ jobs:
             if [[ "$result" != 2 ]]; then
               return "$result"
             fi
-            { read -r holder held_until < "$lock"; } 2> /dev/null || true
-            if [[ -z "$holder" ]]; then
-              # Given back between the two statements above.
+            seen=$(cat "$lock" 2> /dev/null) || seen=""
+            if [[ -z "$seen" ]]; then
+              # Given back between the two statements above, or never there.
               result=0
               claim || result=$?
               if [[ "$result" != 2 ]]; then
                 return "$result"
               fi
+              # Taken again in between, by a build whose name is read now. Or
+              # there is no file, and what keeps this build from making it is
+              # not that it exists.
+              seen=$(cat "$lock" 2> /dev/null) || seen=""
+              if [[ -z "$seen" && ! -e "$lock" && ! -L "$lock" ]]; then
+                problem="$lock, the file that names the build that has the QA home, could not be made, and no other build has made it: ${claim_error:-the link failed without a message}."
+                return 1
+              fi
             fi
+            { read -r holder held_until; IFS= read -r holder_runner; } <<< "$seen" || true
             if [[ ! "$holder" =~ ^[0-9]+-[0-9]+-[0-9]+-[0-9]+$ || ! "$held_until" =~ ^[0-9]{1,12}$ ]]; then
               holder=""
+              held_until=""
               problem="$lock does not name a build of this workflow. Delete it on the host while no QA build of the repository runs."
               return 1
             fi
-            if (( now <= 10#$held_until )); then
+            if (( now <= 10#$held_until )) && ! over "$holder" "$holder_runner"; then
               return 2
             fi
-            # The job of that build is over, with time to spare, and the file
-            # is still there: the job died or was killed before its last
-            # steps. The file is taken away in one step, so that one build
-            # takes the home over and not two. A build that gets in between
-            # the two statements finds the home without `intact`, as this
-            # one will.
+            # The job of that build is over and the file is still there:
+            # GitHub says so, or the time the job had is up with time to
+            # spare. The job died, or it was stopped before its last steps.
+            # The file is taken away in one step, so that one build takes the
+            # home over and not two. A build that gets in between the two
+            # statements finds the home without `intact`, as this one will.
             moved="$base/stale-$token"
             if ! mv "$lock" "$moved" 2> /dev/null; then
               holder=""
+              held_until=""
               return 2
             fi
             found=$(cat "$moved" 2> /dev/null) || found=""
-            if [[ "$found" != "$holder $held_until" ]]; then
+            if [[ "$found" != "$seen" ]]; then
               # Not the file that was read: another build took the home over
               # in between, and this is its name. Back it goes.
               ln "$moved" "$lock" 2> /dev/null || true
               rm -f "$moved"
-              holder="${found%% *}"
+              { read -r holder held_until; } <<< "$found" || true
               return 2
             fi
             rm -f "$moved"
+            echo "Taking the QA home over from the build of run ${holder%%-*}, which did not give it back."
             result=0
             claim || result=$?
+            if [[ "$result" == 2 ]]; then
+              # Another build was quicker, and its name was not read.
+              holder=""
+              held_until=""
+            fi
             return "$result"
+          }
+          # A time of the lock file as people read it. GNU date and the BSD
+          # one take the seconds differently.
+          clock() {
+            date -u -d "@$1" '+%H:%M UTC' 2> /dev/null || date -u -r "$1" '+%H:%M UTC' 2> /dev/null || echo "$1 (seconds since 1970)"
           }
           # Moved away in one step and deleted after that: the path of the
           # home is free at once, however long the deleting takes. With
@@ -646,6 +766,22 @@ jobs:
             list_extra "$1"
             [[ "${#extra[@]}" == 0 ]]
           }
+          # The first symbolic link, in `link`, among the places where one
+          # would bring another Gradle user home in: the top of the home and
+          # one level down, two levels below caches (caches/modules-2/files-2.1
+          # is the downloads), three below wrapper/dists (a distribution is
+          # wrapper/dists/<name>/<hash>/<gradle>). These are also all the
+          # directories list_extra looks into, so what scrub deletes is in
+          # this home.
+          find_link() {
+            link=$(find "$1" -mindepth 1 -maxdepth 2 -type l -print -quit) || return 1
+            if [[ -z "$link" && -d "$1/caches" ]]; then
+              link=$(find "$1/caches" -mindepth 1 -maxdepth 2 -type l -print -quit) || return 1
+            fi
+            if [[ -z "$link" && -d "$1/wrapper/dists" ]]; then
+              link=$(find "$1/wrapper/dists" -mindepth 1 -maxdepth 3 -type l -print -quit) || return 1
+            fi
+          }
           prepare() {
             local path names finished=false
             # What a discard could not delete, and what a build that was
@@ -664,10 +800,10 @@ jobs:
               discard || return 1
               echo "::warning title=QA Gradle home discarded::The build that had the QA home before${holder:+ (run ${holder%%-*})} did not finish in it: its job died or was killed before its last steps. Such a home is not used again, so this build starts with an empty one."
             elif [[ -d "$home" ]]; then
-              path=$(find "$home" -mindepth 1 -maxdepth 2 -type l -print -quit) || return 1
-              if [[ -n "$path" ]]; then
+              find_link "$home" || return 1
+              if [[ -n "$link" ]]; then
                 discard || return 1
-                echo "::warning title=QA Gradle home discarded::$path was a symbolic link: the QA home shares nothing with another Gradle user home. The build starts with an empty QA home."
+                echo "::warning title=QA Gradle home discarded::$link was a symbolic link: the QA home shares nothing with another Gradle user home. The build starts with an empty QA home."
               elif [[ "$GRADLE_HOME" == reset ]]; then
                 discard || return 1
                 echo "Discarded the QA home: gradle-home is reset."
@@ -699,13 +835,27 @@ jobs:
             if [[ "$GRADLE_HOME" == reset ]]; then
               not_emptied=" The home was not emptied: start the run again when that build has ended."
             fi
-            echo "::notice title=QA Gradle home in use::Another QA build of $REPOSITORY has the QA home${holder:+ (run ${holder%%-*})}, and one build at a time uses it. The build is cold.$not_emptied"
+            how_long=""
+            if [[ -n "$held_until" ]]; then
+              how_long=" It is that build's until $(clock "$held_until") at the latest, and sooner when its job ends."
+            fi
+            echo "::notice title=QA Gradle home in use::Another QA build of $REPOSITORY has the QA home${holder:+ (run ${holder%%-*})}, and one build at a time uses it. The build is cold.$how_long$not_emptied"
             use_cold "the QA home is in use"
           elif [[ "$state" != 0 ]]; then
             give_up "$problem"
           fi
-          # The home is this build's from here on. One that could not be
-          # prepared is not used, and not left for the next build as it is.
+          # The home is this build's from here on, and the step after the
+          # build is told so at once, before the home is made ready: a job
+          # that is cancelled while this step deletes an old home then still
+          # gives the home back. `warm`, which only the end of this step
+          # writes, says whether the home was made ready and Gradle uses it.
+          {
+            echo "root=$root"
+            echo "home=$home"
+            echo "token=$token"
+          } >> "$GITHUB_OUTPUT"
+          # A home that could not be prepared is not used, and not left for
+          # the next build as it is.
           if ! prepare; then
             if ! discard give-back; then
               problem="$problem $home could not be moved away either. It stays marked as in use, so QA builds on this host are cold until one of them takes it over, after the time this build has, and tries again. Or delete $base on the host."
@@ -713,12 +863,7 @@ jobs:
             give_up "$problem"
           fi
           echo "GRADLE_USER_HOME=$home" >> "$GITHUB_ENV"
-          {
-            echo "warm=true"
-            echo "root=$root"
-            echo "home=$home"
-            echo "token=$token"
-          } >> "$GITHUB_OUTPUT"
+          echo "warm=true" >> "$GITHUB_OUTPUT"
           echo "Gradle user home: $home (the QA home of $REPOSITORY)"
 
       # For the wrapper validation and the job summary. The Actions cache is
@@ -999,10 +1144,21 @@ jobs:
             echo "Emptied $GITHUB_WORKSPACE."
           fi
 
-      # Only after a build that had the QA home, which outlives the job. The
-      # step gives the home back (it deletes `in-use`) in every case but one:
-      # a home that could be neither tidied nor moved away stays taken, so
-      # that no build uses it as it is.
+      # Only after a build that took the QA home, which outlives the job. The
+      # step gives the home back (it deletes `in-use`) in every case but two.
+      # A home that could be neither tidied nor moved away stays taken, so
+      # that no build uses it as it is. And after a Gradle run that was
+      # cancelled (by a run of a later commit, by a person or by the timeout
+      # of the job) the home stays taken for two more minutes: what Gradle
+      # started may outlive this step, the runner ends it when the job ends,
+      # and a build that got the home in between would share it with those
+      # processes. The next build takes the home over when GitHub tells it
+      # that this job is over, or when the two minutes are.
+      #
+      # This step is not what frees the home after a job that died: no step
+      # of such a job runs. The step that chooses the home sees to that, by
+      # asking GitHub. A build whose step that chose the home was stopped
+      # before the home was ready (`warm` is not set) gives it back as it is.
       #
       # A Gradle run that did not succeed leaves a home that is not used
       # again: it is moved away and deleted, and the next QA build on this
@@ -1029,11 +1185,12 @@ jobs:
       # for the steps after it. And nothing is touched unless `in-use` still
       # names this build. The step never fails.
       - name: Tidy or discard the QA Gradle home
-        if: ${{ always() && steps.gradle-home.outputs.warm == 'true' }}
+        if: ${{ always() && steps.gradle-home.outputs.token != '' && steps.gradle-home.outputs.warm != 'false' }}
         env:
           QA_ROOT: ${{ steps.gradle-home.outputs.root }}
           QA_HOME: ${{ steps.gradle-home.outputs.home }}
           QA_TOKEN: ${{ steps.gradle-home.outputs.token }}
+          QA_READY: ${{ steps.gradle-home.outputs.warm }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
         run: |
           set -euo pipefail
@@ -1049,9 +1206,18 @@ jobs:
             exit 0
           fi
           holder=""
-          { read -r holder _ < "$lock"; } 2> /dev/null || true
+          holder_runner=""
+          { { read -r holder _; IFS= read -r holder_runner; } < "$lock"; } 2> /dev/null || true
           if [[ "$holder" != "$token" ]]; then
             echo "::warning title=QA Gradle home left as it is::The QA home is not this build's any more${holder:+: the build of run ${holder%%-*} has it}. The job ran past the time it had and a later build took the home over, or the file that names the build was deleted on the host. Nothing is deleted."
+            exit 0
+          fi
+          if [[ "$QA_READY" != true ]]; then
+            # Whatever state the home is in, it is marked as that: a home
+            # whose preparing was begun has no `intact`, and the next build
+            # discards it.
+            rm -f "$lock"
+            echo "The step that chose the QA home was stopped before the home was ready, and Gradle did not run in it. The home is given back as it is."
             exit 0
           fi
           if [[ ! -e "$home" && ! -L "$home" ]]; then
@@ -1060,7 +1226,7 @@ jobs:
             exit 0
           fi
 
-          # The next three are the functions of the step that chose the home,
+          # The next four are the functions of the step that chose the home,
           # word for word.
 
           # Moved away in one step and deleted after that: the path of the
@@ -1113,9 +1279,44 @@ jobs:
             list_extra "$1"
             [[ "${#extra[@]}" == 0 ]]
           }
+          # The first symbolic link, in `link`, among the places where one
+          # would bring another Gradle user home in: the top of the home and
+          # one level down, two levels below caches (caches/modules-2/files-2.1
+          # is the downloads), three below wrapper/dists (a distribution is
+          # wrapper/dists/<name>/<hash>/<gradle>). These are also all the
+          # directories list_extra looks into, so what scrub deletes is in
+          # this home.
+          find_link() {
+            link=$(find "$1" -mindepth 1 -maxdepth 2 -type l -print -quit) || return 1
+            if [[ -z "$link" && -d "$1/caches" ]]; then
+              link=$(find "$1/caches" -mindepth 1 -maxdepth 2 -type l -print -quit) || return 1
+            fi
+            if [[ -z "$link" && -d "$1/wrapper/dists" ]]; then
+              link=$(find "$1/wrapper/dists" -mindepth 1 -maxdepth 3 -type l -print -quit) || return 1
+            fi
+          }
 
           taken="It stays marked as in use, so QA builds on this host are cold until one of them takes it over, after the time this build had, and tries again. Or delete $base on the host."
-          if [[ "$BUILD_OUTCOME" == failure || "$BUILD_OUTCOME" == cancelled ]]; then
+          if [[ "$BUILD_OUTCOME" == cancelled ]]; then
+            # The file is replaced in one step, with the time in it changed:
+            # this job has two more minutes, not the rest of its timeout.
+            # Before the deleting, which a job that is being cancelled may not
+            # get to finish.
+            briefly="$base/claim-$token"
+            if printf '%s %s\n%s\n' "$token" "$(( $(date +%s) + 120 ))" "$holder_runner" > "$briefly" && mv -f "$briefly" "$lock"; then
+              kept="It stays this build's until the job is over: the next QA build takes it over when GitHub says so, or two minutes from now."
+            else
+              rm -f "$briefly"
+              kept="It stays this build's until the job is over: the next QA build takes it over when GitHub says so, or after the time this build had."
+            fi
+            if discard; then
+              echo "::notice title=QA Gradle home discarded::The Gradle run in the QA home ended as $BUILD_OUTCOME, so the home is not used again: the next QA build on this host starts with an empty one and is as slow as a cold build. $kept"
+            else
+              echo "::warning title=QA Gradle home not discarded::The Gradle run in the QA home ended as $BUILD_OUTCOME, and $home could not be moved away; the reason is in the lines above. $kept That build discards it."
+            fi
+            exit 0
+          fi
+          if [[ "$BUILD_OUTCOME" == failure ]]; then
             if discard give-back; then
               echo "::notice title=QA Gradle home discarded::The Gradle run in the QA home ended as $BUILD_OUTCOME, so the home is not used again: the next QA build on this host starts with an empty one and is as slow as a cold build. If the failure is not the code's, run the failed jobs again."
             else
@@ -1125,7 +1326,9 @@ jobs:
           fi
           # A link that the build put there is not followed by what deletes:
           # the home goes as a whole.
-          link=$(find "$home" -maxdepth 2 -type l -print -quit) || link="$home"
+          if [[ -L "$home" ]] || ! find_link "$home"; then
+            link="$home"
+          fi
           if [[ -z "$link" ]] && scrub "$home" && rm -rf "$mark" && : > "$mark"; then
             rm -f "$lock"
             if [[ "${#removed[@]}" != 0 ]]; then
