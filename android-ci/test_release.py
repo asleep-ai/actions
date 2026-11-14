@@ -672,22 +672,465 @@ def test_a_moved_tag_is_refused(build, tmp_path):
 # --- build: Gradle ------------------------------------------------------------------------
 
 
-def test_the_gradle_user_home_belongs_to_the_job(build, tmp_path):
+# What the step that chooses the home is handed for a release, as android-release.yml calls the build:
+# it passes neither gradle-home nor source-branch.
+RELEASE_RUN = {
+    "GRADLE_HOME": "cold",
+    "KIND": "release",
+    "RUNNER_KIND": "self-hosted",
+    "EVENT_NAME": "workflow_dispatch",
+    "RUN_REF": "refs/tags/v1.13.1",
+    "SOURCE_BRANCH": "develop",
+    "REPOSITORY": "acme/app",
+}
+# And for the QA build of a push to the source branch, as android-qa.yml calls its first build.
+QA_RUN = {**RELEASE_RUN, "GRADLE_HOME": "warm", "KIND": "qa", "EVENT_NAME": "push", "RUN_REF": "refs/heads/develop"}
+QA_HOME = "android-qa-gradle/acme/app/home"
+
+
+def choose_home(build, tmp_path, **overrides):
+    """Run the step that chooses the Gradle user home on a host whose runner user has `host` as its home."""
+    temp, host = tmp_path / "temp", tmp_path / "host"
+    temp.mkdir(exist_ok=True)
+    host.mkdir(exist_ok=True)
+    github_env, output = tmp_path / "github-env", tmp_path / "home-output"
+    github_env.write_text("")
+    output.write_text("")
+    env = {
+        "RUNNER_TEMP": str(temp),
+        "HOME": str(host),
+        "GITHUB_ENV": str(github_env),
+        "GITHUB_OUTPUT": str(output),
+        "GITHUB_RUN_ID": "77",
+        "GITHUB_RUN_ATTEMPT": "1",
+        **QA_RUN,
+        **overrides,
+    }
+    result = run_script(step_by_id(build, "gradle-home")["run"], env, tmp_path)
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    lines = github_env.read_text().splitlines()
+    assert len(lines) <= 1 and all(line.startswith("GRADLE_USER_HOME=") for line in lines), lines
+    return result, Path(lines[0].split("=", 1)[1]) if lines else None, outputs
+
+
+def fill(home: Path, *names: str) -> None:
+    for name in names:
+        path = home / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"left in {name}")
+
+
+# What a build leaves in a Gradle user home that is worth keeping.
+CACHES = ("caches/modules-2/files-2.1/androidx.core/core-1.13.0.aar", "wrapper/dists/gradle-8.9-bin/abc/gradle-8.9/bin/gradle")
+
+
+def test_the_gradle_user_home_of_a_release_belongs_to_the_job(build, tmp_path):
     temp = tmp_path / "temp"
     stale = temp / "gradle-user-home" / "init.d" / "evil.gradle"
     stale.parent.mkdir(parents=True)
     stale.write_text("left behind")
-    github_env = tmp_path / "github-env"
-    env = {"RUNNER_TEMP": str(temp), "GITHUB_ENV": str(github_env)}
-    result = run_script(step_by_id(build, "gradle-home")["run"], env, tmp_path)
+    result, home, outputs = choose_home(build, tmp_path, **RELEASE_RUN)
     assert result.returncode == 0, result.stderr
-    home = temp / "gradle-user-home"
-    assert github_env.read_text() == f"GRADLE_USER_HOME={home}\n"
+    assert home == temp / "gradle-user-home"
     assert home.is_dir() and list(home.iterdir()) == []
+    assert outputs == {"warm": "false"}
+    assert not (tmp_path / "host" / "android-qa-gradle").exists()
     ids = [item.get("id") for item in build["steps"]]
     assert ids.index("gradle-home") < ids.index("gradle") < ids.index("build")
     # Nothing is restored into a build that signs, and nothing it produced is saved.
     assert step_by_id(build, "gradle")["with"] == {"cache-disabled": True}
+    # Cold unless a caller asks for more, and android-release.yml asks for nothing.
+    inputs = trigger(load(BUILD))["inputs"]
+    assert (inputs["gradle-home"]["default"], inputs["gradle-home"]["required"]) == ("cold", False)
+    assert (inputs["source-branch"]["default"], inputs["source-branch"]["required"]) == ("", False)
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        {},
+        {"KIND": "label", "EVENT_NAME": "workflow_dispatch"},
+        {"EVENT_NAME": "workflow_dispatch"},
+        # The maintenance branches are built from merged code as well, and share the home of the repository.
+        {"RUN_REF": "refs/heads/release/1.x"},
+        {"RUN_REF": "refs/heads/release/12.x", "EVENT_NAME": "workflow_dispatch"},
+        {"RUN_REF": "refs/heads/release/0.x"},
+        {"RUN_REF": "refs/heads/main", "SOURCE_BRANCH": "main"},
+        {"GRADLE_HOME": "reset"},
+    ],
+)
+def test_a_qa_build_of_a_release_branch_on_a_self_hosted_runner_uses_the_qa_home(build, tmp_path, run):
+    result, home, outputs = choose_home(build, tmp_path, **run)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert home == tmp_path / "host" / QA_HOME
+    assert home.is_dir() and list(home.iterdir()) == []
+    assert outputs == {"warm": "true", "home": str(home)}
+    # Only the runner's user reads it.
+    assert home.stat().st_mode & 0o077 == 0 and (tmp_path / "host" / "android-qa-gradle").stat().st_mode & 0o077 == 0
+    assert not (tmp_path / "temp" / "gradle-user-home").exists()
+    assert "::warning" not in result.stdout
+    assert f"Gradle user home: {home} (the QA home of acme/app)" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("run", "reason"),
+    [
+        # A release and a preview are cold whatever a caller passes: the build workflow itself says so.
+        ({"KIND": "release"}, "a release or a preview is built cold"),
+        ({"KIND": "preview"}, "a release or a preview is built cold"),
+        ({"KIND": "release", "RUN_REF": "refs/tags/v1.13.1", "EVENT_NAME": "workflow_dispatch"}, "a release or a preview is built cold"),
+        ({"KIND": "preview", "GRADLE_HOME": "reset"}, "a release or a preview is built cold"),
+        ({"KIND": ""}, "a release or a preview is built cold"),
+        # The build after an infrastructure failure, and a caller without self-hosted runners.
+        ({"RUNNER_KIND": "github-hosted"}, "a GitHub-hosted runner keeps nothing between jobs"),
+        ({"RUNNER_KIND": ""}, "a GitHub-hosted runner keeps nothing between jobs"),
+        ({"GRADLE_HOME": "cold"}, "gradle-home is cold"),
+        # A pull request never reads or writes the home, whatever branch it names.
+        ({"EVENT_NAME": "pull_request", "RUN_REF": "refs/pull/12/merge"}, "this is a pull_request run"),
+        ({"EVENT_NAME": "pull_request"}, "this is a pull_request run"),
+        ({"EVENT_NAME": "pull_request_target"}, "this is a pull_request_target run"),
+        ({"EVENT_NAME": "schedule"}, "this is a schedule run"),
+        ({"EVENT_NAME": "workflow_run"}, "this is a workflow_run run"),
+        ({"EVENT_NAME": "merge_group", "RUN_REF": "refs/heads/gh-readonly-queue/develop/pr-1"}, "this is a merge_group run"),
+        ({"EVENT_NAME": ""}, "this is a  run"),
+        # Code that is not merged: any other branch, a tag, and names that only look like a release branch.
+        ({"RUN_REF": "refs/heads/feature/login"}, "this run is on refs/heads/feature/login"),
+        ({"RUN_REF": "refs/heads/developer"}, "this run is on refs/heads/developer"),
+        ({"RUN_REF": "refs/heads/main"}, "this run is on refs/heads/main"),
+        ({"RUN_REF": "refs/heads/release/1.x/fix"}, "this run is on refs/heads/release/1.x/fix"),
+        ({"RUN_REF": "refs/heads/release/01.x"}, "this run is on refs/heads/release/01.x"),
+        ({"RUN_REF": "refs/heads/release/x"}, "this run is on refs/heads/release/x"),
+        ({"RUN_REF": "refs/heads/release/1.2"}, "this run is on refs/heads/release/1.2"),
+        ({"RUN_REF": "refs/heads/hotfix/release/1.x"}, "this run is on refs/heads/hotfix/release/1.x"),
+        ({"RUN_REF": "refs/tags/develop"}, "this run is on refs/tags/develop"),
+        ({"RUN_REF": "refs/tags/release/1.x"}, "this run is on refs/tags/release/1.x"),
+        ({"RUN_REF": "refs/tags/v1.13.1", "EVENT_NAME": "workflow_dispatch"}, "this run is on refs/tags/v1.13.1"),
+        ({"RUN_REF": "refs/pull/12/merge"}, "this run is on refs/pull/12/merge"),
+        ({"RUN_REF": "develop"}, "this run is on develop"),
+        ({"RUN_REF": "refs/heads/", "SOURCE_BRANCH": ""}, "this run is on refs/heads/"),
+        ({"RUN_REF": "", "SOURCE_BRANCH": ""}, "this run is on "),
+    ],
+)
+def test_every_other_build_is_cold_whatever_it_asks_for(build, tmp_path, run, reason):
+    # The home of earlier QA builds is there, and is neither read nor touched.
+    kept = tmp_path / "host" / QA_HOME
+    fill(kept, *CACHES, "gradle.properties")
+    result, home, outputs = choose_home(build, tmp_path, **run)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert home == tmp_path / "temp" / "gradle-user-home"
+    assert home.is_dir() and list(home.iterdir()) == []
+    assert outputs == {"warm": "false"}
+    (said,) = [line for line in result.stdout.splitlines() if line.startswith("Gradle user home: ")]
+    assert said.startswith(f"Gradle user home: {home} (cold: ") and reason in said
+    assert sorted(path.name for path in kept.iterdir()) == ["caches", "gradle.properties", "wrapper"]
+    assert "::warning" not in result.stdout
+
+
+@pytest.mark.parametrize("value", ["", "Warm", "hot", "warm ", "true"])
+def test_a_gradle_home_that_is_no_known_word_is_cold_and_says_so(build, tmp_path, value):
+    result, home, outputs = choose_home(build, tmp_path, GRADLE_HOME=value)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert home == tmp_path / "temp" / "gradle-user-home" and outputs == {"warm": "false"}
+    assert "::warning title=QA Gradle home not used::gradle-home is none of cold, warm and reset. The build is cold." in result.stdout
+    assert not (tmp_path / "host" / "android-qa-gradle").exists()
+
+
+def test_the_qa_home_is_kept_between_builds_and_holds_no_configuration(build, tmp_path):
+    result, home, _ = choose_home(build, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "The QA home is new: this build fills it." in result.stdout
+    fill(
+        home, *CACHES,
+        # What must not decide how the next signed build runs, or stay on the host: configuration and logs.
+        "init.gradle", "init.gradle.kts", "gradle.properties", "init.d/evil.gradle", "init.d/more/evil.init.gradle.kts",
+        "daemon/8.9/daemon-4711.out.log", "daemon/8.9/registry.bin",
+        # setup-gradle writes these in the step after, for this build and for one that runs on another runner.
+        "init.d/gradle-actions.build-result-capture.init.gradle",
+    )
+    (home / "gradle.properties").write_text("KEY_PASSWORD=key-pass\n")
+    # The next build: on a maintenance branch, started by hand, with a label. One home for the repository.
+    result, again, outputs = choose_home(
+        build, tmp_path, KIND="label", EVENT_NAME="workflow_dispatch", RUN_REF="refs/heads/release/1.x"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert again == home and outputs == {"warm": "true", "home": str(home)}
+    assert "The QA home exists: earlier QA builds of acme/app left it." in result.stdout
+    for name in CACHES:
+        assert (home / name).read_text() == f"left in {name}"
+    left = sorted(str(path.relative_to(home)) for path in home.rglob("*") if path.is_file() and not path.is_relative_to(home / "caches") and not path.is_relative_to(home / "wrapper"))
+    assert left == ["daemon/8.9/registry.bin", "init.d/gradle-actions.build-result-capture.init.gradle"]
+    assert (
+        "::warning title=QA Gradle home held configuration::Deleted from the QA home before the build: "
+        "gradle.properties init.d/evil.gradle init.d/more init.gradle init.gradle.kts. " in result.stdout
+    )
+    # Names are printed, a value never.
+    assert "key-pass" not in result.stdout + result.stderr
+    # A home that is as the build before left it says nothing.
+    result, _, _ = choose_home(build, tmp_path)
+    assert result.returncode == 0 and "::warning" not in result.stdout
+
+
+def test_each_repository_has_a_qa_home_of_its_own(build, tmp_path):
+    homes = {}
+    for repository in ("acme/app", "acme/app-v2", "other/app", "acme-app/v2", "acme/app.v2", "acme/app_v2"):
+        result, home, _ = choose_home(build, tmp_path, REPOSITORY=repository)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert home == tmp_path / "host" / "android-qa-gradle" / repository / "home"
+        fill(home, "caches/owner")
+        homes[repository] = home
+    assert len(set(homes.values())) == len(homes)
+    for repository, home in homes.items():
+        # Owner and repository are two directories: "acme/app-v2" and "acme-app/v2" do not meet.
+        assert [path.name for path in home.parent.iterdir()] == ["home"], repository
+
+
+@pytest.mark.parametrize("repository", ["", "acme", "acme/", "/app", "acme/app/extra", "acme/..", "acme/.", "../app", "-acme/app", "acme/a b", "acme/a$b"])
+def test_a_repository_name_that_cannot_name_a_directory_is_built_cold(build, tmp_path, repository):
+    result, home, outputs = choose_home(build, tmp_path, REPOSITORY=repository)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert home == tmp_path / "temp" / "gradle-user-home" and outputs == {"warm": "false"}
+    assert "::warning title=QA Gradle home not used::The name of the repository cannot name a directory. The build is cold." in result.stdout
+    assert not (tmp_path / "host" / "android-qa-gradle").exists()
+
+
+@pytest.mark.parametrize("home_directory", ["", "relative/home", "{tmp}/missing", "{tmp}/a-file"])
+def test_a_host_without_a_home_directory_is_built_cold(build, tmp_path, home_directory):
+    (tmp_path / "a-file").write_text("")
+    result, home, outputs = choose_home(build, tmp_path, HOME=home_directory.replace("{tmp}", str(tmp_path)))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert home == tmp_path / "temp" / "gradle-user-home" and outputs == {"warm": "false"}
+    assert "::warning title=QA Gradle home not used::HOME is not a directory" in result.stdout
+
+
+def test_a_qa_home_that_cannot_be_made_is_built_cold(build, tmp_path):
+    # A file where the directory of the QA homes belongs: mkdir fails, and the build goes on without.
+    (tmp_path / "host").mkdir()
+    (tmp_path / "host" / "android-qa-gradle").write_text("")
+    result, home, outputs = choose_home(build, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert home == tmp_path / "temp" / "gradle-user-home" and outputs == {"warm": "false"}
+    assert "::warning title=QA Gradle home not used::The QA home could not be prepared" in result.stdout
+
+
+def test_gradle_home_reset_starts_with_an_empty_qa_home(build, tmp_path):
+    home = tmp_path / "host" / QA_HOME
+    fill(home, *CACHES, "caches/8.9/transforms/damaged/metadata.bin")
+    result, again, outputs = choose_home(build, tmp_path, GRADLE_HOME="reset", EVENT_NAME="workflow_dispatch")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert again == home and outputs == {"warm": "true", "home": str(home)}
+    assert "Discarded the QA home: gradle-home is reset." in result.stdout
+    assert home.is_dir() and list(home.iterdir()) == []
+    # Moved away and deleted: nothing of it is left next to the new home.
+    assert [path.name for path in home.parent.iterdir()] == ["home"]
+    # A reset where there is no home yet is a first build.
+    result, other, _ = choose_home(build, tmp_path, GRADLE_HOME="reset", REPOSITORY="acme/other")
+    assert result.returncode == 0 and other.is_dir() and "Discarded" not in result.stdout
+
+
+def test_what_an_interrupted_discard_left_is_deleted_by_the_next_build(build, tmp_path):
+    home = tmp_path / "host" / QA_HOME
+    fill(home, *CACHES)
+    fill(home.parent / "discarded-76-1-4242", "caches/half/deleted.bin")
+    result, again, _ = choose_home(build, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert again == home and [path.name for path in home.parent.iterdir()] == ["home"]
+    assert (home / CACHES[0]).exists()
+
+
+@pytest.mark.parametrize("linked", ["home", "caches", "wrapper", "init.d"])
+def test_a_link_to_another_gradle_user_home_is_not_followed(build, tmp_path, linked):
+    # The home the pull request builds share, with what a pull request's build may have put there.
+    shared = tmp_path / "host" / ".gradle"
+    fill(shared, "caches/modules-2/files-2.1/poisoned.jar", "wrapper/dists/gradle", "init.d/evil.gradle")
+    home = tmp_path / "host" / QA_HOME
+    if linked == "home":
+        home.parent.mkdir(parents=True)
+        home.symlink_to(shared, target_is_directory=True)
+    else:
+        fill(home, "caches/own.jar" if linked != "caches" else "wrapper/own")
+        (home / linked).symlink_to(shared / linked, target_is_directory=True)
+    result, again, outputs = choose_home(build, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    # An empty home of its own, and the other home as it was.
+    assert again == home and outputs["warm"] == "true"
+    assert home.is_dir() and not home.is_symlink() and list(home.iterdir()) == []
+    assert "::warning title=QA Gradle home discarded::" in result.stdout and "was a symbolic link" in result.stdout
+    assert sorted(str(path.relative_to(shared)) for path in shared.rglob("*") if path.is_file()) == [
+        "caches/modules-2/files-2.1/poisoned.jar", "init.d/evil.gradle", "wrapper/dists/gradle",
+    ]
+    assert [path.name for path in home.parent.iterdir()] == ["home"]
+
+
+@pytest.mark.parametrize("linked", ["android-qa-gradle", "android-qa-gradle/acme", "android-qa-gradle/acme/app"])
+def test_a_linked_directory_above_the_qa_home_is_not_used(build, tmp_path, linked):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    path = tmp_path / "host" / linked
+    path.parent.mkdir(parents=True)
+    path.symlink_to(elsewhere, target_is_directory=True)
+    result, home, outputs = choose_home(build, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert home == tmp_path / "temp" / "gradle-user-home" and outputs == {"warm": "false"}
+    assert f"::warning title=QA Gradle home not used::{path} is a symbolic link, and the QA home is a directory of its own. The build is cold." in result.stdout
+    assert list(elsewhere.iterdir()) == []
+
+
+# --- build: the QA home after the build ----------------------------------------------------
+
+
+def finish_home(build, tmp_path, outcome: str, qa_home: Path | str | None = None):
+    host = tmp_path / "host"
+    host.mkdir(exist_ok=True)
+    env = {
+        "HOME": str(host),
+        "QA_HOME": str(host / QA_HOME if qa_home is None else qa_home),
+        "BUILD_OUTCOME": outcome,
+        "GITHUB_RUN_ID": "77",
+        "GITHUB_RUN_ATTEMPT": "1",
+    }
+    return run_script(step(build, "Tidy or discard the QA Gradle home")["run"], env, tmp_path)
+
+
+@pytest.mark.parametrize("outcome", ["failure", "cancelled"])
+def test_a_qa_home_that_a_failed_gradle_run_used_is_not_used_again(build, tmp_path, outcome):
+    home = tmp_path / "host" / QA_HOME
+    fill(home, *CACHES, "caches/8.9/transforms/half-written/metadata.bin")
+    other = tmp_path / "host" / "android-qa-gradle" / "acme" / "other" / "home"
+    fill(other, *CACHES)
+    result = finish_home(build, tmp_path, outcome)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"::notice title=QA Gradle home discarded::The Gradle run in the QA home ended as {outcome}" in result.stdout
+    # Nothing of it is left, and the next build makes a new one. The home of another repository stays.
+    assert list(home.parent.iterdir()) == []
+    assert (other / CACHES[0]).exists()
+    again, chosen, _ = choose_home(build, tmp_path)
+    assert again.returncode == 0 and chosen == home and "The QA home is new" in again.stdout
+
+
+@pytest.mark.parametrize("outcome", ["success", "skipped"])
+def test_a_qa_home_is_kept_after_any_other_build_without_logs_and_configuration(build, tmp_path, outcome):
+    # skipped: a step before Gradle failed, and Gradle never ran in the home.
+    home = tmp_path / "host" / QA_HOME
+    fill(
+        home, *CACHES, "daemon/8.9/daemon-4711.out.log", "daemon/8.9/registry.bin", "gradle.properties", "init.gradle",
+        "init.d/left-by-the-build.gradle", "init.d/gradle-actions.build-result-capture.init.gradle",
+    )
+    result = finish_home(build, tmp_path, outcome)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"Kept the QA home for the next QA build, without daemon logs and configuration: {home}" in result.stdout
+    left = sorted(str(path.relative_to(home)) for path in home.rglob("*") if path.is_file())
+    assert left == sorted([*CACHES, "daemon/8.9/registry.bin", "init.d/gradle-actions.build-result-capture.init.gradle"])
+    assert "::" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "named",
+    ["", "{host}/.gradle", "{host}/android-qa-gradle/acme/app", "{host}/android-qa-gradle/home", "{host}/android-qa-gradle/acme/../../.gradle/home", "{host}/elsewhere/acme/app/home", "/", "{host}"],
+)
+def test_only_a_qa_home_is_ever_discarded(build, tmp_path, named):
+    # The step deletes a directory by a path it was handed. Whatever is not a QA home stays.
+    host = tmp_path / "host"
+    fill(host, ".gradle/caches/shared.jar", ".gradle/home/x", QA_HOME + "/caches/own.jar", "elsewhere/acme/app/home/x")
+    result = finish_home(build, tmp_path, "failure", qa_home=named.replace("{host}", str(host)))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "::warning title=QA Gradle home left as it is::" in result.stdout
+    assert sorted(str(path.relative_to(host)) for path in host.rglob("*") if path.is_file()) == [
+        ".gradle/caches/shared.jar", ".gradle/home/x", "android-qa-gradle/acme/app/home/caches/own.jar",
+        "elsewhere/acme/app/home/x",
+    ]
+
+
+def test_a_qa_home_that_became_a_link_or_is_gone_is_left_alone(build, tmp_path):
+    host = tmp_path / "host"
+    fill(host, ".gradle/caches/shared.jar")
+    home = host / QA_HOME
+    # Another build discarded the home meanwhile.
+    result = finish_home(build, tmp_path, "failure")
+    assert result.returncode == 0 and "The QA home is gone: another build discarded it." in result.stdout
+    home.parent.mkdir(parents=True)
+    home.symlink_to(host / ".gradle", target_is_directory=True)
+    for outcome in ("failure", "success"):
+        result = finish_home(build, tmp_path, outcome)
+        assert result.returncode == 0 and "::warning title=QA Gradle home left as it is::" in result.stdout
+        assert (host / ".gradle/caches/shared.jar").exists() and home.is_symlink()
+
+
+def test_the_qa_home_is_seen_to_after_every_build_that_used_it(build):
+    names = [item.get("name") for item in build["steps"]]
+    tidy = step(build, "Tidy or discard the QA Gradle home")
+    # Whatever happened to the build, and only after a build that was given the QA home.
+    assert tidy["if"] == "${{ always() && steps.gradle-home.outputs.warm == 'true' }}"
+    # The path is what the step that chose the home said before any code of the repository ran, not
+    # a variable the build could have set for the steps after it.
+    assert tidy["env"] == {
+        "QA_HOME": "${{ steps.gradle-home.outputs.home }}",
+        "BUILD_OUTCOME": "${{ steps.build.outcome }}",
+    }
+    assert "GRADLE_USER_HOME" not in tidy["run"]
+    # After the secrets are gone, and before the verdict: the step fails nothing, so the verdict is the build's.
+    assert names.index("Delete the keystore and local.properties") < names.index("Tidy or discard the QA Gradle home")
+    assert names[-1] == "Report the verdict" and names[-2] == "Tidy or discard the QA Gradle home"
+    assert "exit 1" not in tidy["run"]
+
+
+def test_no_other_step_and_no_other_workflow_names_the_qa_home(build, entry):
+    # The directory is the QA build's alone because nothing else is told where it is: the pull
+    # request jobs use the home of the runner's user, a release the one of its job.
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        text = path.read_text()
+        assert ("android-qa-gradle" in text) == (path.name == BUILD), path.name
+        if path.name != BUILD:
+            assert "GRADLE_USER_HOME" not in text, path.name
+    for item in build["steps"]:
+        text = json.dumps(item)
+        names_it = "android-qa-gradle" in text or "steps.gradle-home.outputs.home" in text
+        assert names_it == (item.get("id") == "gradle-home" or item.get("name") == "Tidy or discard the QA Gradle home"), item.get("name")
+        # And the home is set in one place. The Gradle step prints it.
+        if "GRADLE_USER_HOME" in text:
+            assert item.get("id") in ("gradle-home", "build"), item.get("name")
+    chosen = step_by_id(build, "gradle-home")
+    assert chosen["env"] == {
+        "GRADLE_HOME": "${{ inputs.gradle-home }}",
+        "KIND": "${{ inputs.kind }}",
+        "RUNNER_KIND": "${{ runner.environment }}",
+        # The event and the ref of the run, never an input: a caller cannot say that its run is a
+        # push to the source branch.
+        "EVENT_NAME": "${{ github.event_name }}",
+        "RUN_REF": "${{ github.ref }}",
+        "SOURCE_BRANCH": "${{ inputs.source-branch || github.event.repository.default_branch }}",
+        "REPOSITORY": "${{ github.repository }}",
+    }
+    assert "if" not in chosen
+    # A release asks for nothing, so its two builds are cold by the default of the input, and by
+    # their kind whatever the input says.
+    for name in ("primary", "fallback"):
+        assert "gradle-home" not in entry["jobs"][name]["with"]
+        assert entry["jobs"][name]["with"]["kind"] == "${{ needs.plan.outputs.preview == 'true' && 'preview' || 'release' }}"
+
+
+def test_no_secret_is_written_to_the_gradle_user_home(build):
+    # Where each secret is on disk, and for how long: the keystore and the prepared values in the
+    # job's temp directory, local.properties in the work folder. All three are deleted, the work
+    # folder is emptied, and none of these paths is in a Gradle user home.
+    signing = (ROOT / "android-signing" / "signing.py").read_text()
+    assert 'temp = env.get("RUNNER_TEMP", "").strip()' in signing and "path = Path(temp) / KEYSTORE_NAME" in signing
+    assert 'os.path.join(os.environ["RUNNER_TEMP"], "android-release.properties")' in step_by_id(build, "values")["run"]
+    properties = step_by_id(build, "properties")["run"]
+    assert '> local.properties' in properties and "GRADLE_USER_HOME" not in properties and "$HOME" not in properties
+    # No step writes a gradle.properties: the two that name it delete it from the QA home.
+    for item in build["steps"]:
+        if "gradle.properties" in item.get("run", ""):
+            assert item.get("id") == "gradle-home" or item.get("name") == "Tidy or discard the QA Gradle home"
+            for line in item["run"].splitlines():
+                if "gradle.properties" in line:
+                    assert line.lstrip().startswith(("rm -rf ", "for path in ")), line
+    # Memory settings go to Gradle on the command line, not into a file of the home.
+    gradle = step_by_id(build, "build")["run"]
+    assert '"-Dorg.gradle.jvmargs=$GRADLE_JVMARGS"' in gradle and '"-Pkotlin.daemon.jvmargs=$KOTLIN_DAEMON_JVMARGS"' in gradle
+    # And the build writes no task output to a cache of the home, where the values of
+    # local.properties would stay inside compiled classes: the flag is there for every kind and home.
+    assert "--no-daemon --no-build-cache" in gradle
+    assert "GRADLE_HOME" not in gradle and "warm" not in json.dumps(step_by_id(build, "build")["env"])
 
 
 def write_local_properties(build, tmp_path, keystore: str | None = "release.jks"):
@@ -794,7 +1237,7 @@ def test_a_qa_build_runs_ci_qa_the_same_way(build, tmp_path):
         build, tmp_path, KIND="qa", VERSION_NAME="2.0.0-qa.57", VERSION_CODE="200000057", SENTRY_AUTH_TOKEN=""
     )
     assert result.returncode == 0, result.stderr
-    # The same cold, uncached build as a release: it is signed with the same key.
+    # The same uncached build as a release, in whatever home: it is signed with the same key.
     assert arguments == [
         "ciQa", "-PciVersionName=2.0.0-qa.57", "-PciVersionCode=200000057", "-PciBuildKind=qa", "--no-daemon",
         "--no-build-cache",
@@ -1112,6 +1555,7 @@ def test_the_apks_are_verified_uploaded_and_the_secrets_deleted(build):
         "Upload the signed APKs",
         "Delete the keystore and local.properties",
         "Empty the work folder again",
+        "Tidy or discard the QA Gradle home",
         "Report the verdict",
     ]
     assert names[-len(order) :] == order
@@ -1163,10 +1607,17 @@ def test_the_verdict_covers_every_step_before_the_build(build):
     # A missing secret is final, and so are an incomplete plan and APKs that cannot be released: the
     # other runner would end the same way, after another cold build. The verdict is the only output:
     # the runner drops a job output that contains a secret's value, and a file or artifact name can.
+    #
+    # A Gradle run in the QA home that failed is never final: what reads like a failure of the code
+    # may be a damaged entry of the home, so the verdict is infra and the calling workflow builds
+    # again, cold, where a failure of the code fails again. The three refusals above stay code: no
+    # home changes a missing secret or the version an APK carries.
     assert build["outputs"] == {
         "verdict": (
             "${{ (steps.planned.outcome == 'failure' || steps.values.outcome == 'failure' "
-            "|| steps.apk.outputs.refused == 'true') && 'code' || steps.verdict.outputs.verdict }}"
+            "|| steps.apk.outputs.refused == 'true') && 'code' "
+            "|| (steps.gradle-home.outputs.warm == 'true' && steps.verdict.outputs.verdict == 'code' && 'infra') "
+            "|| steps.verdict.outputs.verdict }}"
         )
     }
     assert set(trigger(load(BUILD))["outputs"]) == {"verdict"}
@@ -1190,15 +1641,17 @@ def test_primary_and_fallback_pass_the_same_inputs(entry):
     # The names in local-properties-secrets are known only to the caller, so every secret is handed on.
     assert primary["secrets"] == fallback["secrets"] == "inherit"
     assert "secrets" not in inner
-    # sentry-upload is left at its default: a release always gets the token.
-    assert set(primary["with"]) == set(fallback["with"]) == set(inner["inputs"]) - {"sentry-upload"}
+    # sentry-upload is left at its default: a release always gets the token. So are gradle-home and
+    # the branch it is decided with: a release is built cold, and the QA home is the QA build's.
+    left_out = {"sentry-upload", "gradle-home", "source-branch"}
+    assert set(primary["with"]) == set(fallback["with"]) == set(inner["inputs"]) - left_out
     assert primary["with"]["attempt"] == "primary" and fallback["with"]["attempt"] == "fallback"
     # release or preview, from the plan's true or false: the word itself is not a job output.
     assert primary["with"]["kind"] == fallback["with"]["kind"] == "${{ needs.plan.outputs.preview == 'true' && 'preview' || 'release' }}"
     planned = {"sha": "sha", "version-name": "version", "version-code": "version-code"}
     for name, output in planned.items():
         assert primary["with"][name] == fallback["with"][name] == f"${{{{ needs.plan.outputs.{output} }}}}"
-    forwarded = set(inner["inputs"]) - {"runs-on", "attempt", "kind", "ref", "sentry-upload", *planned}
+    forwarded = set(inner["inputs"]) - {"runs-on", "attempt", "kind", "ref", *left_out, *planned}
     assert forwarded == set(inputs) - {
         "tag", "runner-labels", "fallback-runs-on", "source-branch", "required-checks", "release-notes-prompt",
     }

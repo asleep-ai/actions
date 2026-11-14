@@ -6,8 +6,15 @@ name: Android QA build
 # publishes it as the rolling pre-release of its line (qa-develop,
 # qa-release-1.x): one GitHub Release per line, whose APK every build
 # replaces. The build runs like the build of a release: on a self-hosted
-# runner when one is online, cold, and again on a GitHub-hosted runner after
-# an infrastructure failure.
+# runner when one is online, from an emptied work folder, and again on a
+# GitHub-hosted runner when the first build did not pass for a reason that
+# may lie outside the code.
+#
+# One thing differs from a release. On a self-hosted runner the build uses the
+# QA Gradle home of the repository (qa-gradle-home): a directory on the host
+# that only these builds use, kept between them, so the Gradle distribution
+# and the dependencies are not downloaded for every push. A release and a
+# preview never use it, and neither does a pull request build.
 #
 # The APK is published only when the checks of the same commit succeeded. The
 # job `checks` waits for them, because the push that starts this workflow
@@ -196,11 +203,25 @@ on:
         default: 60
       build-timeout-minutes:
         description: >-
-          Timeout of the build job, on either kind of runner. The build never
-          uses a cache, so size it for a cold build.
+          Timeout of the build job, on either kind of runner. Size it for a
+          cold build: the first build on a host, the build after the QA
+          Gradle home was discarded and the build on the GitHub-hosted runner
+          are cold.
         required: false
         type: number
         default: 60
+      qa-gradle-home:
+        description: >-
+          The Gradle user home of the build on a self-hosted runner. warm, the
+          default: the QA Gradle home of the repository, a directory on the
+          host that only QA and label builds use and that is kept between
+          them. cold: a home of the job, empty at its start and gone at its
+          end, as for a release. reset: the QA Gradle home, emptied first.
+          Empty means warm, so a calling file can pass an input of its manual
+          run. The build on a GitHub-hosted runner is always cold.
+        required: false
+        type: string
+        default: warm
       self-hosted-max-workers:
         description: >-
           Gradle --max-workers on a self-hosted runner. Empty leaves Gradle's
@@ -319,6 +340,22 @@ jobs:
             exit 1
           fi
 
+      # Empty stands for the default. Any other word stops the run here: the
+      # build job would take it for cold and say so in a warning, and every
+      # build after it would be slow without anyone having asked for that.
+      - name: Check qa-gradle-home
+        env:
+          QA_GRADLE_HOME: ${{ inputs.qa-gradle-home }}
+        run: |
+          set -euo pipefail
+          case "$QA_GRADLE_HOME" in
+            ''|warm|cold|reset) ;;
+            *)
+              echo "::error title=Invalid input::qa-gradle-home is '$QA_GRADLE_HOME'. It is one of warm, cold and reset."
+              exit 1
+              ;;
+          esac
+
       # Every tag, every branch and the whole history of the commit the run
       # started for: the version is counted from the release tags the commit
       # contains, and a label build from the rolling tags. Nothing of the
@@ -396,10 +433,16 @@ jobs:
           token: ${{ secrets.RUNNER_READ_TOKEN }}
           fallback: ${{ inputs.fallback-runs-on }}
 
-  # The build of a release, with ciQa as the task: an emptied work folder, a
-  # Gradle user home of its own, no cache, the version read back from every
-  # APK and every signature verified. A QA build is signed with the same key
-  # as a release, so it is trusted with no more than a release is.
+  # The build of a release, with ciQa as the task: an emptied work folder, no
+  # build cache and no daemon, the version read back from every APK and every
+  # signature verified. A QA build is signed with the same key as a release.
+  #
+  # The Gradle user home is where it differs: on a self-hosted runner this
+  # build uses the QA Gradle home (gradle-home), which the build job gives to
+  # nothing but a QA or label build of the source branch or of
+  # release/<major>.x. What is in it was put there by such builds, the builds
+  # of merged code that are signed anyway, and by nothing the pull request
+  # builds do with their own home.
   #
   # The version name is put together here, as release-version does it in the
   # plan (android-ci's tests compare the two): <version>-qa.<number>, or
@@ -427,13 +470,18 @@ jobs:
       expected-cert-sha256: ${{ inputs.expected-cert-sha256 }}
       build-tools-version: ${{ inputs.build-tools-version }}
       build-timeout-minutes: ${{ inputs.build-timeout-minutes }}
+      gradle-home: ${{ inputs.qa-gradle-home || 'warm' }}
+      source-branch: ${{ inputs.source-branch }}
       self-hosted-max-workers: ${{ inputs.self-hosted-max-workers }}
       self-hosted-gradle-jvmargs: ${{ inputs.self-hosted-gradle-jvmargs }}
       self-hosted-kotlin-daemon-jvmargs: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
     secrets: inherit
 
   # As in android-release.yml: only after a build on a self-hosted runner, and
-  # never after a code verdict.
+  # never after a code verdict. A Gradle run in the QA Gradle home that failed
+  # never has that verdict, so this build follows it: cold, whatever
+  # qa-gradle-home says and whatever runner fallback-runs-on names, and so the
+  # one that tells a failure of the code from a failure of the home.
   fallback:
     needs: [plan, primary]
     if: >-
@@ -465,6 +513,8 @@ jobs:
       expected-cert-sha256: ${{ inputs.expected-cert-sha256 }}
       build-tools-version: ${{ inputs.build-tools-version }}
       build-timeout-minutes: ${{ inputs.build-timeout-minutes }}
+      gradle-home: cold
+      source-branch: ${{ inputs.source-branch }}
       self-hosted-max-workers: ${{ inputs.self-hosted-max-workers }}
       self-hosted-gradle-jvmargs: ${{ inputs.self-hosted-gradle-jvmargs }}
       self-hosted-kotlin-daemon-jvmargs: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
@@ -473,7 +523,7 @@ jobs:
   # The one check that says whether the commit was built, and the one a
   # release requires next to the pull request check: android-pr-check.yml does
   # not build the release variant on a push to a branch that is released from,
-  # because this workflow does, cold and signed. The check of the calling job
+  # because this workflow does, signed. The check of the calling job
   # `qa` is "qa / built". It succeeds when the build passed on either runner,
   # whatever the publish job does afterwards: a commit whose APK was not
   # published (a newer build was there first, or its publish job was replaced
@@ -509,7 +559,7 @@ jobs:
             echo "::error title=The commit was not built::${SHA:0:7}: plan ${PLAN:-none}, build ${PRIMARY:-none}, build on the GitHub-hosted runner ${FALLBACK:-none}. A release of this commit requires this check; run the jobs that failed again once the reason is gone."
             exit 1
           fi
-          echo "${SHA:0:7} was built with ciQa on $where: the release variant, cold, signed and verified."
+          echo "${SHA:0:7} was built with ciQa on $where: the release variant, from an empty work folder, signed and verified."
 
   # Whether the commit passed what a pull request has to pass: an APK is handed
   # to people only then. The push that started this run started the checks

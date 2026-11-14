@@ -237,7 +237,7 @@ Measured cold builds on the GitHub-hosted runner (runs with `runner-labels` left
 
 **One build of a push is left to another workflow: the release build of a push to a branch that is released from**, the source branch and `release/<major>.x`.
 
-- [`android-qa.yml`](#android-qayml) builds the release variant of that very commit: `ciQa`, cold, with the release key, the version and the signature of every APK checked. A second release build of the same commit in this workflow, with a throwaway key, would add nothing but time on the runners.
+- [`android-qa.yml`](#android-qayml) builds the release variant of that very commit: `ciQa`, from an empty work folder, with the release key, the version and the signature of every APK checked. A second release build of the same commit in this workflow, with a throwaway key, would add nothing but time on the runners.
 - `release-build` still runs on such a push and reports `pass` without building, so `result` is decided by `code-style` and `verify`. `verify` builds and tests every push, as above.
 - **`result` of a push to those branches therefore no longer says that the release variant builds. The check of the QA build says it**, and a release requires both: `pr-check / result` and `qa / built` are the default `required-checks` of the version bump and of the release ([The check a release requires](#the-check-a-release-requires)). The two defaults change together, so a calling repository that takes them cannot tag a commit whose release variant no job built: without a QA build of the push, the release is refused.
 - A pull request builds the release variant as before, so R8 and keep-rule breakage still surface before the merge, and so does a push to any other branch.
@@ -386,7 +386,7 @@ These refusals happen in `plan`, and all but the last are the same on a dry run,
 | check | from | what it says |
 |-------|------|--------------|
 | `pr-check / result` | [`android-pr-check.yml`](#android-pr-checkyml), called by a job named `pr-check`, on the `push` run | The commit passed code style, the verification build, the tests and lint. That run always builds ([Skipped builds](#skipped-builds)). |
-| `qa / built` | [`android-qa.yml`](#the-check-a-release-requires), called by a job named `qa`, on the `push` run | The release variant of the commit was built, cold and signed, and its APKs were checked. The pull request check leaves that build to this workflow on a push. |
+| `qa / built` | [`android-qa.yml`](#the-check-a-release-requires), called by a job named `qa`, on the `push` run | The release variant of the commit was built from an empty work folder and signed, and its APKs were checked. The pull request check leaves that build to this workflow on a push. |
 
 - The merge commit gets both from the runs its push started, so the calling repository has to run both workflows on pushes to the branches that are released from, without a path filter and without cancelling a run for a later push.
 - A run that was cancelled leaves its check `cancelled`, and a commit that was pushed together with later ones has neither check. Run the failed or cancelled jobs of that commit's runs again, or release a later commit.
@@ -666,6 +666,8 @@ The build trusts nothing an earlier job left behind:
 - **No caches.** `setup-gradle` runs with the Actions cache off, and Gradle with `--no-daemon --no-build-cache`. Every dependency is downloaded and every task runs. The build is therefore about as slow on a self-hosted runner as on a GitHub-hosted one.
 - **The commit.** The checkout is the tag, and the job fails when the tag no longer names the commit the release was planned for.
 
+A QA build differs in the Gradle user home, and with it in the downloads: on a self-hosted runner it uses a home that QA builds keep between them ([The QA Gradle home](#the-qa-gradle-home)), so the Gradle distribution and the dependencies are not downloaded again. Every task still runs. A release and a preview never use that home.
+
 What a self-hosted host still shares with this job: the JDK and other tools in the runner's tool cache, the Android SDK, and everything else the runner's user can write, its home directory included (`~/.gitconfig`, which the checkout reads, and the configuration files of tools the build calls). A pull request build on the same host can change those. The workflow's own Python steps do not read the user's site-packages or `PYTHON*` variables. A repository that cannot accept the rest leaves `runner-labels` empty, and the release is built on a GitHub-hosted runner.
 
 On a self-hosted runner the Gradle step passes `--max-workers`, `org.gradle.jvmargs` and `kotlin.daemon.jvmargs` from the three `self-hosted-*` inputs, as the pull request check does.
@@ -748,6 +750,7 @@ jobs:
   - no `concurrency` in the calling file. With `cancel-in-progress`, the second of two merges in a row would cancel the build of the first, and the first could then not be released. With a group that cancels nothing, a whole run would wait behind the one before it, the wait for that one's checks included. The workflow keeps the order of what is published itself ([The rolling pre-release](#the-rolling-pre-release)).
 - `permissions` must grant the four scopes above: the pre-release and its tag (`contents: write`), private packages, the checks of the commit, and deleting the build's artifact (`actions: write`).
 - `secrets: inherit` is required, as for the release: the names in `local-properties-secrets` are known only to the calling repository.
+- Nothing is passed for the [QA Gradle home](#the-qa-gradle-home): a build on a self-hosted runner uses it by default. The example file adds an input `qa-gradle-home` to the manual run, for one build that is cold or that empties the home first.
 
 ### Jobs
 
@@ -759,13 +762,15 @@ plan ─▶ primary / build ─▶ fallback / build ─┬▶ built
 | job | runs on | what it does |
 |-----|---------|--------------|
 | `plan` | GitHub-hosted | Refuses a ref that is not built, computes the version name and versionCode with [`release-version`](../release-version/), and picks the runner. |
-| `primary / build` | picked runner | Builds the commit with `./gradlew ciQa`, checks the APKs and uploads them as an artifact. |
-| `fallback / build` | `fallback-runs-on` | The same build again, only after an infrastructure failure of a self-hosted primary build. |
+| `primary / build` | picked runner | Builds the commit with `./gradlew ciQa`, checks the APKs and uploads them as an artifact. On a self-hosted runner, in the [QA Gradle home](#the-qa-gradle-home). |
+| `fallback / build` | `fallback-runs-on` | The same build again, cold, only after a self-hosted primary build that failed for an infrastructure reason or whose Gradle run failed in the QA Gradle home. |
 | `built` | GitHub-hosted | States whether the commit was built: the check a release requires. |
 | `checks` | GitHub-hosted | Waits for the commit's checks, each commit on its own. Stops waiting when a newer build is published. |
 | `publish` | GitHub-hosted | Replaces the APKs of the rolling pre-release and deletes the artifact, one build at a time per pre-release. |
 
-The build job is the one of the release ([The build](#the-build)): the work folder emptied before and after, a Gradle user home of its own, no cache and no daemon, the version read back from every APK and every signature verified. A QA build is signed with the release key, so it is trusted with no more than a release is. It is therefore a cold build on every push; size `build-timeout-minutes` for that.
+The build job is the one of the release ([The build](#the-build)): the work folder emptied before and after, no build cache and no daemon, the version read back from every APK and every signature verified. A QA build is signed with the release key.
+
+One thing differs. A release starts from an empty Gradle user home, and so downloads the Gradle distribution and every dependency. A QA build is made on every push, so on a self-hosted runner it keeps its Gradle user home between builds, in a directory that only QA builds use ([The QA Gradle home](#the-qa-gradle-home)). Its first build on a host, a build after that home was discarded and the build on the GitHub-hosted runner are cold; size `build-timeout-minutes` for those.
 
 ### What the calling repository provides
 
@@ -783,12 +788,81 @@ The build job is the one of the release ([The build](#the-build)): the work fold
 - **A commit the pre-release is already past is built too.** Its build is what its check stands for; the pre-release is then left as it is ([The rolling pre-release](#the-rolling-pre-release)).
 - This is a rule of the workflow, checked from the run's own ref. It is not a protection of the signing key ([Who can release](#who-can-release)).
 
+### The QA Gradle home
+
+On a self-hosted runner a QA or label build keeps its Gradle user home between builds, in a directory of the runner's user:
+
+```
+~/android-qa-gradle/<owner>/<repo>/home
+```
+
+Nothing has to be set for it, on the host or in the calling file. `qa-gradle-home` turns it off.
+
+**What it saves, and what it does not.**
+
+- Kept between builds: what Gradle downloads (the Gradle distribution, the dependencies), what it derives from the downloads (transformed and dexed dependencies, the plugins' class path), and the compiled build scripts.
+- Not kept, as for a release: the work folder is emptied before and after the build, Gradle runs with `--no-daemon --no-build-cache`, and `setup-gradle` with the Actions cache off. **Every task of the project runs in every build**, and no task output is read from a cache or written to one.
+- So a build in a filled home is faster than a cold build by the downloads and by the work on the dependencies. It stays slower than the release build of the pull request check, which keeps its work folder and a build cache. By how much has not been measured: compare the first QA build on a host with the second.
+
+**Who uses it.** The build job decides, from the run and not from what a caller says. All four have to hold, and every other build is cold whatever it asks for:
+
+| | |
+|---|---|
+| the kind of build | A QA or label build. A release or a preview is built cold: `android-release.yml` does not ask for the home, and the build job refuses it to their kind. |
+| the runner | Self-hosted. A GitHub-hosted runner keeps nothing between jobs. |
+| the event | `push` or `workflow_dispatch`. Never a pull request. |
+| the ref | The source branch or `release/<major>.x`, the branches a QA build is [built from](#which-commits-are-built). |
+
+- The build after a failed one ([How a run is decided](#how-a-run-is-decided-1)) is cold, on whatever runner `fallback-runs-on` names.
+- The pull request check never uses the directory. Its jobs use the Gradle user home of the runner's user (`~/.gradle`), and no workflow file but the build job's names this one.
+
+**Who can write to it: builds of merged code.** This is why a build that signs may read it.
+
+- A build that signs does not read the Gradle user home the pull request builds share: what one of those builds leaves there, a dependency cache entry or an init script, would end up in a signed APK. That rule stands. The QA home is another directory, and through these workflows only the builds of the table write to it: the builds of the head of the source branch and of `release/<major>.x`, **which are signed with the release key anyway**. Code reaches those branches by a merge. What is in the home is therefore what builds of merged code put there: the dependencies their build files name, and whatever their build scripts and plugins did while they ran.
+- "Merged" is as strong as the rules of those branches ([Who can release](#who-can-release)). Someone who can push to the source branch without a review, or create `release/9.x`, gets a QA build signed in any case; with the home, that build can also leave something for the QA builds after it.
+- **It is not an isolation from the host.** The directory belongs to the runner's user, and every job on the host runs as that user. A pull request build that sets out to write into it can, just as it can change the JDK in the tool cache, the Android SDK or `~/.gitconfig`, which every build on the host reads, a release included ([The build](#the-build)). The home adds one more place of that kind; it does not add a kind. What it rules out is that a pull request build reaches a signed build through what Gradle does with its own home. A repository that cannot accept the rest gives the builds that sign runners of their own (another user or another host, with labels of their own), or leaves `runner-labels` empty.
+- **What a build of merged code leaves stays until the home is discarded**: a dependency that was published again under the same version, a file a plugin wrote into the home, an entry a killed build left half written. A cold build would have met it once. A snapshot or a dynamic version (`1.+`) is looked up again only when Gradle's own time for it is up, a day by default, so a QA build may carry an older one than a cold build would.
+- **The release never reads the home**, so none of this reaches a release or a preview. It also means that the release is the first cold build of its commit: `qa / built` says that the commit builds with the dependencies the QA home has, not that every one of them can still be downloaded.
+- Private packages that were downloaded with `GIT_TOKEN` stay in the home, where every job on the host can read them. The pull request builds leave the same packages in `~/.gradle`.
+
+**No secret is kept in it.**
+
+- The keystore and the prepared values are in the job's temp directory, and `local.properties` is in the work folder. All three are deleted at the end of the job, and the work folder is emptied.
+- The steps of the workflow write nothing of the run into the home: `setup-gradle` copies its init scripts there, the same ones for every build, and the memory settings go to Gradle on the command line, not into a `gradle.properties`.
+- No task output is cached, so no compiled class or resource that holds a value of `local.properties` gets there. A configuration cache, where the build uses one, is in the work folder.
+- **The home holds caches, never configuration.** Init scripts (`init.gradle`, `init.d/`, but for the ones `setup-gradle` writes for each build) and a `gradle.properties` are deleted before every build and after it. Finding one before a build is a warning: the build before deleted its own, and a build has no reason to write one.
+- The logs of the build's daemon (`daemon/<version>/*.log`) hold the output of the build as Gradle printed it; the runner masks secrets in its own log only. They are deleted after the build, and before the next one for a job that died.
+- What this does not see: a build whose own code writes a secret into a file of the home.
+
+**Several runners, one home.**
+
+- One home for each repository. Repositories differ in who can merge, and the builds of one do not write what the signed builds of another read. `<owner>` and `<repo>` are two directories, so no two names meet.
+- One home for all lines of a repository. The source branch and `release/<major>.x` have the same reviewers, the same key and mostly the same dependencies, and a maintenance branch is built too rarely to keep a home of its own filled.
+- One home for every runner of a host that runs as the same user, at the same path for each of them. Gradle is made for several builds in one user home: each cache is guarded by a file lock between processes, which the operating system releases when a process dies, so a killed build leaves no lock behind. The pull request builds of a host share `~/.gradle` in the same way ([Self-hosted runners](#self-hosted-runners)). The two things known to go wrong in a shared home are not used here: the build cache, whose entries one build removes while another reads them, and daemons.
+- What the locks do not cover is an entry that a killed build left half written. That is what the next part is for.
+- A symbolic link in place of the home, or directly inside it, is not followed: the link is how another Gradle user home would get back in. The build then starts with an empty home and a warning.
+
+**When the home is damaged.**
+
+- **A Gradle run in the QA home that fails is never the last word.** A damaged entry reads like a compile error, so the build job reports the failure as `infra` whatever the log says, and the build runs again on the GitHub-hosted runner, cold. When that build passes, the commit was built: `built` succeeds and says where, `publish` adds the warning of a build that passed only on the re-run, and the run stays red for its first build. When it fails too, the failure is the code's.
+- The price: a QA build that fails because of the code is built twice before the run ends, and the second build is the slow one.
+- **A home that a failed Gradle run used is not used again.** At the end of that job it is moved away and deleted, and the next QA build on the host starts with an empty one, as slow as a cold build, and fills it. The same after a Gradle run that was cancelled or hit the timeout. A failure of another step (the APK check, the signatures, the upload) leaves the home alone.
+- The job cannot tell a failure of the code from a failure of the home, so a failure of the code costs the home as well: one slow build after it.
+- A build on another runner that is using the home at that moment loses it, fails, and is built again on the GitHub-hosted runner like any failed build.
+- A job that died with its runner discards nothing. When it left the home damaged, the next QA build fails, is built again cold, and discards the home: one round.
+- **By hand**: `qa-gradle-home: reset` empties the home before one build. [`qa.yml.example`](./qa.yml.example) has it as an input of the manual run. It empties the home on the host the job lands on; with several hosts, each has its own. It is a value for one run, not for the calling file: there, every build would empty the home under the builds that run beside it. On the host itself, delete `~/android-qa-gradle/<owner>/<repo>` while no QA build of the repository runs.
+- `qa-gradle-home: cold` in the calling file builds every QA build as a release is built.
+
+Gradle itself removes from the home what no build has used for some time, by default 30 days for what it downloaded. How large the home of a calling repository gets has not been measured.
+
+**Look at it once**, after the first two QA builds on a host. The step `Choose the Gradle user home` of the build job says which home the build got and why: `the QA home of <owner>/<repo>` and, from the second build on, `The QA home exists`. A build that was meant to be warm and is not carries the warning `QA Gradle home not used`.
+
 ### The check a release requires
 
 `built` succeeds when the build of the commit passed, on the picked runner or on the re-run, and fails otherwise: a plan that refused the run, a build that failed, a run that was cancelled. It does not wait for `publish` and is not changed by it.
 
 - **Its name is `<calling job> / built`, `qa / built` in the example, and only for a run that a push started.** That is the name in the default `required-checks` of [`android-version-bump.yml`](#what-is-released) and [`android-release.yml`](#the-tag-1), next to `pr-check / result`.
-- **It stands for the release build of the pushed commit.** [`android-pr-check.yml`](#skipped-builds) does not build the release variant on a push to a branch that is released from, because this workflow builds it there: cold, with the release key, the version and signature of every APK checked. The two checks together say what `pr-check / result` alone said before: the commit was built, tested, and built for release.
+- **It stands for the release build of the pushed commit.** [`android-pr-check.yml`](#skipped-builds) does not build the release variant on a push to a branch that is released from, because this workflow builds it there: from an empty work folder, with the release key, the version and signature of every APK checked. The two checks together say what `pr-check / result` alone said before: the commit was built, tested, and built for release.
 - **A manual run reports `<calling job> / built (manual run)` instead.** It builds what its inputs say (a label, a version, another flavor through `gradle-args`). A release reads the newest check run of a name, so under one name a manual build could stand in for the build of the push, or a failed one could hide it.
 - A commit whose push run failed for a reason outside the code is built again with **Re-run failed jobs** on that run; the check then succeeds, even when the pre-release has moved on.
 - A commit that no push run built has no such check and cannot be released: a commit that was pushed together with later ones, or one from before the repository called this workflow. Release a later commit.
@@ -936,7 +1010,8 @@ Each line has one GitHub Release, a pre-release that is never the latest release
 | `sequence-offset` | `0` | A whole number added to the run number of the calling workflow to give the `N` of a QA build. |
 | `required-checks` | `pr-check / result` | Names of the checks that must have succeeded on the commit before its APK is published, one per line. Empty requires none. |
 | `checks-timeout-minutes` | `60` | How long `checks` waits, after the build, for a required check that has not finished. A whole number, at most 100. |
-| `build-timeout-minutes` | `60` | Timeout of the build job, on either kind of runner. The build never uses a cache, so size it for a cold build. |
+| `build-timeout-minutes` | `60` | Timeout of the build job, on either kind of runner. Size it for a cold build: the first build on a host, the build after the QA Gradle home was discarded and the build on the GitHub-hosted runner are cold. |
+| `qa-gradle-home` | `warm` | The Gradle user home of the build on a self-hosted runner ([The QA Gradle home](#the-qa-gradle-home)). `warm`: the QA Gradle home of the repository, kept between QA builds. `cold`: a home of the job, empty at its start and gone at its end, as for a release. `reset`: the QA Gradle home, emptied first. Empty means `warm`, so a calling file can pass an input of its manual run; any other value fails in `plan`. The build on a GitHub-hosted runner is always cold. |
 | `self-hosted-max-workers` | `32` | Gradle `--max-workers` on a self-hosted runner. Empty leaves Gradle's default. |
 | `self-hosted-gradle-jvmargs` | `-Xmx16g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8` | `org.gradle.jvmargs` on a self-hosted runner. Empty keeps the caller's `gradle.properties` value. |
 | `self-hosted-kotlin-daemon-jvmargs` | `-Xmx6g` | `kotlin.daemon.jvmargs` on a self-hosted runner. Empty keeps the caller's value. |
@@ -987,6 +1062,7 @@ The workflows share one picture of the calling repository:
 - **Starting the version bump.** Write access is what `workflow_dispatch` asks for. One person starts the dry run, reads the plan and starts the release with `confirm`; no second person is involved ([Dry run and confirmation](#dry-run-and-confirmation)). Required reviewers on an environment would add one, and a private repository on the Team plan cannot have them.
 - **Pushing a tag by hand.** Everyone with write access can push a tag `vX.Y.Z` or `vX.Y.0-preview.N`, or start the release workflow for one, without the version bump.
 - **Starting a QA build or a label build.** Every push to a release branch makes a QA build, and everyone with write access can start one by hand on those branches, with a label or with the next minor or major version. The workflow builds no other ref and no other version, which is a rule of its own file like the checks below: a branch that changes its calling file is not held by it.
+- **Writing what later QA builds read.** A QA build on a self-hosted runner keeps its Gradle user home for the QA builds after it ([The QA Gradle home](#the-qa-gradle-home)). Through the workflows, only builds of the release branches write to it, the builds that are signed anyway; whoever can get code onto those branches without a review can leave something there. So can any job on the same host that sets out to, a pull request build included: the home is a directory of the runner's user, not a boundary. No release and no preview is built from it.
 - **Reading the signing key.** With the signing secrets among the repository's or the organization's secrets, every workflow on every branch can read them. With a `release` environment that holds them, the rule for branches and tags keeps the key from pull request runs and from every other branch, but it goes by ref names: someone with write access can change a workflow on a branch, tag that commit `v0.0.1-x` or push it as `release/x`, and the run of that ref may name the environment and read the key.
 
 What the workflows do enforce, for the version bump and for a hand-pushed tag alike, is **what** is released, not who releases it:
@@ -1071,12 +1147,24 @@ Moving the tag `android-ci/v1` to this release:
 - **Not while a version bump or a release is running.** A run reads the workflow file when it starts and each action of this repository when the job that uses it starts. A move in between gives one run the plan of one version and the versionCode formula of another.
 - A calling repository whose earlier workflow made builds by another formula stops making them before the move: their versionCodes and the new ones are counted apart, and may collide or leapfrog a release.
 
+`android-ci/v1.2.1` changes how a QA build is made, for a caller that changes nothing:
+
+| what | before | from `v1.2.1` | a caller that does nothing |
+|------|--------|---------------|----------------------------|
+| the Gradle user home of a QA or label build on a self-hosted runner | a home of the job, empty at its start: every build downloads the Gradle distribution and every dependency | the [QA Gradle home](#the-qa-gradle-home) of the repository, `~/android-qa-gradle/<owner>/<repo>/home` on the host, kept between QA builds | From the second QA build on each host, the Gradle distribution and the dependencies are not downloaded again. `qa-gradle-home: cold` keeps the earlier build. |
+| a failed Gradle run of such a build | final when the log read as a failure of the code | never final: the build runs again on the GitHub-hosted runner, cold, and the home is discarded | A QA build that fails because of the code is built twice, and the run ends later. |
+| a release, a preview, the pull request check | | unchanged: a release and a preview are built cold, and no pull request build uses the QA Gradle home | |
+
+- `qa / built` still says that the release variant of the commit was built from an empty work folder, with every task run, signed and verified. It no longer says that every dependency was downloaded for that build.
+- The host needs room for one Gradle user home per calling repository under the home directory of the runner's user. Nothing is to be created there.
+- [`qa.yml.example`](./qa.yml.example) has a new, optional input of the manual run, `qa-gradle-home`. A calling file without it works as before.
+
 ## Development
 
 ```bash
 uv run --with pytest --with pyyaml python -m pytest android-ci -q
 ```
 
-The tests read the workflow files. They run the shell of each `run` step against throwaway git repositories and stand-ins for `gradlew`, `keytool`, `gh`, `aapt2` and the GitHub API, check every combination of results and verdicts that `result` has to decide, and fail when the copies that have to match drift apart: the `verify` and `release-build` jobs, the `primary` and `fallback` calls of the build workflows, and the script that reads a commit's checks in the version bump, the release and the QA build.
+The tests read the workflow files. They run the shell of each `run` step against throwaway git repositories and stand-ins for `gradlew`, `keytool`, `gh`, `aapt2` and the GitHub API, check every combination of results and verdicts that `result` has to decide, and fail when the copies that have to match drift apart: the `verify` and `release-build` jobs, the `primary` and `fallback` calls of the build workflows, and the script that reads a commit's checks in the version bump, the release and the QA build. The step that chooses the Gradle user home is run for every kind of build, event and ref, against a stand-in for the home directory of the runner's user: which builds get the QA Gradle home, what is deleted from it before and after a build, and that a link to another home is not followed.
 
-They cannot evaluate GitHub's expressions or its behaviour: job conditions, job names and the expressions that put a version name together are pinned as text, and how secrets of an environment reach a called workflow, whether a push or the move of a tag is accepted under the repository's rules, under which name the check of a job appears on a commit, what GitHub answers when a tag is compared with a commit, whether a started workflow runs, and how GitHub shows a pre-release whose tag was moved are verified only by running the workflows from a calling repository. The stand-in for `gh` in the QA tests keeps the assets of a release and records them after every change, so the tests do see whether a release was ever without its APK; they do not see what the real API answers.
+They cannot evaluate GitHub's expressions or its behaviour: job conditions, job names and the expressions that put a version name together are pinned as text, and how secrets of an environment reach a called workflow, whether a push or the move of a tag is accepted under the repository's rules, under which name the check of a job appears on a commit, what GitHub answers when a tag is compared with a commit, whether a started workflow runs, and how GitHub shows a pre-release whose tag was moved are verified only by running the workflows from a calling repository. The same holds for the QA Gradle home: no test runs Gradle, so how much time a filled home saves, what Gradle and `setup-gradle` write into it, and how two builds that share it get along are seen only on the runners. The stand-in for `gh` in the QA tests keeps the assets of a release and records them after every change, so the tests do see whether a release was ever without its APK; they do not see what the real API answers.

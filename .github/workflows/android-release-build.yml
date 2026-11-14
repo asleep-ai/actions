@@ -8,6 +8,12 @@ name: Android release build
 # keystore, checks every APK the build left and uploads them as one artifact
 # for the publish job.
 #
+# Every build starts from an emptied work folder and runs every task. A
+# release or a preview also starts from an empty Gradle user home. A QA or
+# label build on a self-hosted runner may use the QA home of its repository
+# instead (gradle-home), a directory that only such builds use and that is
+# kept between them: see the step that chooses the home.
+#
 # This file is internal to those two workflows: call them, not this one. The
 # inputs are documented there and in android-ci/README.md.
 on:
@@ -96,6 +102,27 @@ on:
       build-timeout-minutes:
         required: true
         type: number
+      gradle-home:
+        description: >-
+          cold, warm or reset. cold, the default: a Gradle user home of this
+          job, empty at its start and gone at its end. warm: the QA home of
+          the repository, which is kept between jobs. reset: that home,
+          emptied first. Anything but cold is honoured only for kind qa or
+          label, on a self-hosted runner, in a run that a push or a person
+          started on the source branch or on release/<major>.x. Every other
+          build is cold, whatever the value. android-release.yml does not
+          pass it.
+        required: false
+        type: string
+        default: cold
+      source-branch:
+        description: >-
+          The branch releases are cut from; empty means the default branch of
+          the repository. Read only to decide whether the run may use the QA
+          home.
+        required: false
+        type: string
+        default: ''
       self-hosted-max-workers:
         required: false
         type: string
@@ -114,7 +141,8 @@ on:
           pass, code or infra; empty when the job never reported (its runner
           went away). code also stands for a missing secret or variable and
           for APKs that cannot be released: another runner would end the same
-          way.
+          way. A Gradle run in the QA home that failed is infra, never code:
+          a cold build may end otherwise.
         value: ${{ jobs.build.outputs.verdict }}
 
 permissions:
@@ -142,8 +170,13 @@ jobs:
     #
     # code as well when the plan of the calling workflow passed something
     # empty: the same plan would pass it to the second build.
+    #
+    # Never code for a Gradle run that used the QA home and failed: the
+    # failure may be the home's (a damaged entry reads like a compile error),
+    # so it is reported as infra and the calling workflow builds again, cold,
+    # on the GitHub-hosted runner. A failure of the code fails there too.
     outputs:
-      verdict: ${{ (steps.planned.outcome == 'failure' || steps.values.outcome == 'failure' || steps.apk.outputs.refused == 'true') && 'code' || steps.verdict.outputs.verdict }}
+      verdict: ${{ (steps.planned.outcome == 'failure' || steps.values.outcome == 'failure' || steps.apk.outputs.refused == 'true') && 'code' || (steps.gradle-home.outputs.warm == 'true' && steps.verdict.outputs.verdict == 'code' && 'infra') || steps.verdict.outputs.verdict }}
     steps:
       # A self-hosted runner keeps its work folder between jobs, and the jobs
       # before this one may have built a pull request: files in the folder, git
@@ -342,20 +375,177 @@ jobs:
           distribution: ${{ inputs.java-distribution }}
           java-version: ${{ inputs.java-version }}
 
-      # The temp directory is emptied by the runner before and after every
-      # job. A Gradle user home there starts without init scripts, dependency
-      # cache, build cache or daemons of any other job, and what this build
-      # leaves in it, values of local.properties included, is gone when the
-      # job ends.
-      - name: Use a Gradle user home of this job
+      # Cold, for every release and preview and wherever nothing else is asked
+      # for: a Gradle user home in the job's temp directory, which the runner
+      # empties before and after every job. It starts without init scripts,
+      # dependency cache, build cache or daemons of any other job, and what
+      # this build leaves in it, values of local.properties included, is gone
+      # when the job ends.
+      #
+      # Warm, for a QA or label build that asks for it (gradle-home): the QA
+      # home of the repository, <HOME>/android-qa-gradle/<owner>/<repo>/home,
+      # a directory of the runner's user that no other step of these
+      # workflows names. It is kept between jobs, so a build finds the Gradle
+      # distribution, the dependencies and what Gradle derived from them
+      # already there.
+      #
+      # Who may use it is decided here, from the run itself and not from what
+      # a caller says: a QA or label build, on a self-hosted runner, in a run
+      # that a push or a person started on the source branch or on
+      # release/<major>.x. Those are the builds of merged code that are signed
+      # anyway. Every other build is cold whatever was asked for: a release,
+      # a preview, a GitHub-hosted runner, any other event, any other ref.
+      #
+      # One home per repository, for all its lines and for every runner of a
+      # host that runs as the same user: the same path on each of them, as
+      # ~/.gradle is for the pull request builds. Gradle guards a user home
+      # that several builds use at once with file locks. The pull request
+      # builds never use this directory, and this build never uses theirs.
+      #
+      # The home holds caches, never configuration. Init scripts, a
+      # gradle.properties and daemon logs found in it are deleted before the
+      # build; setup-gradle writes its own init scripts (gradle-actions.*) in
+      # the next step, and those stay, because a build on another runner may
+      # be reading them. A symbolic link in place of the home or directly
+      # inside it, which is how another home would get back in, ends in an
+      # empty home. So does gradle-home reset.
+      #
+      # Nothing about the QA home fails the step: whatever keeps it from
+      # being used ends in a cold build and a warning.
+      - name: Choose the Gradle user home
         id: gradle-home
+        env:
+          GRADLE_HOME: ${{ inputs.gradle-home }}
+          KIND: ${{ inputs.kind }}
+          RUNNER_KIND: ${{ runner.environment }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_REF: ${{ github.ref }}
+          SOURCE_BRANCH: ${{ inputs.source-branch || github.event.repository.default_branch }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          home="$RUNNER_TEMP/gradle-user-home"
-          rm -rf "$home"
-          mkdir -p "$home"
+          cold="$RUNNER_TEMP/gradle-user-home"
+          rm -rf "$cold"
+          use_cold() {
+            mkdir -p "$cold"
+            echo "GRADLE_USER_HOME=$cold" >> "$GITHUB_ENV"
+            echo "warm=false" >> "$GITHUB_OUTPUT"
+            echo "Gradle user home: $cold (cold: $1)"
+            exit 0
+          }
+          # The build was meant to be warm and is not: the host has to hear of it.
+          give_up() {
+            echo "::warning title=QA Gradle home not used::$1 The build is cold."
+            use_cold "the QA home cannot be used"
+          }
+
+          case "$GRADLE_HOME" in
+            warm|reset) ;;
+            cold) use_cold "gradle-home is cold" ;;
+            *) give_up "gradle-home is none of cold, warm and reset." ;;
+          esac
+          if [[ "$KIND" != qa && "$KIND" != label ]]; then
+            use_cold "a release or a preview is built cold, whatever gradle-home says"
+          fi
+          if [[ "$RUNNER_KIND" != self-hosted ]]; then
+            use_cold "a GitHub-hosted runner keeps nothing between jobs"
+          fi
+          if [[ "$EVENT_NAME" != push && "$EVENT_NAME" != workflow_dispatch ]]; then
+            use_cold "only a run that a push or a person started uses the QA home, and this is a $EVENT_NAME run"
+          fi
+          release_line='^release/(0|[1-9][0-9]*)\.x$'
+          branch="${RUN_REF#refs/heads/}"
+          if [[ "$RUN_REF" != refs/heads/* || -z "$SOURCE_BRANCH" ]] || [[ "$branch" != "$SOURCE_BRANCH" && ! "$branch" =~ $release_line ]]; then
+            use_cold "only a run on the source branch or on release/<major>.x uses the QA home, and this run is on $RUN_REF"
+          fi
+
+          # <owner>/<repo>, as two directories: no two repositories share a path.
+          repository_name='^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$'
+          if [[ ! "$REPOSITORY" =~ $repository_name || "$REPOSITORY" == */. || "$REPOSITORY" == */.. ]]; then
+            give_up "The name of the repository cannot name a directory."
+          fi
+          if [[ -z "${HOME:-}" || "$HOME" != /* || ! -d "$HOME" ]]; then
+            give_up "HOME is not a directory, so there is no place for the QA home."
+          fi
+          root="$HOME/android-qa-gradle"
+          base="$root/$REPOSITORY"
+          home="$base/home"
+
+          # Moved away in one step and deleted after that: a build that starts
+          # meanwhile finds no home and makes its own, never half of one.
+          discard() {
+            local gone="$base/discarded-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}-$$"
+            mv "$home" "$gone" || return 1
+            rm -rf "$gone" || return 1
+          }
+          # A function that is asked "did it work" runs without errexit, so
+          # it returns at its first failure itself.
+          problem="The QA home could not be prepared; the reason is in the lines above."
+          prepare() {
+            local path names
+            for path in "$root" "${base%/*}" "$base"; do
+              if [[ -L "$path" ]]; then
+                problem="$path is a symbolic link, and the QA home is a directory of its own."
+                return 1
+              fi
+            done
+            mkdir -p "$base" || return 1
+            chmod 700 "$root" || return 1
+            # What a discard that was interrupted left behind.
+            find "$base" -mindepth 1 -maxdepth 1 -name 'discarded-*' -exec rm -rf {} + \
+              || echo "Could not delete everything an earlier discard left in $base. The next build tries again."
+            if [[ -L "$home" ]]; then
+              rm -f "$home" || return 1
+              echo "::warning title=QA Gradle home discarded::$home was a symbolic link. The link is deleted, and the build starts with an empty QA home."
+            elif [[ -d "$home" ]]; then
+              path=$(find "$home" -mindepth 1 -maxdepth 1 -type l -print -quit) || return 1
+              if [[ -n "$path" ]]; then
+                discard || return 1
+                echo "::warning title=QA Gradle home discarded::$path was a symbolic link: the QA home shares nothing with another Gradle user home. The build starts with an empty QA home."
+              elif [[ "$GRADLE_HOME" == reset ]]; then
+                discard || return 1
+                echo "Discarded the QA home: gradle-home is reset."
+              fi
+            elif [[ -e "$home" ]]; then
+              rm -f "$home" || return 1
+            fi
+            if [[ -d "$home" ]]; then
+              echo "The QA home exists: earlier QA builds of $REPOSITORY left it."
+            else
+              echo "The QA home is new: this build fills it."
+            fi
+            mkdir -p "$home" || return 1
+            chmod 700 "$home" || return 1
+
+            stray=()
+            for path in "$home/init.gradle" "$home/init.gradle.kts" "$home/gradle.properties"; do
+              if [[ -e "$path" ]]; then
+                stray+=("$path")
+              fi
+            done
+            if [[ -d "$home/init.d" ]]; then
+              while IFS= read -r path; do
+                stray+=("$path")
+              done < <(find "$home/init.d" -mindepth 1 -maxdepth 1 ! -name 'gradle-actions.*')
+            fi
+            if [[ "${#stray[@]}" != 0 ]]; then
+              rm -rf "${stray[@]}" || return 1
+              names=$(for path in "${stray[@]}"; do echo "${path#"$home"/}"; done | sort | tr '\n' ' ')
+              echo "::warning title=QA Gradle home held configuration::Deleted from the QA home before the build: ${names% }. The build before deletes them at its end and a build has no reason to write them, so look for what did."
+            fi
+            if [[ -d "$home/daemon" ]]; then
+              find "$home/daemon" -type f -name '*.log' -delete || return 1
+            fi
+          }
+          if ! prepare; then
+            give_up "$problem"
+          fi
           echo "GRADLE_USER_HOME=$home" >> "$GITHUB_ENV"
-          echo "Gradle user home: $home"
+          {
+            echo "warm=true"
+            echo "home=$home"
+          } >> "$GITHUB_OUTPUT"
+          echo "Gradle user home: $home (the QA home of $REPOSITORY)"
 
       # For the wrapper validation and the job summary. The Actions cache is
       # off on every runner: nothing is restored into a build that signs, and
@@ -456,6 +646,14 @@ jobs:
           # A build that is signed is built from its sources alone: no daemon
           # of an earlier build, no build cache entry from anywhere. The copy
           # in the temp directory is what gradle-log-verdict reads.
+          #
+          # That holds in the QA home too, which is why the two flags do not
+          # depend on it. The work folder was empty, and no task output is
+          # read from a cache or written to one: every task of the project
+          # runs, and no value of local.properties ends up in the home inside
+          # a cached output. What the QA home saves is the downloads (the
+          # Gradle distribution, the dependencies), what Gradle derives from
+          # them, and the compiled build scripts.
           #
           # -PciBuildKind says which of the four kinds the build is, for a
           # build that puts it into the name of the APK. A build that does not
@@ -611,8 +809,8 @@ jobs:
 
       # The build outputs hold the values of local.properties (generated
       # sources, the APK), and a self-hosted runner would keep them for the
-      # jobs that follow. The Gradle user home is in the temp directory, which
-      # the runner empties itself.
+      # jobs that follow. A cold Gradle user home is in the temp directory,
+      # which the runner empties itself; the QA home is seen to below.
       - name: Empty the work folder again
         if: ${{ always() }}
         env:
@@ -627,12 +825,76 @@ jobs:
             echo "Emptied $GITHUB_WORKSPACE."
           fi
 
+      # Only after a build in the QA home, which outlives the job.
+      #
+      # A Gradle run that did not succeed there leaves a home that is not
+      # used again: it is moved away and deleted, and the next QA build on
+      # this host starts with an empty one. The failure may be the code's,
+      # and then a good home is thrown away for one slow build; it may be the
+      # home's (an entry that a killed build left half written), and then
+      # every build after it would fail the same way. The two cannot be told
+      # apart here. A build on another runner of the host that is using the
+      # home at that moment loses it and fails over to the GitHub-hosted
+      # runner as well.
+      #
+      # After any other build the home is kept, without what is not a cache:
+      # the logs of the build's daemon, which hold its output as Gradle
+      # printed it, and configuration (init scripts but setup-gradle's, a
+      # gradle.properties), should the build have left any.
+      #
+      # The path is the output of the step that chose the home, not
+      # GRADLE_USER_HOME: the build ran in between and can write to the
+      # file that sets the variables of later steps. The step never fails: a
+      # home it could not see to is discarded or tidied by the next build.
+      - name: Tidy or discard the QA Gradle home
+        if: ${{ always() && steps.gradle-home.outputs.warm == 'true' }}
+        env:
+          QA_HOME: ${{ steps.gradle-home.outputs.home }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          set -euo pipefail
+          root="${HOME:-}/android-qa-gradle"
+          if [[ -z "${HOME:-}" || "$QA_HOME" != "$root"/*/home || "$QA_HOME" == *..* || -L "$QA_HOME" ]]; then
+            echo "::warning title=QA Gradle home left as it is::'$QA_HOME' is not a QA home under $root."
+            exit 0
+          fi
+          if [[ ! -d "$QA_HOME" ]]; then
+            echo "The QA home is gone: another build discarded it."
+            exit 0
+          fi
+          base="${QA_HOME%/home}"
+          if [[ "$BUILD_OUTCOME" == failure || "$BUILD_OUTCOME" == cancelled ]]; then
+            gone="$base/discarded-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}-$$"
+            if mv "$QA_HOME" "$gone" && rm -rf "$gone"; then
+              echo "::notice title=QA Gradle home discarded::The Gradle run in the QA home ended as $BUILD_OUTCOME, so the home is not used again. The next QA build on this host starts with an empty one and is as slow as a cold build."
+            else
+              echo "::warning title=QA Gradle home not discarded::The Gradle run in the QA home ended as $BUILD_OUTCOME, and $QA_HOME could not be moved away and deleted. Delete $base on the host."
+            fi
+            exit 0
+          fi
+          tidy() {
+            rm -rf "$QA_HOME/init.gradle" "$QA_HOME/init.gradle.kts" "$QA_HOME/gradle.properties" || return 1
+            if [[ -d "$QA_HOME/init.d" ]]; then
+              find "$QA_HOME/init.d" -mindepth 1 -maxdepth 1 ! -name 'gradle-actions.*' -exec rm -rf {} + || return 1
+            fi
+            if [[ -d "$QA_HOME/daemon" ]]; then
+              find "$QA_HOME/daemon" -type f -name '*.log' -delete || return 1
+            fi
+          }
+          if tidy; then
+            echo "Kept the QA home for the next QA build, without daemon logs and configuration: $QA_HOME"
+          else
+            echo "::warning title=QA Gradle home not tidied::Could not delete the daemon logs or the configuration in $QA_HOME; the reason is in the lines above. The next QA build deletes them before it starts."
+          fi
+
       # The secrets check and the check of the plan are left out of
       # setup-outcome: a missing secret or an incomplete plan is reported as
       # code by the job output, because no other runner would have it.
       # job-status covers the steps after the build (the APK check, the
       # signature, the upload): when one of them fails, the verdict is infra,
-      # which the job output turns into code when the APKs were refused.
+      # which the job output turns into code when the APKs were refused. The
+      # job output also turns a code verdict of a Gradle run in the QA home
+      # into infra; the log line of this step still says what the log said.
       - name: Report the verdict
         id: verdict
         if: ${{ always() && steps.planned.outcome != 'failure' && steps.values.outcome != 'failure' }}
