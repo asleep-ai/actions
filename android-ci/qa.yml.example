@@ -26,14 +26,6 @@ on:
         description: 'Optional: the next minor or major version X.Y.Z, for one QA build of it that installs over the releases that are out. Published apart, as qa-<line>-<version>. Not with label'
         required: false
         type: string
-      # Optional, and only for this one run. Leave it out of the file and every
-      # build uses the QA Gradle home, which is the default of the workflow.
-      qa-gradle-home:
-        description: 'The Gradle user home on a self-hosted runner. warm: the QA Gradle home, kept between QA builds. cold: an empty one for this build. reset: the QA Gradle home, emptied first'
-        required: false
-        type: choice
-        options: [warm, cold, reset]
-        default: warm
 
 # The called workflow can use no more than what is granted here, and it fails
 # to start when one of these is missing.
@@ -54,8 +46,12 @@ jobs:
       runner-labels: '["self-hosted","Linux","X64"]'
       label: ${{ inputs.label }}
       version: ${{ inputs.version }}
-      # Empty on a push, which the workflow reads as warm.
-      qa-gradle-home: ${{ inputs.qa-gradle-home }}
+      # Optional, and off unless it is set: `warm` keeps the Gradle user home
+      # of the QA builds on the self-hosted host between them, so the Gradle
+      # distribution and the dependencies are not downloaded for every push.
+      # Read "The QA Gradle home" in android-ci/README.md before turning it
+      # on: who can write to that home, and what to look at afterwards.
+      # qa-gradle-home: warm
       # Secrets and variables written to local.properties under their own
       # names, next to the four signing keys.
       local-properties-secrets: |

@@ -10,11 +10,12 @@ name: Android QA build
 # GitHub-hosted runner when the first build did not pass for a reason that
 # may lie outside the code.
 #
-# One thing differs from a release. On a self-hosted runner the build uses the
-# QA Gradle home of the repository (qa-gradle-home): a directory on the host
-# that only these builds use, kept between them, so the Gradle distribution
-# and the dependencies are not downloaded for every push. A release and a
-# preview never use it, and neither does a pull request build.
+# One thing can differ from a release, when the calling repository asks for it
+# (qa-gradle-home: warm). On a self-hosted runner the build then uses the QA
+# Gradle home of the repository: a directory on the host that only these
+# builds use, one at a time, kept between them, so the Gradle distribution and
+# the dependencies are not downloaded for every push. A release and a preview
+# never use it, and neither does a pull request build.
 #
 # The APK is published only when the checks of the same commit succeeded. The
 # job `checks` waits for them, because the push that starts this workflow
@@ -204,24 +205,25 @@ on:
       build-timeout-minutes:
         description: >-
           Timeout of the build job, on either kind of runner. Size it for a
-          cold build: the first build on a host, the build after the QA
-          Gradle home was discarded and the build on the GitHub-hosted runner
-          are cold.
+          cold build, with qa-gradle-home warm as well: the first build on a
+          host, a build that finds the QA Gradle home in use or discarded and
+          the build on the GitHub-hosted runner are cold.
         required: false
         type: number
         default: 60
       qa-gradle-home:
         description: >-
-          The Gradle user home of the build on a self-hosted runner. warm, the
-          default: the QA Gradle home of the repository, a directory on the
-          host that only QA and label builds use and that is kept between
-          them. cold: a home of the job, empty at its start and gone at its
-          end, as for a release. reset: the QA Gradle home, emptied first.
-          Empty means warm, so a calling file can pass an input of its manual
-          run. The build on a GitHub-hosted runner is always cold.
+          The Gradle user home of the build on a self-hosted runner. cold, the
+          default: a home of the job, empty at its start and gone at its end,
+          as for a release. warm: the QA Gradle home of the repository, a
+          directory on the host that only QA and label builds of the default
+          branch and of release/<major>.x use, one at a time, and that is kept
+          between them. reset: the QA Gradle home, emptied first. Empty means
+          cold, so a calling file can pass an input of its manual run. The
+          build on a GitHub-hosted runner is always cold.
         required: false
         type: string
-        default: warm
+        default: cold
       self-hosted-max-workers:
         description: >-
           Gradle --max-workers on a self-hosted runner. Empty leaves Gradle's
@@ -340,9 +342,10 @@ jobs:
             exit 1
           fi
 
-      # Empty stands for the default. Any other word stops the run here: the
-      # build job would take it for cold and say so in a warning, and every
-      # build after it would be slow without anyone having asked for that.
+      # Empty stands for the default, cold. Any other word stops the run here:
+      # the build job would take it for cold and say so in a warning, and
+      # every build after it would be slow in a repository that asked for
+      # something else.
       - name: Check qa-gradle-home
         env:
           QA_GRADLE_HOME: ${{ inputs.qa-gradle-home }}
@@ -351,7 +354,7 @@ jobs:
           case "$QA_GRADLE_HOME" in
             ''|warm|cold|reset) ;;
             *)
-              echo "::error title=Invalid input::qa-gradle-home is '$QA_GRADLE_HOME'. It is one of warm, cold and reset."
+              echo "::error title=Invalid input::qa-gradle-home is '$QA_GRADLE_HOME'. It is one of cold, warm and reset."
               exit 1
               ;;
           esac
@@ -437,12 +440,14 @@ jobs:
   # build cache and no daemon, the version read back from every APK and every
   # signature verified. A QA build is signed with the same key as a release.
   #
-  # The Gradle user home is where it differs: on a self-hosted runner this
-  # build uses the QA Gradle home (gradle-home), which the build job gives to
-  # nothing but a QA or label build of the source branch or of
-  # release/<major>.x. What is in it was put there by such builds, the builds
-  # of merged code that are signed anyway, and by nothing the pull request
-  # builds do with their own home.
+  # The Gradle user home is where it can differ. Cold unless the calling
+  # repository asks for the QA Gradle home (qa-gradle-home), which the build
+  # job gives to nothing but a QA or label build on a self-hosted runner, of
+  # the default branch or of release/<major>.x, and to one build at a time. It
+  # decides that from the run, not from an input of this workflow. What is in
+  # the home was put there by such builds, the builds of merged code that are
+  # signed anyway, and by nothing the pull request builds do with their own
+  # home.
   #
   # The version name is put together here, as release-version does it in the
   # plan (android-ci's tests compare the two): <version>-qa.<number>, or
@@ -470,18 +475,16 @@ jobs:
       expected-cert-sha256: ${{ inputs.expected-cert-sha256 }}
       build-tools-version: ${{ inputs.build-tools-version }}
       build-timeout-minutes: ${{ inputs.build-timeout-minutes }}
-      gradle-home: ${{ inputs.qa-gradle-home || 'warm' }}
-      source-branch: ${{ inputs.source-branch }}
+      gradle-home: ${{ inputs.qa-gradle-home || 'cold' }}
       self-hosted-max-workers: ${{ inputs.self-hosted-max-workers }}
       self-hosted-gradle-jvmargs: ${{ inputs.self-hosted-gradle-jvmargs }}
       self-hosted-kotlin-daemon-jvmargs: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
     secrets: inherit
 
   # As in android-release.yml: only after a build on a self-hosted runner, and
-  # never after a code verdict. A Gradle run in the QA Gradle home that failed
-  # never has that verdict, so this build follows it: cold, whatever
-  # qa-gradle-home says and whatever runner fallback-runs-on names, and so the
-  # one that tells a failure of the code from a failure of the home.
+  # never after a code verdict, in the QA Gradle home or out of it. This build
+  # is cold, whatever qa-gradle-home says and whatever runner
+  # fallback-runs-on names.
   fallback:
     needs: [plan, primary]
     if: >-
@@ -514,7 +517,6 @@ jobs:
       build-tools-version: ${{ inputs.build-tools-version }}
       build-timeout-minutes: ${{ inputs.build-timeout-minutes }}
       gradle-home: cold
-      source-branch: ${{ inputs.source-branch }}
       self-hosted-max-workers: ${{ inputs.self-hosted-max-workers }}
       self-hosted-gradle-jvmargs: ${{ inputs.self-hosted-gradle-jvmargs }}
       self-hosted-kotlin-daemon-jvmargs: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
