@@ -230,7 +230,7 @@ jobs:
       #
       # One build of a push is left to another workflow: the release build of
       # a push to the source branch or to release/<major>.x, which
-      # android-qa.yml makes of the same commit, cold and signed, and reports
+      # android-qa.yml makes of the same commit, signed, and reports
       # as a check of its own that a release requires as well
       # (QA_SOURCE_BRANCH, set in the release-build job only). The verify job
       # builds every push.

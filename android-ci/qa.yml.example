@@ -46,6 +46,12 @@ jobs:
       runner-labels: '["self-hosted","Linux","X64"]'
       label: ${{ inputs.label }}
       version: ${{ inputs.version }}
+      # Optional, and off unless it is set: `warm` keeps the Gradle user home
+      # of the QA builds on the self-hosted host between them, so the Gradle
+      # distribution and the dependencies are not downloaded for every push.
+      # Read "The QA Gradle home" in android-ci/README.md before turning it
+      # on: who can write to that home, and what to look at afterwards.
+      # qa-gradle-home: warm
       # Secrets and variables written to local.properties under their own
       # names, next to the four signing keys.
       local-properties-secrets: |
