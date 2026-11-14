@@ -548,6 +548,46 @@ def test_the_release_build_of_a_push_is_left_to_the_qa_build_of_that_push(jobs, 
     assert (left in log) == (build == "false")
     if build == "false":
         assert "a release requires the check of that build next to this one" in log
+    # The job is not started at all where an expression can tell, which is the source branch by its
+    # name (NOT_STARTED below, read here as GitHub evaluates it). It never leaves out a build that
+    # this step would have made.
+    if event == "push" and source != "" and ref == f"refs/heads/{source}":
+        assert build == "false"
+
+
+# What keeps the release-build job from being given to a runner. `source` in the test above is what
+# the last operand comes to when release-build-on-push is off.
+NOT_STARTED = (
+    "github.event_name == 'push' && !inputs.release-build-on-push && "
+    "github.ref == format('refs/heads/{0}', inputs.source-branch || github.event.repository.default_branch)"
+)
+
+
+def test_the_release_build_job_is_not_started_for_a_push_to_the_source_branch(entry, jobs):
+    # On such a push the job only decided that it had nothing to build, and waited for a self-hosted
+    # runner to do so. The condition is on the job now, and the output of the file says pass in its
+    # place: a skipped job has no outputs, and `result` requires a pass verdict from every job.
+    assert jobs["release-build"]["if"] == "${{ !(" + NOT_STARTED + ") }}"
+    outputs = trigger(load(JOBS))["outputs"]
+    assert outputs["release-build-verdict"]["value"] == (
+        "${{ (" + NOT_STARTED + ") && 'pass' || jobs.release-build.outputs.verdict }}"
+    )
+    # The other two jobs run on every push, and their verdicts are the jobs' own.
+    for job in ("code-style", "verify"):
+        assert "if" not in jobs[job]
+        assert outputs[f"{job}-verdict"]["value"] == f"${{{{ jobs.{job}.outputs.verdict }}}}"
+    # The same words as the step's rule for the source branch, so the two cannot disagree about it.
+    env = step(jobs["release-build"], "Decide whether to build")["env"]
+    assert env["QA_SOURCE_BRANCH"] == "${{ !inputs.release-build-on-push && (inputs.source-branch || github.event.repository.default_branch) || '' }}"
+    assert 'if build and event == "push" and qa_source_branch and ref.startswith("refs/heads/"):' in step(jobs["release-build"], "Decide whether to build")["run"]
+    # release/<major>.x is a pattern, which an expression cannot match: the step still decides it.
+    assert "release/" not in jobs["release-build"]["if"] and "startsWith" not in jobs["release-build"]["if"]
+    # Nothing about the check changes: `result` is the job it was, reads the same outputs and needs
+    # the same jobs, and a run whose release build was not started passes like any other.
+    result = entry["jobs"]["result"]
+    assert "name" not in result and result["needs"] == ["pick-runner", "primary", "fallback"]
+    assert step(result, "Combine the runs")["env"]["PRIMARY_RELEASE_BUILD"] == "${{ needs.primary.outputs.release-build-verdict }}"
+    assert "release-build-verdict" in " ".join(entry["jobs"]["fallback"]["if"].split())
 
 
 def test_only_the_release_build_leaves_a_push_to_the_qa_build(entry, jobs):
@@ -983,9 +1023,10 @@ def test_fallback_runs_only_after_a_self_hosted_infrastructure_failure(entry):
     assert condition == "${{ " + " && ".join(clauses) + " }}"
     assert entry["jobs"]["fallback"]["needs"] == ["pick-runner", "primary"]
     outputs = trigger(load(JOBS))["outputs"]
-    assert {name: value["value"] for name, value in outputs.items()} == {
-        f"{job}-verdict": f"${{{{ jobs.{job}.outputs.verdict }}}}" for job in ("code-style", "verify", "release-build")
-    }
+    assert list(outputs) == [f"{job}-verdict" for job in ("code-style", "verify", "release-build")]
+    for job in ("code-style", "verify", "release-build"):
+        # The verdict of the job. For the release build, pass in its place when the job is not started.
+        assert outputs[f"{job}-verdict"]["value"].endswith(f"jobs.{job}.outputs.verdict }}}}")
 
 
 def uses_lines() -> list[str]:

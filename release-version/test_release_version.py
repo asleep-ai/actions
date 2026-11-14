@@ -1464,8 +1464,22 @@ def test_changes_say_which_other_pre_release_holds_the_versioncode(lines, repo, 
     _, again = run_qa(tmp_path, lines["c"], label="knox")
     assert (again["version-name"], again["version-code"]) == ("2.0.1-knox.2", "200050002")
     assert taken("qa-develop-knox", "200050002") == ""
-    # The build's own pre-release is not another one: the same run published again.
+    # The build's own pre-release is not another one while it names this very commit: the same run
+    # published again, or run again after "Published, but not completely".
     assert taken("qa-develop-ble-test", "200050001") == ""
+    # It is one when it names another commit. Two runs of one label, on b and then on c, were both
+    # planned as number 3 while neither was published; the one of c publishes second and finds its
+    # own tag holding the code for b. (Planned after that, it would have been number 4.)
+    rolling(repo, "qa-develop-sweet", "2.0.1-sweet.3", 200_050_003, lines["b"])
+    capsys.readouterr()
+    out = run(tmp_path, operation="changes", sha=lines["c"], since="qa-develop-sweet", version_code="200050003")[1]
+    assert (out["code-taken-by"], out["stale"], out["unchanged"]) == ("qa-develop-sweet", "false", "false")
+    assert "qa-develop-sweet holds a build of the versionCode 200050003." in capsys.readouterr().out
+    _, again = run_qa(tmp_path, lines["c"], label="sweet")
+    assert again["version-code"] == "200050004"
+    # The run of b, started again: its tag names its own commit.
+    assert run(tmp_path, operation="changes", sha=lines["b"], since="qa-develop-sweet", version_code="200050003")[1]["code-taken-by"] == ""
+    git(repo, "tag", "-d", "qa-develop-sweet")
     # Only a tag that names its build counts, and the label builds of another line have other codes.
     git(repo, "tag", "qa-develop-plain", lines["c"])
     rolling(repo, "qa-release-1.x-ble-test", "1.13.2-ble-test.1", 101_350_101, lines["h2"])
