@@ -3329,3 +3329,59 @@ def test_readme_lists_every_input_with_its_default(entry):
         assert shown == ("`''`" if default == "" else "<br>".join(f"`{line}`" for line in str(default).splitlines())), name
     for name in trigger(entry)["secrets"]:
         assert f"`{name}`" in section, name
+
+
+def test_the_readme_shows_the_calling_file_of_the_example():
+    example = yaml.safe_load(EXAMPLE.read_text())
+    usage = yaml.safe_load(README.read_text().split("## android-release.yml", 1)[1].split("```yaml", 1)[1].split("```", 1)[0])
+    # The triggers, the manual run's `cold` included, the group and the permissions.
+    for part in (True, "concurrency", "permissions"):
+        assert usage[part] == example[part], part
+    (shown,), (job,) = usage["jobs"].values(), example["jobs"].values()
+    assert shown == job
+
+
+def test_the_readme_describes_both_homes_in_one_place_and_what_changes_for_a_caller():
+    readme = README.read_text()
+    homes = readme.split("\n## The warm Gradle homes\n", 1)[1].split("\n## ", 1)[0]
+    # The two directories, as the step that chooses the home puts them together.
+    for which in ("qa", "release"):
+        assert f"`~/android-{which}-gradle/<owner>/<repo>/home`" in homes, which
+    assert 'root="$HOME/android-$which-gradle"' in step_by_id(load(BUILD)["jobs"]["build"], "gradle-home")["run"]
+    # What to do about a release that failed for what may be its home, here and where a release is described.
+    assert "**A release that fails for what may be its home is run once more with `gradle-home: cold`**" in homes
+    release = readme.split("\n## android-release.yml\n", 1)[1].split("\n## ", 1)[0]
+    assert "**When a release fails for what may be its Gradle home, run it once more cold.**" in release
+    assert "gh workflow run release.yml --ref vX.Y.Z -f cold=true" in release
+    # The section is one for both workflows, and neither workflow's chapter keeps one of its own.
+    assert "The QA Gradle home\n" not in readme and "#the-qa-gradle-home" not in readme and "#before-turning-it-on" not in readme
+    # The defaults that change with the move of the tag are named where the tags are described: a
+    # caller that does nothing gets both homes, and the earlier name of the input is still taken.
+    changes = readme.split("### Changes within `android-ci/v1`", 1)[1].split("\n## ", 1)[0].split("`android-ci/v1.3.0` builds", 1)[1]
+    for word in (
+        "**the release Gradle home of the repository**", "**Its QA builds change from cold to warm**",
+        "**deprecated**", "`gradle-home: cold` is the build of before", "**No calling file has to change, and none has to grant more.**",
+    ):
+        assert word in changes, word
+    inputs = trigger(load("android-qa.yml"))["inputs"]
+    assert (inputs["gradle-home"]["default"], inputs["qa-gradle-home"]["default"]) == ("warm", "")
+
+
+def test_every_link_within_the_readme_names_a_heading():
+    # GitHub's anchors: the heading in lower case, without punctuation, spaces as hyphens, and a
+    # number after the second heading of a name. A section that is moved or renamed takes its links along.
+    readme = README.read_text()
+    seen: dict[str, int] = {}
+    anchors = set()
+    fenced = False
+    for line in readme.splitlines():
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        heading = None if fenced else re.match(r"#{1,6} (.+)", line)
+        if heading:
+            slug = re.sub(r"[^\w\- ]", "", heading[1].strip().lower()).replace(" ", "-")
+            anchors.add(slug if slug not in seen else f"{slug}-{seen[slug]}")
+            seen[slug] = seen.get(slug, 0) + 1
+    links = set(re.findall(r"\]\(#([^)\s]+)\)", readme))
+    assert len(links) > 30 and "the-warm-gradle-homes" in links
+    assert sorted(links - anchors) == []
