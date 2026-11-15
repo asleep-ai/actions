@@ -369,6 +369,7 @@ def test_the_branch_and_the_checks_are_checked_for_every_tag_before_anything_is_
     plan = entry["jobs"]["plan"]
     names = [item.get("name") or item.get("uses") for item in plan["steps"]]
     assert names == [
+        "Check gradle-home",
         "Check the tag",
         "actions/checkout@v7",
         "Check the branch of the tagged commit",
@@ -377,11 +378,11 @@ def test_the_branch_and_the_checks_are_checked_for_every_tag_before_anything_is_
         "Pick the runner",
     ]
     # No step is conditional on who pushed the tag or on what started the run.
-    for item in plan["steps"][:4]:
+    for item in plan["steps"][:5]:
         assert "if" not in item, item
     assert "github.event_name" not in json.dumps(plan) and "github.actor" not in json.dumps(plan)
     # The checkout is of the tag that was just checked, with every branch, and leaves no token.
-    assert plan["steps"][1]["with"] == {
+    assert plan["steps"][2]["with"] == {
         "ref": "refs/tags/${{ steps.tag.outputs.tag }}",
         "fetch-depth": 0,
         "persist-credentials": False,
@@ -401,6 +402,81 @@ def test_the_branch_and_the_checks_are_checked_for_every_tag_before_anything_is_
     assert plan["permissions"] == {"contents": "read", "checks": "read"}
     # The primary build needs the plan, so a refusal here means that no job reads the signing key.
     assert entry["jobs"]["primary"]["needs"] == "plan"
+
+
+# What gradle-home takes, in android-release.yml and in android-qa.yml alike, and what it does not.
+GRADLE_HOME_WORDS = [
+    ("warm", True), ("cold", True), ("reset", True), ("", True),
+    # A boolean handed on as it is, and words that only look right.
+    ("true", False), ("false", False), ("Warm", False), ("COLD", False), ("hot", False), ("warm cold", False), (" cold", False),
+]
+
+
+@pytest.mark.parametrize(("value", "passes"), GRADLE_HOME_WORDS)
+def test_a_gradle_home_that_is_no_known_word_is_refused_by_the_plan(entry, tmp_path, value, passes):
+    # Empty is the default, warm: a calling file may pass an input of its manual run, which a tag
+    # push leaves empty. Another word would give cold builds with a warning in the build job, in a
+    # repository that meant to ask for something.
+    plan = entry["jobs"]["plan"]
+    check = step(plan, "Check gradle-home")
+    assert check["env"] == {"GRADLE_HOME": "${{ inputs.gradle-home }}"}
+    result = run_script(check["run"], {"GRADLE_HOME": value}, tmp_path)
+    assert (result.returncode == 0) == passes, result.stdout + result.stderr
+    if passes:
+        assert result.stdout == f"gradle-home is {value or 'warm'}.\n"
+    else:
+        assert f"::error title=Invalid input::gradle-home is '{value}'. It is one of cold, warm and reset." in result.stdout
+    # The first step of the plan: before the tag is read, and before any job that builds or signs.
+    assert plan["steps"][0] is check and "if" not in check
+    assert entry["jobs"]["primary"]["needs"] == "plan"
+
+
+def first_given(expression: str, inputs: dict) -> str:
+    """What `${{ inputs.a || inputs.b || 'word' }}` gives for `inputs`, as GitHub reads `||`: the
+    first operand that is not empty. The tests cannot run GitHub's expressions; this is the one
+    form the workflows choose a Gradle home with, read the same way."""
+    for operand in re.fullmatch(r"\$\{\{ (.+) \}\}", expression)[1].split(" || "):
+        word = re.fullmatch(r"'([a-z]+)'", operand)
+        value = word[1] if word else inputs.get(re.fullmatch(r"inputs\.([a-z-]+)", operand)[1], "")
+        if value:
+            return value
+    return ""
+
+
+def test_a_release_is_built_in_the_release_home_unless_the_calling_file_says_cold(entry):
+    inputs = trigger(entry)["inputs"]
+    primary, fallback = entry["jobs"]["primary"], entry["jobs"]["fallback"]
+    # Warm unless the calling file says otherwise: a repository that changes nothing gets the
+    # release home with the version of the workflow that has it. An empty value is warm as well.
+    assert inputs["gradle-home"] == {**inputs["gradle-home"], "type": "string", "default": "warm", "required": False}
+    asked = primary["with"]["gradle-home"]
+    assert asked == "${{ inputs.gradle-home || 'warm' }}"
+    for given, built in (("warm", "warm"), ("", "warm"), ("cold", "cold"), ("reset", "reset")):
+        assert first_given(asked, {"gradle-home": given}) == built
+    # The build that follows a failed one is cold, on whatever runner fallback-runs-on names.
+    assert fallback["with"]["gradle-home"] == "cold"
+    # Which home, and whether the build really gets it, is decided in the build job: from the kind
+    # of the build and from the run. The workflow hands it no branch and no tag to decide by, and
+    # the step is executed above, for a release and for a preview.
+    for name in ("primary", "fallback"):
+        assert "source-branch" not in entry["jobs"][name]["with"] and "tag" not in entry["jobs"][name]["with"]
+        assert entry["jobs"][name]["with"]["kind"] == "${{ needs.plan.outputs.preview == 'true' && 'preview' || 'release' }}"
+    # The build workflow itself stays cold for a caller that passes nothing.
+    assert trigger(load(BUILD))["inputs"]["gradle-home"]["default"] == "cold"
+    # A failure of the code is final in the release home as anywhere: the verdict does not ask
+    # which home the build had.
+    assert "needs.primary.outputs.verdict != 'code'" in fallback["if"]
+    # The first build may not read the runs of the repository, as the first QA build may: the
+    # files that call this workflow grant no `actions`, and a job that asked for it would keep
+    # their runs from starting. A release that finds its home taken goes by the time in the file.
+    assert "permissions" not in primary and "actions" not in entry["permissions"]
+    for job in entry["jobs"].values():
+        assert "actions" not in job.get("permissions", {})
+    # No other job of the workflow runs on the self-hosted runner, and none names a Gradle home.
+    for name, job in entry["jobs"].items():
+        if name not in ("primary", "fallback"):
+            assert job["runs-on"] == "ubuntu-latest", name
+            assert "GRADLE_USER_HOME" not in json.dumps(job) and "-gradle/" not in json.dumps(job), name
 
 
 def test_the_checks_are_decided_by_the_script_of_the_version_bump(entry):
@@ -2321,10 +2397,9 @@ def test_no_other_step_and_no_other_workflow_names_a_warm_home(build, entry):
         # And the home is set in one place. The Gradle step prints it.
         if "GRADLE_USER_HOME" in text:
             assert item.get("id") in ("gradle-home", "build"), item.get("name")
-    # A release asks for nothing, so its two builds are cold by the default of the input, and by
-    # their kind whatever the input says.
+    # A release says warm or cold, and never where: the kind of its two builds says which home.
     for name in ("primary", "fallback"):
-        assert "gradle-home" not in entry["jobs"][name]["with"]
+        assert entry["jobs"][name]["with"]["gradle-home"] in ("${{ inputs.gradle-home || 'warm' }}", "cold")
         assert entry["jobs"][name]["with"]["kind"] == "${{ needs.plan.outputs.preview == 'true' && 'preview' || 'release' }}"
 
 
@@ -2864,9 +2939,8 @@ def test_primary_and_fallback_pass_the_same_inputs(entry):
     # The names in local-properties-secrets are known only to the caller, so every secret is handed on.
     assert primary["secrets"] == fallback["secrets"] == "inherit"
     assert "secrets" not in inner
-    # sentry-upload is left at its default: a release always gets the token. So is gradle-home: a
-    # release is built cold, and the QA home is the QA build's.
-    left_out = {"sentry-upload", "gradle-home"}
+    # sentry-upload is left at its default: a release always gets the token.
+    left_out = {"sentry-upload"}
     assert set(primary["with"]) == set(fallback["with"]) == set(inner["inputs"]) - left_out
     assert primary["with"]["attempt"] == "primary" and fallback["with"]["attempt"] == "fallback"
     # release or preview, from the plan's true or false: the word itself is not a job output.
@@ -2874,9 +2948,10 @@ def test_primary_and_fallback_pass_the_same_inputs(entry):
     planned = {"sha": "sha", "version-name": "version", "version-code": "version-code"}
     for name, output in planned.items():
         assert primary["with"][name] == fallback["with"][name] == f"${{{{ needs.plan.outputs.{output} }}}}"
-    forwarded = set(inner["inputs"]) - {"runs-on", "attempt", "kind", "ref", *left_out, *planned}
+    # gradle-home is the one input the two builds do not share: the second is cold whatever it says.
+    forwarded = set(inner["inputs"]) - {"runs-on", "attempt", "kind", "ref", "gradle-home", *left_out, *planned}
     assert forwarded == set(inputs) - {
-        "tag", "runner-labels", "fallback-runs-on", "source-branch", "required-checks", "release-notes-prompt",
+        "tag", "runner-labels", "fallback-runs-on", "source-branch", "required-checks", "release-notes-prompt", "gradle-home",
     }
     for name in forwarded:
         assert primary["with"][name] == fallback["with"][name] == f"${{{{ inputs.{name} }}}}"
@@ -3228,6 +3303,19 @@ def test_the_example_passes_only_what_the_workflow_declares(entry):
     # tag does, the rolling tags of the QA builds (qa-...) included.
     assert example[True]["push"]["tags"] == ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-preview.[0-9]+"]
     assert "workflow_dispatch" in example[True]
+    # A run started by hand can ask for a cold build, and nothing else is asked of it. The input is
+    # a boolean, so `inputs.cold` is false, and not the word "false", when the box is left alone.
+    dispatch = example[True]["workflow_dispatch"]["inputs"]
+    assert dispatch == {"cold": {**dispatch["cold"], "type": "boolean", "default": False, "required": False}}
+    assert job["with"]["gradle-home"] == "${{ inputs.cold && 'cold' || 'warm' }}"
+    # The version bump starts the workflow for the tag without any input, and a tag push has none:
+    # `inputs.cold` is then false or empty, and the release is built warm.
+    start = step(load("android-version-bump.yml")["jobs"]["tag"], "Start the release workflow")["run"]
+    assert 'gh workflow run "$RELEASE_WORKFLOW" --ref "$TAG" >&2' in start
+    assert " -f " not in start and " -F " not in start and "--field" not in start and "--raw-field" not in start
+    # The calling file grants no `actions`, and the workflow asks for none: see the test of the
+    # release home that is found taken.
+    assert "actions" not in example["permissions"]
 
 
 def test_readme_lists_every_input_with_its_default(entry):

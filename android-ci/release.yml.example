@@ -10,12 +10,23 @@ name: Release
 # X.Y.0: the same build, published as a GitHub pre-release. A preview tag of
 # a patch release starts a run that refuses it with the reason. No other tag
 # starts this workflow, the rolling tags of the QA builds (qa-...) included.
+#
+# On the self-hosted host the build uses the release Gradle home of the
+# repository, which is kept between releases. A run started by hand can ask
+# for a cold build instead (`cold`), which is what to do once when a release
+# failed for what may be that home.
 on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-preview.[0-9]+'
   workflow_dispatch:
+    inputs:
+      cold:
+        description: 'Cold build: an empty Gradle user home for this run, instead of the release Gradle home that is kept on the runner host'
+        required: false
+        type: boolean
+        default: false
 
 # One build per tag at a time. A second run of a tag waits and then adds its
 # APKs to the same release.
@@ -37,6 +48,10 @@ jobs:
     with:
       # Leave runner-labels out to build on a GitHub-hosted runner only.
       runner-labels: '["self-hosted","Linux","X64"]'
+      # warm unless the run was started by hand with `cold`. The version bump
+      # starts this workflow without inputs and a tag push has none, so the
+      # releases they start are warm.
+      gradle-home: ${{ inputs.cold && 'cold' || 'warm' }}
       # Secrets and variables written to local.properties under their own
       # names, next to the four signing keys.
       local-properties-secrets: |
