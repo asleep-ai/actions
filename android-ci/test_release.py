@@ -60,7 +60,7 @@ case "$*" in
   "api --paginate repos/acme/app/releases --jq .[] | select(.draft | not) | .tag_name")
     if [ -f "$GH_DIR/release-error" ]; then cat "$GH_DIR/release-error" >&2; exit 1; fi
     cat "$GH_DIR/released" ;;
-  "api repos/acme/app/commits/tags/"*)
+  "api repos/acme/app/commits/refs/tags/"*)
     cat "$GH_DIR/sha" ;;
   "api repos/acme/app/releases/tags/"*)
     if [ -f "$GH_DIR/release-error" ]; then cat "$GH_DIR/release-error" >&2; exit 1; fi
@@ -141,6 +141,15 @@ def test_only_a_release_tag_is_built(entry, tmp_path, tag):
     assert "is not a release tag" in result.stdout
     assert outputs == {}
     assert (directory / "calls").read_text() == "", "nothing is asked for a ref that is not a release tag"
+
+
+def test_the_tagged_commit_is_read_through_the_full_ref(entry, tmp_path):
+    # GitHub answers commits/tags/<name> with 422 "No commit found for SHA": only the full ref
+    # (or the bare name) resolves a tag. The stand-in refuses any other form of the call.
+    directory = gh_directory(tmp_path, TAGS, released=RELEASED)
+    result, _ = check_tag(entry, tmp_path, "v1.10.1", directory)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "api repos/acme/app/commits/refs/tags/v1.10.1 --jq .sha" in (directory / "calls").read_text().splitlines()
 
 
 def test_a_tag_that_does_not_exist_is_refused(entry, tmp_path):

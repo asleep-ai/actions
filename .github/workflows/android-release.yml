@@ -292,7 +292,9 @@ jobs:
             echo "::error::Tag $TAG does not exist in $GH_REPO."
             exit 1
           fi
-          sha=$(gh api "repos/$GH_REPO/commits/tags/$TAG" --jq '.sha')
+          # The full ref: GitHub reads commits/tags/<name> as a SHA and answers
+          # 422 "No commit found for SHA" for every tag.
+          sha=$(gh api "repos/$GH_REPO/commits/refs/tags/$TAG" --jq '.sha')
 
           # A major version is a release line: 1.x may still be released from
           # its maintenance branch after 2.0.0 exists.
