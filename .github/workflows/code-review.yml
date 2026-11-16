@@ -59,7 +59,8 @@ jobs:
   review:
     needs: gate
     if: needs.gate.outputs.allowed == 'true'
-    runs-on: ubuntu-latest
+    # Pin the tested image: Ubuntu 26 currently fails upstream drop-sudo socket isolation.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
