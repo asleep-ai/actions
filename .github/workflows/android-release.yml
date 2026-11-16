@@ -11,6 +11,14 @@ name: Android release
 # or major version X.Y.0: the same key and checks, a versionCode below the
 # release's, and a GitHub pre-release that is never the latest release.
 #
+# Every build starts from an emptied work folder and runs every task. On a
+# self-hosted runner it uses the release Gradle home of the repository unless
+# the calling file says cold (gradle-home): a directory on the host that only
+# releases and previews use, one at a time, kept between them, so the Gradle
+# distribution and the dependencies are not downloaded for every release. The
+# QA builds have a home of their own, which no release is given, and a pull
+# request build uses neither.
+#
 # The caller's contract, every input and the secrets are in
 # android-ci/README.md.
 on:
@@ -145,11 +153,26 @@ on:
         default: ''
       build-timeout-minutes:
         description: >-
-          Timeout of the build job, on either kind of runner. The build never
-          uses a cache, so size it for a cold build.
+          Timeout of the build job, on either kind of runner. Size it for a
+          cold build, in the release Gradle home as well: the first build on a
+          host, a build that finds the home in use or discarded and the build
+          on the GitHub-hosted runner are cold.
         required: false
         type: number
         default: 60
+      gradle-home:
+        description: >-
+          The Gradle user home of the build on a self-hosted runner. warm, the
+          default: the release Gradle home of the repository, a directory on
+          the host that only the releases and previews of the repository use,
+          one at a time, and that is kept between them. cold: a home of the
+          job, empty at its start and gone at its end. reset: the release
+          Gradle home, emptied first. Empty means warm, so a calling file can
+          pass an input of its manual run. The build on a GitHub-hosted runner
+          and the build after a failed one are always cold.
+        required: false
+        type: string
+        default: warm
       self-hosted-max-workers:
         description: >-
           Gradle --max-workers on a self-hosted runner. Empty leaves Gradle's
@@ -256,6 +279,24 @@ jobs:
       runs-on: ${{ steps.pick.outputs.runs-on }}
       self-hosted: ${{ steps.pick.outputs.self-hosted }}
     steps:
+      # Empty stands for the default, warm. Any other word stops the run
+      # here: the build job would take it for cold and say so in a warning,
+      # in a repository that asked for something else. android-qa.yml takes
+      # the same three words.
+      - name: Check gradle-home
+        env:
+          GRADLE_HOME: ${{ inputs.gradle-home }}
+        run: |
+          set -euo pipefail
+          case "$GRADLE_HOME" in
+            ''|warm|cold|reset) ;;
+            *)
+              echo "::error title=Invalid input::gradle-home is '$GRADLE_HOME'. It is one of cold, warm and reset."
+              exit 1
+              ;;
+          esac
+          echo "gradle-home is ${GRADLE_HOME:-warm}."
+
       - name: Check the tag
         id: tag
         env:
@@ -574,6 +615,20 @@ jobs:
           token: ${{ secrets.RUNNER_READ_TOKEN }}
           fallback: ${{ inputs.fallback-runs-on }}
 
+  # The build. Its Gradle user home is the release Gradle home of the
+  # repository unless the calling file says cold (gradle-home). Whether the
+  # build really gets that home is decided in the build job, from the run and
+  # not from an input of this workflow: a self-hosted runner, the run of a
+  # release or preview tag, and no other release in the home. What is in the
+  # home was put there by such builds and by no other: the QA builds and the
+  # pull request builds each have a home of their own.
+  #
+  # The job has what this workflow gives every job, which does not include
+  # reading the runs of the repository: the files that call this workflow
+  # grant no `actions`, and a job that asked for it would keep their runs
+  # from starting. So a build that finds the release Gradle home taken is not
+  # told by GitHub whether the job that took it is over, as a QA build is. It
+  # is cold, and the home is taken over when the time in its file is up.
   primary:
     needs: plan
     uses: ./.github/workflows/android-release-build.yml
@@ -596,15 +651,18 @@ jobs:
       expected-cert-sha256: ${{ inputs.expected-cert-sha256 }}
       build-tools-version: ${{ inputs.build-tools-version }}
       build-timeout-minutes: ${{ inputs.build-timeout-minutes }}
+      gradle-home: ${{ inputs.gradle-home || 'warm' }}
       self-hosted-max-workers: ${{ inputs.self-hosted-max-workers }}
       self-hosted-gradle-jvmargs: ${{ inputs.self-hosted-gradle-jvmargs }}
       self-hosted-kotlin-daemon-jvmargs: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}
     secrets: inherit
 
   # Only after a build on a self-hosted runner, and never after a code
-  # verdict. A build that never reported (its runner went away) has an empty
-  # verdict, which is not code. A primary result of cancelled while the run
-  # itself is not cancelled means the build hit its timeout.
+  # verdict, in the release Gradle home or out of it. A build that never
+  # reported (its runner went away) has an empty verdict, which is not code. A
+  # primary result of cancelled while the run itself is not cancelled means
+  # the build hit its timeout. This build is cold, whatever gradle-home says
+  # and whatever runner fallback-runs-on names.
   fallback:
     needs: [plan, primary]
     if: >-
@@ -635,6 +693,7 @@ jobs:
       expected-cert-sha256: ${{ inputs.expected-cert-sha256 }}
       build-tools-version: ${{ inputs.build-tools-version }}
       build-timeout-minutes: ${{ inputs.build-timeout-minutes }}
+      gradle-home: cold
       self-hosted-max-workers: ${{ inputs.self-hosted-max-workers }}
       self-hosted-gradle-jvmargs: ${{ inputs.self-hosted-gradle-jvmargs }}
       self-hosted-kotlin-daemon-jvmargs: ${{ inputs.self-hosted-kotlin-daemon-jvmargs }}

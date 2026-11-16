@@ -22,6 +22,7 @@ import pytest
 import yaml
 
 from test_pr_check import OWN_ACTION, ROOT, WORKFLOWS, commit, executable, git, load, run_script, step, trigger
+from test_release import GRADLE_HOME_WORDS, first_given
 from test_version_bump import SHA, check_run, check_runs_api
 
 sys.path.insert(0, str(ROOT / "release-version"))
@@ -61,7 +62,7 @@ def test_the_plan_is_the_qa_operation_of_release_version_for_the_ref_of_the_run(
     plan = entry["jobs"]["plan"]
     names = [item.get("name") or item.get("uses") for item in plan["steps"]]
     assert names == [
-        "Check the wait for the checks", "Check qa-gradle-home", "actions/checkout@v7", "Plan the QA build",
+        "Check the wait for the checks", "Check gradle-home", "actions/checkout@v7", "Plan the QA build",
         "Write the plan to the summary", "Cancel the runs of earlier commits", "Pick the runner",
     ]
     # Every tag and the whole history of the commit the run started for, and no token left behind.
@@ -146,22 +147,60 @@ def test_a_wait_the_job_has_no_room_for_is_refused_by_the_plan(entry, tmp_path, 
     assert entry["jobs"]["checks"]["timeout-minutes"] == 120
 
 
-@pytest.mark.parametrize(
-    ("value", "passes"),
-    [("warm", True), ("cold", True), ("reset", True), ("", True), ("Warm", False), ("hot", False), ("true", False), ("warm cold", False)],
-)
-def test_a_qa_gradle_home_that_is_no_known_word_is_refused_by_the_plan(entry, tmp_path, value, passes):
-    # Empty is the default, cold: a calling file passes the input of its manual run, which a push
-    # leaves empty. Another word would give cold builds with a warning in the build job, in a
-    # repository that meant to ask for the home.
-    check = step(entry["jobs"]["plan"], "Check qa-gradle-home")
-    assert check["env"] == {"QA_GRADLE_HOME": "${{ inputs.qa-gradle-home }}"}
-    result = run_script(check["run"], {"QA_GRADLE_HOME": value}, tmp_path)
+@pytest.mark.parametrize("name", ["gradle-home", "qa-gradle-home"])
+@pytest.mark.parametrize(("value", "passes"), GRADLE_HOME_WORDS)
+def test_a_gradle_home_that_is_no_known_word_is_refused_by_the_plan(entry, tmp_path, name, value, passes):
+    # Empty is the default of both inputs: warm for gradle-home, so that a calling file can pass
+    # the input of its manual run, which a push leaves empty, and "not given" for qa-gradle-home,
+    # the name the input had before. Another word would give cold builds with a warning in the
+    # build job, in a repository that meant to ask for something.
+    check = step(entry["jobs"]["plan"], "Check gradle-home")
+    assert check["env"] == {"GRADLE_HOME": "${{ inputs.gradle-home }}", "QA_GRADLE_HOME": "${{ inputs.qa-gradle-home }}"}
+    env = {"GRADLE_HOME": "warm", "QA_GRADLE_HOME": "", name.upper().replace("-", "_"): value}
+    result = run_script(check["run"], env, tmp_path)
     assert (result.returncode == 0) == passes, result.stdout + result.stderr
     if not passes:
-        assert f"::error title=Invalid input::qa-gradle-home is '{value}'. It is one of cold, warm and reset." in result.stdout
+        assert f"::error title=Invalid input::{name} is '{value}'. It is one of cold, warm and reset." in result.stdout
     # Before the checkout and before any job that builds.
     assert entry["jobs"]["plan"]["steps"][1] is check
+    # The release takes the same words for its own gradle-home, and refuses the same.
+    release = step(load(RELEASE)["jobs"]["plan"], "Check gradle-home")
+    assert (run_script(release["run"], {"GRADLE_HOME": value}, tmp_path).returncode == 0) == passes
+
+
+@pytest.mark.parametrize(
+    ("gradle_home", "qa_gradle_home", "built", "said"),
+    [
+        # A calling file that passes neither, or gradle-home alone.
+        ("warm", "", "warm", "gradle-home is warm."),
+        ("", "", "warm", "gradle-home is warm."),
+        ("cold", "", "cold", "gradle-home is cold."),
+        ("reset", "", "reset", "gradle-home is reset."),
+        # A calling file from before gradle-home, which passes qa-gradle-home: it builds as it did.
+        # gradle-home is then at its default.
+        ("warm", "warm", "warm", "qa-gradle-home is warm, and decides: gradle-home (warm) is not read"),
+        ("warm", "cold", "cold", "qa-gradle-home is cold, and decides: gradle-home (warm) is not read"),
+        ("warm", "reset", "reset", "qa-gradle-home is reset, and decides: gradle-home (warm) is not read"),
+        # Both, and they differ: the earlier name still decides, and the log says so.
+        ("cold", "warm", "warm", "qa-gradle-home is warm, and decides: gradle-home (cold) is not read"),
+        ("", "cold", "cold", "qa-gradle-home is cold, and decides: gradle-home (warm) is not read"),
+    ],
+)
+def test_qa_gradle_home_is_still_taken_and_decides_while_it_is_given(entry, tmp_path, gradle_home, qa_gradle_home, built, said):
+    given = {"gradle-home": gradle_home, "qa-gradle-home": qa_gradle_home}
+    # What the first build is asked for: qa-gradle-home when it is not empty, then gradle-home,
+    # then warm. The second build is cold whatever either says.
+    asked = entry["jobs"]["primary"]["with"]["gradle-home"]
+    assert asked == "${{ inputs.qa-gradle-home || inputs.gradle-home || 'warm' }}"
+    assert first_given(asked, given) == built
+    assert entry["jobs"]["fallback"]["with"]["gradle-home"] == "cold"
+    # And the plan says in its log which of the two decided, without an annotation: a calling
+    # file that still passes the earlier name builds on every push.
+    check = step(entry["jobs"]["plan"], "Check gradle-home")
+    result = run_script(check["run"], {"GRADLE_HOME": gradle_home, "QA_GRADLE_HOME": qa_gradle_home}, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert said in result.stdout and "::" not in result.stdout
+    assert ("The input is deprecated; pass gradle-home instead." in result.stdout) == bool(qa_gradle_home)
 
 
 def plan_summary(entry, tmp_path, **overrides) -> str:
@@ -614,7 +653,7 @@ def test_the_build_is_the_build_of_a_release_with_ci_qa(entry):
     # releases from: whether a run may use the QA Gradle home is decided from the run alone.
     assert forwarded == set(inputs) - {
         "runner-labels", "fallback-runs-on", "source-branch", "version", "next-version", "label", "sequence-offset",
-        "required-checks", "checks-timeout-minutes", "qa-gradle-home",
+        "required-checks", "checks-timeout-minutes", "gradle-home", "qa-gradle-home",
     }
     for name in forwarded:
         assert primary["with"][name] == fallback["with"][name] == f"${{{{ inputs.{name} }}}}"
@@ -630,23 +669,30 @@ def test_the_build_is_the_build_of_a_release_with_ci_qa(entry):
     assert "if" not in primary
 
 
-def test_the_qa_gradle_home_is_used_only_when_the_calling_file_asks_for_it(entry):
+def test_a_qa_build_is_built_in_the_qa_home_unless_the_calling_file_says_cold(entry):
     inputs = trigger(entry)["inputs"]
     primary, fallback = entry["jobs"]["primary"], entry["jobs"]["fallback"]
-    # Cold unless the calling file says otherwise: a repository that changes nothing builds as
-    # before, whatever version of the workflow its tag names. An empty value is cold as well.
-    assert inputs["qa-gradle-home"] == {**inputs["qa-gradle-home"], "type": "string", "default": "cold", "required": False}
-    assert primary["with"]["gradle-home"] == "${{ inputs.qa-gradle-home || 'cold' }}"
+    # Warm unless the calling file says otherwise: a repository that changes nothing gets the QA
+    # home with the version of the workflow that has this default. An empty value is warm as well.
+    assert inputs["gradle-home"] == {**inputs["gradle-home"], "type": "string", "default": "warm", "required": False}
+    # The name the input had before is still declared, or a calling file that passes it would not
+    # start. It is empty unless a calling file passes it, and says what it is.
+    assert inputs["qa-gradle-home"] == {**inputs["qa-gradle-home"], "type": "string", "default": "", "required": False}
+    assert inputs["qa-gradle-home"]["description"].startswith("Deprecated: ")
+    assert primary["with"]["gradle-home"] == "${{ inputs.qa-gradle-home || inputs.gradle-home || 'warm' }}"
     # The build that follows a failed one is cold, on whatever runner fallback-runs-on names.
     assert fallback["with"]["gradle-home"] == "cold"
     # Whether the first build really gets the home is decided in the build job, from the run: the
-    # workflow hands it no branch. The gate is executed in test_release.py; here, that a release
-    # never asks.
+    # workflow hands it no branch. The gate is executed in test_release.py. A release asks in the
+    # same words, and the kind of its build gives it another home.
     for name in ("primary", "fallback"):
         assert "source-branch" not in entry["jobs"][name]["with"]
-    release = load(RELEASE)["jobs"]
-    for name in ("primary", "fallback"):
-        assert "gradle-home" not in release[name]["with"]
+    release = load(RELEASE)
+    assert trigger(release)["inputs"]["gradle-home"]["default"] == inputs["gradle-home"]["default"]
+    assert release["jobs"]["primary"]["with"]["gradle-home"] == "${{ inputs.gradle-home || 'warm' }}"
+    assert release["jobs"]["fallback"]["with"]["gradle-home"] == "cold"
+    assert "qa-gradle-home" not in trigger(release)["inputs"] and "qa-gradle-home" not in (WORKFLOWS / RELEASE).read_text()
+    assert primary["with"]["kind"] != release["jobs"]["primary"]["with"]["kind"]
     assert trigger(load(BUILD))["inputs"]["gradle-home"]["default"] == "cold"
     # A failure of the code is final in the QA home as anywhere: the verdict does not ask which
     # home the build had, and the rule of the release, word for word, starts no second build.
@@ -670,7 +716,9 @@ def test_only_the_first_qa_build_may_read_the_runs_of_the_repository(entry):
     assert primary["permissions"] == {"contents": "read", "packages": "read", "actions": "read"}
     # The second build is cold and on a GitHub-hosted runner: it has what the workflow gives every job.
     assert "permissions" not in fallback and entry["permissions"] == {"contents": "read", "packages": "read"}
-    # A release gets what it got while the build workflow named its permissions itself.
+    # A release gets what it got while the build workflow named its permissions itself, and so no
+    # right to ask: a release that finds the release home taken goes by the time in the file,
+    # which test_release.py runs.
     release = load(RELEASE)
     assert release["permissions"] == {"contents": "read", "packages": "read"}
     for name in ("primary", "fallback"):
@@ -1985,7 +2033,7 @@ def test_inputs_and_outputs(entry):
         "runner-labels", "fallback-runs-on", "environment", "java-version", "java-distribution", "checkout-submodules",
         "local-properties-secrets", "required-secrets", "gradle-args", "apk-directory", "expected-cert-sha256",
         "build-tools-version", "sentry-upload", "source-branch", "version", "next-version", "label", "sequence-offset",
-        "required-checks", "checks-timeout-minutes", "build-timeout-minutes", "qa-gradle-home",
+        "required-checks", "checks-timeout-minutes", "build-timeout-minutes", "gradle-home", "qa-gradle-home",
         "self-hosted-max-workers", "self-hosted-gradle-jvmargs", "self-hosted-kotlin-daemon-jvmargs",
     ]
     for name in ("version", "next-version", "label", "source-branch"):
@@ -2036,10 +2084,11 @@ def test_the_example_passes_only_what_the_workflow_declares(entry):
     for name in dispatch:
         assert job["with"][name] == f"${{{{ inputs.{name} }}}}"
         assert dispatch[name]["required"] is False
-    # The QA Gradle home is off in a file that is copied as it is. The line that turns it on is
-    # there, commented out, with where to read first.
-    assert "qa-gradle-home" not in job["with"]
-    assert "      # qa-gradle-home: warm\n" in EXAMPLE.read_text()
+    # A file that is copied as it is builds in the QA Gradle home, which is the default: it passes
+    # nothing. The line that makes the builds cold is there, commented out, with where to read
+    # first, and the name the input had before is nowhere in a file that is new.
+    assert "gradle-home" not in job["with"] and "qa-gradle-home" not in EXAMPLE.read_text()
+    assert "      # gradle-home: cold\n" in EXAMPLE.read_text()
     # The calling file names no concurrency group. The called workflow cancels the runs of earlier
     # commits itself and keeps the order of what is published; a group here would cancel a run
     # that is publishing, or make the newest commit wait behind an older one.

@@ -369,6 +369,7 @@ def test_the_branch_and_the_checks_are_checked_for_every_tag_before_anything_is_
     plan = entry["jobs"]["plan"]
     names = [item.get("name") or item.get("uses") for item in plan["steps"]]
     assert names == [
+        "Check gradle-home",
         "Check the tag",
         "actions/checkout@v7",
         "Check the branch of the tagged commit",
@@ -377,11 +378,11 @@ def test_the_branch_and_the_checks_are_checked_for_every_tag_before_anything_is_
         "Pick the runner",
     ]
     # No step is conditional on who pushed the tag or on what started the run.
-    for item in plan["steps"][:4]:
+    for item in plan["steps"][:5]:
         assert "if" not in item, item
     assert "github.event_name" not in json.dumps(plan) and "github.actor" not in json.dumps(plan)
     # The checkout is of the tag that was just checked, with every branch, and leaves no token.
-    assert plan["steps"][1]["with"] == {
+    assert plan["steps"][2]["with"] == {
         "ref": "refs/tags/${{ steps.tag.outputs.tag }}",
         "fetch-depth": 0,
         "persist-credentials": False,
@@ -401,6 +402,81 @@ def test_the_branch_and_the_checks_are_checked_for_every_tag_before_anything_is_
     assert plan["permissions"] == {"contents": "read", "checks": "read"}
     # The primary build needs the plan, so a refusal here means that no job reads the signing key.
     assert entry["jobs"]["primary"]["needs"] == "plan"
+
+
+# What gradle-home takes, in android-release.yml and in android-qa.yml alike, and what it does not.
+GRADLE_HOME_WORDS = [
+    ("warm", True), ("cold", True), ("reset", True), ("", True),
+    # A boolean handed on as it is, and words that only look right.
+    ("true", False), ("false", False), ("Warm", False), ("COLD", False), ("hot", False), ("warm cold", False), (" cold", False),
+]
+
+
+@pytest.mark.parametrize(("value", "passes"), GRADLE_HOME_WORDS)
+def test_a_gradle_home_that_is_no_known_word_is_refused_by_the_plan(entry, tmp_path, value, passes):
+    # Empty is the default, warm: a calling file may pass an input of its manual run, which a tag
+    # push leaves empty. Another word would give cold builds with a warning in the build job, in a
+    # repository that meant to ask for something.
+    plan = entry["jobs"]["plan"]
+    check = step(plan, "Check gradle-home")
+    assert check["env"] == {"GRADLE_HOME": "${{ inputs.gradle-home }}"}
+    result = run_script(check["run"], {"GRADLE_HOME": value}, tmp_path)
+    assert (result.returncode == 0) == passes, result.stdout + result.stderr
+    if passes:
+        assert result.stdout == f"gradle-home is {value or 'warm'}.\n"
+    else:
+        assert f"::error title=Invalid input::gradle-home is '{value}'. It is one of cold, warm and reset." in result.stdout
+    # The first step of the plan: before the tag is read, and before any job that builds or signs.
+    assert plan["steps"][0] is check and "if" not in check
+    assert entry["jobs"]["primary"]["needs"] == "plan"
+
+
+def first_given(expression: str, inputs: dict) -> str:
+    """What `${{ inputs.a || inputs.b || 'word' }}` gives for `inputs`, as GitHub reads `||`: the
+    first operand that is not empty. The tests cannot run GitHub's expressions; this is the one
+    form the workflows choose a Gradle home with, read the same way."""
+    for operand in re.fullmatch(r"\$\{\{ (.+) \}\}", expression)[1].split(" || "):
+        word = re.fullmatch(r"'([a-z]+)'", operand)
+        value = word[1] if word else inputs.get(re.fullmatch(r"inputs\.([a-z-]+)", operand)[1], "")
+        if value:
+            return value
+    return ""
+
+
+def test_a_release_is_built_in_the_release_home_unless_the_calling_file_says_cold(entry):
+    inputs = trigger(entry)["inputs"]
+    primary, fallback = entry["jobs"]["primary"], entry["jobs"]["fallback"]
+    # Warm unless the calling file says otherwise: a repository that changes nothing gets the
+    # release home with the version of the workflow that has it. An empty value is warm as well.
+    assert inputs["gradle-home"] == {**inputs["gradle-home"], "type": "string", "default": "warm", "required": False}
+    asked = primary["with"]["gradle-home"]
+    assert asked == "${{ inputs.gradle-home || 'warm' }}"
+    for given, built in (("warm", "warm"), ("", "warm"), ("cold", "cold"), ("reset", "reset")):
+        assert first_given(asked, {"gradle-home": given}) == built
+    # The build that follows a failed one is cold, on whatever runner fallback-runs-on names.
+    assert fallback["with"]["gradle-home"] == "cold"
+    # Which home, and whether the build really gets it, is decided in the build job: from the kind
+    # of the build and from the run. The workflow hands it no branch and no tag to decide by, and
+    # the step is executed above, for a release and for a preview.
+    for name in ("primary", "fallback"):
+        assert "source-branch" not in entry["jobs"][name]["with"] and "tag" not in entry["jobs"][name]["with"]
+        assert entry["jobs"][name]["with"]["kind"] == "${{ needs.plan.outputs.preview == 'true' && 'preview' || 'release' }}"
+    # The build workflow itself stays cold for a caller that passes nothing.
+    assert trigger(load(BUILD))["inputs"]["gradle-home"]["default"] == "cold"
+    # A failure of the code is final in the release home as anywhere: the verdict does not ask
+    # which home the build had.
+    assert "needs.primary.outputs.verdict != 'code'" in fallback["if"]
+    # The first build may not read the runs of the repository, as the first QA build may: the
+    # files that call this workflow grant no `actions`, and a job that asked for it would keep
+    # their runs from starting. A release that finds its home taken goes by the time in the file.
+    assert "permissions" not in primary and "actions" not in entry["permissions"]
+    for job in entry["jobs"].values():
+        assert "actions" not in job.get("permissions", {})
+    # No other job of the workflow runs on the self-hosted runner, and none names a Gradle home.
+    for name, job in entry["jobs"].items():
+        if name not in ("primary", "fallback"):
+            assert job["runs-on"] == "ubuntu-latest", name
+            assert "GRADLE_USER_HOME" not in json.dumps(job) and "-gradle/" not in json.dumps(job), name
 
 
 def test_the_checks_are_decided_by_the_script_of_the_version_bump(entry):
@@ -660,10 +736,10 @@ def test_the_work_folder_is_emptied_before_checkout_and_after_the_build_whatever
 def test_a_build_that_is_cancelled_leaves_no_key_and_no_home_taken(build):
     # A QA build is cancelled whenever a push follows closely. The runner stops the step that runs
     # and then runs the steps that say always(), in order: the keystore and local.properties are
-    # deleted, the work folder is emptied, the QA Gradle home is seen to, the verdict is reported.
+    # deleted, the work folder is emptied, the warm Gradle home is seen to, the verdict is reported.
     last = build["steps"][-4:]
     assert [item["name"] for item in last] == [
-        "Delete the keystore and local.properties", "Empty the work folder again", "Tidy or discard the QA Gradle home",
+        "Delete the keystore and local.properties", "Empty the work folder again", "Tidy or discard the warm Gradle home",
         "Report the verdict",
     ]
     for item in last:
@@ -713,10 +789,10 @@ def test_a_moved_tag_is_refused(build, tmp_path):
 # --- build: Gradle ------------------------------------------------------------------------
 
 
-# What the step that chooses the home is handed for a release, as android-release.yml calls the build:
-# it does not pass gradle-home. The event, the ref and the default branch are the run's.
+# What the step that chooses the home is handed for a release whose build is asked to be warm: the
+# run that the version bump started for the tag. The event, the ref and the default branch are the run's.
 RELEASE_RUN = {
-    "GRADLE_HOME": "cold",
+    "GRADLE_HOME": "warm",
     "KIND": "release",
     "RUNNER_KIND": "self-hosted",
     "EVENT_NAME": "workflow_dispatch",
@@ -725,20 +801,29 @@ RELEASE_RUN = {
     "REPOSITORY": "acme/app",
     "BUILD_TIMEOUT_MINUTES": "60",
 }
-# And for the QA build of a push to the default branch, in a repository that asked for the QA home.
-QA_RUN = {**RELEASE_RUN, "GRADLE_HOME": "warm", "KIND": "qa", "EVENT_NAME": "push", "RUN_REF": "refs/heads/develop"}
+# And for the QA build of a push to the default branch.
+QA_RUN = {**RELEASE_RUN, "KIND": "qa", "EVENT_NAME": "push", "RUN_REF": "refs/heads/develop"}
+# The two warm homes of a repository: one for its QA and label builds, one for its releases and previews.
 QA_BASE = "android-qa-gradle/acme/app"
 QA_HOME = f"{QA_BASE}/home"
 # The file that names the build that has the home, and the one that says a build finished in it.
 QA_LOCK = f"{QA_BASE}/in-use"
 QA_MARK = f"{QA_BASE}/intact"
-# When the step after the build runs: for a build that took the home (the step that chose it says
-# under which name), unless that step gave the home back itself and went on cold.
+RELEASE_BASE = "android-release-gradle/acme/app"
+RELEASE_HOME = f"{RELEASE_BASE}/home"
+RELEASE_LOCK = f"{RELEASE_BASE}/in-use"
+RELEASE_MARK = f"{RELEASE_BASE}/intact"
+# The step after the build, one for both homes. It runs for a build that took a home (the step that
+# chose it says under which name), unless that step gave the home back itself and went on cold.
+TIDY = "Tidy or discard the warm Gradle home"
 TIDY_IF = "${{ always() && steps.gradle-home.outputs.token != '' && steps.gradle-home.outputs.warm != 'false' }}"
 
 
 def choose_home(build, tmp_path, **overrides):
-    """Run the step that chooses the Gradle user home on a host whose runner user has `host` as its home."""
+    """Run the step that chooses the Gradle user home on a host whose runner user has `host` as its home.
+
+    The run is the QA build of a push unless `overrides` says otherwise: **RELEASE_RUN makes it a release.
+    """
     temp, host = tmp_path / "temp", tmp_path / "host"
     temp.mkdir(exist_ok=True)
     host.mkdir(exist_ok=True)
@@ -762,23 +847,25 @@ def choose_home(build, tmp_path, **overrides):
     return result, Path(lines[0].split("=", 1)[1]) if lines else None, outputs
 
 
-def finish_home(build, tmp_path, outcome: str, outputs: dict):
-    """Run the step that tidies or discards the QA home, with what the step that chose it put out.
+def finish_home(build, tmp_path, outcome: str, outputs: dict, kind: str = "qa"):
+    """Run the step that tidies or discards a warm home, with what the step that chose it put out.
 
-    HOME is another directory than the one the home was chosen under: the build ran in between, and
-    it can set the variables of the steps after it.
+    `kind` is the kind of the build, which says whose home it is: the QA home unless it is release
+    or preview. HOME is another directory than the one the home was chosen under: the build ran in
+    between, and it can set the variables of the steps after it.
     """
     env = {
         "HOME": str(tmp_path / "set-by-the-build"),
-        "QA_ROOT": outputs.get("root", ""),
-        "QA_HOME": outputs.get("home", ""),
-        "QA_TOKEN": outputs.get("token", ""),
-        "QA_READY": outputs.get("warm", ""),
+        "KIND": kind,
+        "WARM_ROOT": outputs.get("root", ""),
+        "WARM_HOME": outputs.get("home", ""),
+        "WARM_TOKEN": outputs.get("token", ""),
+        "WARM_READY": outputs.get("warm", ""),
         "BUILD_OUTCOME": outcome,
         "GITHUB_RUN_ID": "77",
         "GITHUB_RUN_ATTEMPT": "1",
     }
-    return run_script(step(build, "Tidy or discard the QA Gradle home")["run"], env, tmp_path)
+    return run_script(step(build, TIDY)["run"], env, tmp_path)
 
 
 def fill(home: Path, *names: str) -> None:
@@ -788,11 +875,14 @@ def fill(home: Path, *names: str) -> None:
         path.write_text(f"left in {name}")
 
 
-def earlier_home(tmp_path: Path, *names: str) -> Path:
-    """The QA home as an earlier QA build left it when it finished: filled, and marked intact."""
-    home = tmp_path / "host" / QA_HOME
+def earlier_home(tmp_path: Path, *names: str, base: str = QA_BASE) -> Path:
+    """A warm home as an earlier build left it when it finished: filled, and marked intact.
+
+    The QA home, unless `base` is RELEASE_BASE.
+    """
+    home = tmp_path / "host" / base / "home"
     fill(home, *names)
-    (tmp_path / "host" / QA_MARK).write_text("")
+    (tmp_path / "host" / base / "intact").write_text("")
     return home
 
 
@@ -829,22 +919,26 @@ NOT_CACHES = (
 )
 
 
-def test_the_gradle_user_home_of_a_release_belongs_to_the_job(build, tmp_path):
+@pytest.mark.parametrize("run", [RELEASE_RUN, {**RELEASE_RUN, "KIND": "preview", "RUN_REF": "refs/tags/v2.0.0-preview.1"}, QA_RUN])
+def test_a_cold_gradle_user_home_belongs_to_the_job(build, tmp_path, run):
+    # gradle-home: cold, on a self-hosted runner, in a run that would get a warm home otherwise.
     temp = tmp_path / "temp"
     stale = temp / "gradle-user-home" / "init.d" / "evil.gradle"
     stale.parent.mkdir(parents=True)
     stale.write_text("left behind")
-    result, home, outputs = choose_home(build, tmp_path, **RELEASE_RUN)
+    result, home, outputs = choose_home(build, tmp_path, **{**run, "GRADLE_HOME": "cold"})
     assert result.returncode == 0, result.stderr
     assert home == temp / "gradle-user-home"
     assert home.is_dir() and list(home.iterdir()) == []
     assert outputs == {"warm": "false"}
-    assert not (tmp_path / "host" / "android-qa-gradle").exists()
+    assert f"Gradle user home: {home} (cold: gradle-home is cold)" in result.stdout and "::" not in result.stdout
+    # No directory is made on the host, for either kind of home.
+    assert list((tmp_path / "host").iterdir()) == []
     ids = [item.get("id") for item in build["steps"]]
     assert ids.index("gradle-home") < ids.index("gradle") < ids.index("build")
     # Nothing is restored into a build that signs, and nothing it produced is saved.
     assert step_by_id(build, "gradle")["with"] == {"cache-disabled": True}
-    # Cold unless a caller asks for more, and android-release.yml asks for nothing.
+    # Cold unless the workflow that calls the build workflow asks for more.
     inputs = trigger(load(BUILD))["inputs"]
     assert (inputs["gradle-home"]["default"], inputs["gradle-home"]["required"]) == ("cold", False)
 
@@ -879,28 +973,75 @@ def test_a_qa_build_of_a_release_branch_on_a_self_hosted_runner_uses_the_qa_home
     assert re.fullmatch(r"77-1-\d+-\d+", outputs["token"])
     assert sorted(path.name for path in home.parent.iterdir()) == ["home", "in-use"]
     assert (host / QA_LOCK).read_text().split()[0] == outputs["token"]
+    # The home of the releases is another directory, and this build makes none.
+    assert not (host / "android-release-gradle").exists()
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        # The run that the version bump starts for the tag it pushed, or a person for a tag.
+        {},
+        # A tag that a person pushed.
+        {"EVENT_NAME": "push"},
+        # A preview is built like a release, and in the same home.
+        {"KIND": "preview", "RUN_REF": "refs/tags/v2.0.0-preview.1"},
+        {"KIND": "preview", "RUN_REF": "refs/tags/v2.1.0-preview.12", "EVENT_NAME": "push"},
+        {"RUN_REF": "refs/tags/v0.0.1"},
+        {"RUN_REF": "refs/tags/v10.20.30"},
+        # The tag says that the run is a release's: the default branch is not asked for.
+        {"DEFAULT_BRANCH": ""},
+        {"GRADLE_HOME": "reset"},
+    ],
+)
+def test_a_release_or_a_preview_of_a_tag_on_a_self_hosted_runner_uses_the_release_home(build, tmp_path, run):
+    # The QA builds of the repository have left their home. A release is not given it.
+    qa = earlier_home(tmp_path, *CACHES)
+    result, home, outputs = choose_home(build, tmp_path, **{**RELEASE_RUN, **run})
+    assert result.returncode == 0, result.stdout + result.stderr
+    host = tmp_path / "host"
+    assert home == host / RELEASE_HOME == host / "android-release-gradle" / "acme" / "app" / "home"
+    assert home.is_dir() and list(home.iterdir()) == []
+    assert outputs == {"warm": "true", "root": str(host / "android-release-gradle"), "home": str(home), "token": outputs["token"]}
+    # Only the runner's user reads it.
+    assert home.stat().st_mode & 0o077 == 0 and (host / "android-release-gradle").stat().st_mode & 0o077 == 0
+    assert not (tmp_path / "temp" / "gradle-user-home").exists()
+    assert "::" not in result.stdout and "QA" not in result.stdout
+    assert "The release home is new: this build fills it." in result.stdout
+    assert f"Gradle user home: {home} (the release home of acme/app)" in result.stdout
+    # The home is this build's: the file next to it names the build, and nothing else is there.
+    assert re.fullmatch(r"77-1-\d+-\d+", outputs["token"])
+    assert sorted(path.name for path in home.parent.iterdir()) == ["home", "in-use"]
+    assert (host / RELEASE_LOCK).read_text().split()[0] == outputs["token"]
+    # Nothing of the QA home was read, taken or changed.
+    assert files(qa) == sorted(CACHES) and sorted(path.name for path in qa.parent.iterdir()) == ["home", "intact"]
 
 
 @pytest.mark.parametrize(
     ("run", "reason"),
     [
-        # A release and a preview are cold whatever a caller passes: the build workflow itself says so.
-        ({"KIND": "release"}, "a release or a preview is built cold"),
-        ({"KIND": "preview"}, "a release or a preview is built cold"),
-        ({"KIND": "release", "RUN_REF": "refs/tags/v1.13.1", "EVENT_NAME": "workflow_dispatch"}, "a release or a preview is built cold"),
-        ({"KIND": "preview", "GRADLE_HOME": "reset"}, "a release or a preview is built cold"),
-        ({"KIND": ""}, "a release or a preview is built cold"),
+        # What a calling file gets that says cold: a home of the job, on a self-hosted runner as well.
+        ({"GRADLE_HOME": "cold"}, "gradle-home is cold"),
+        ({**RELEASE_RUN, "GRADLE_HOME": "cold"}, "gradle-home is cold"),
+        ({**RELEASE_RUN, "GRADLE_HOME": "cold", "EVENT_NAME": "push"}, "gradle-home is cold"),
+        ({**RELEASE_RUN, "GRADLE_HOME": "cold", "KIND": "preview", "RUN_REF": "refs/tags/v2.0.0-preview.1"}, "gradle-home is cold"),
         # The build after an infrastructure failure, and a caller without self-hosted runners.
         ({"RUNNER_KIND": "github-hosted"}, "a GitHub-hosted runner keeps nothing between jobs"),
         ({"RUNNER_KIND": ""}, "a GitHub-hosted runner keeps nothing between jobs"),
-        # What a caller gets that asks for nothing.
-        ({"GRADLE_HOME": "cold"}, "gradle-home is cold"),
+        ({**RELEASE_RUN, "RUNNER_KIND": "github-hosted"}, "a GitHub-hosted runner keeps nothing between jobs"),
+        ({**RELEASE_RUN, "RUNNER_KIND": "github-hosted", "GRADLE_HOME": "reset"}, "a GitHub-hosted runner keeps nothing between jobs"),
+        ({**RELEASE_RUN, "RUNNER_KIND": "", "KIND": "preview", "RUN_REF": "refs/tags/v2.0.0-preview.1"}, "a GitHub-hosted runner keeps nothing between jobs"),
+        # A kind that is none of the four has no home. The step that checks the plan fails such a build.
+        ({"KIND": ""}, "kind is none of release, preview, qa and label"),
+        ({"KIND": "Release"}, "kind is none of release, preview, qa and label"),
+        ({**RELEASE_RUN, "KIND": "qa label"}, "kind is none of release, preview, qa and label"),
     ],
 )
-def test_a_build_that_is_not_meant_for_the_qa_home_is_cold_and_says_no_more(build, tmp_path, run, reason):
-    # The home of earlier QA builds is there, and is neither read nor touched.
-    kept = tmp_path / "host" / QA_HOME
-    fill(kept, *CACHES, "gradle.properties")
+def test_a_build_that_is_not_meant_for_a_warm_home_is_cold_and_says_no_more(build, tmp_path, run, reason):
+    # The homes of earlier builds are there, and are neither read nor touched.
+    kept = [tmp_path / "host" / QA_HOME, tmp_path / "host" / RELEASE_HOME]
+    for left in kept:
+        fill(left, *CACHES, "gradle.properties")
     result, home, outputs = choose_home(build, tmp_path, **run)
     assert result.returncode == 0, result.stdout + result.stderr
     assert home == tmp_path / "temp" / "gradle-user-home"
@@ -908,8 +1049,9 @@ def test_a_build_that_is_not_meant_for_the_qa_home_is_cold_and_says_no_more(buil
     assert outputs == {"warm": "false"}
     (said,) = [line for line in result.stdout.splitlines() if line.startswith("Gradle user home: ")]
     assert said.startswith(f"Gradle user home: {home} (cold: ") and reason in said
-    assert files(kept) == sorted([*CACHES, "gradle.properties"])
-    assert sorted(path.name for path in kept.parent.iterdir()) == ["home"]
+    for left in kept:
+        assert files(left) == sorted([*CACHES, "gradle.properties"])
+        assert sorted(path.name for path in left.parent.iterdir()) == ["home"]
     assert "::" not in result.stdout
 
 
@@ -962,6 +1104,62 @@ def test_a_qa_build_of_any_other_run_is_cold_and_says_why(build, tmp_path, run, 
     assert reason in warning
     assert files(kept) == sorted([*CACHES, "gradle.properties"])
     assert sorted(path.name for path in kept.parent.iterdir()) == ["home"]
+    # A QA build that is refused its home is not given the other one.
+    assert not (tmp_path / "host" / "android-release-gradle").exists()
+
+
+@pytest.mark.parametrize(
+    ("run", "reason"),
+    [
+        # A run that was started on a branch, with the tag as an input: the run is not the tag's.
+        ({"RUN_REF": "refs/heads/develop"}, "this run is on refs/heads/develop"),
+        ({"RUN_REF": "refs/heads/develop", "EVENT_NAME": "push"}, "this run is on refs/heads/develop"),
+        ({"RUN_REF": "refs/heads/release/1.x"}, "this run is on refs/heads/release/1.x"),
+        ({"RUN_REF": "refs/heads/feature/login", "KIND": "preview"}, "this run is on refs/heads/feature/login"),
+        # A branch that is named like a release tag, and tags that android-release.yml does not build.
+        ({"RUN_REF": "refs/heads/v1.13.1"}, "this run is on refs/heads/v1.13.1"),
+        ({"RUN_REF": "refs/tags/v1.13"}, "this run is on refs/tags/v1.13"),
+        ({"RUN_REF": "refs/tags/1.13.1"}, "this run is on refs/tags/1.13.1"),
+        ({"RUN_REF": "refs/tags/v01.13.1"}, "this run is on refs/tags/v01.13.1"),
+        ({"RUN_REF": "refs/tags/v1.13.1-qa.3"}, "this run is on refs/tags/v1.13.1-qa.3"),
+        ({"RUN_REF": "refs/tags/v1.13.1-rc.1"}, "this run is on refs/tags/v1.13.1-rc.1"),
+        ({"RUN_REF": "refs/tags/v1.13.1/x"}, "this run is on refs/tags/v1.13.1/x"),
+        ({"RUN_REF": "refs/tags/qa-develop"}, "this run is on refs/tags/qa-develop"),
+        # A preview of a patch release, which the plan refuses, and a preview without a number.
+        ({"RUN_REF": "refs/tags/v2.0.1-preview.1", "KIND": "preview"}, "this run is on refs/tags/v2.0.1-preview.1"),
+        ({"RUN_REF": "refs/tags/v2.0.0-preview.0", "KIND": "preview"}, "this run is on refs/tags/v2.0.0-preview.0"),
+        ({"RUN_REF": "refs/tags/v2.0.0-preview", "KIND": "preview"}, "this run is on refs/tags/v2.0.0-preview"),
+        ({"RUN_REF": "refs/pull/12/merge"}, "this run is on refs/pull/12/merge"),
+        ({"RUN_REF": "v1.13.1"}, "this run is on v1.13.1"),
+        ({"RUN_REF": ""}, "this run is on "),
+        # Any event but a push and a manual run, whatever ref it names.
+        ({"EVENT_NAME": "pull_request"}, "this is a pull_request run"),
+        ({"EVENT_NAME": "pull_request_target"}, "this is a pull_request_target run"),
+        ({"EVENT_NAME": "schedule"}, "this is a schedule run"),
+        ({"EVENT_NAME": "workflow_run"}, "this is a workflow_run run"),
+        ({"EVENT_NAME": "release"}, "this is a release run"),
+        ({"EVENT_NAME": ""}, "this is a  run"),
+    ],
+)
+def test_a_release_of_any_other_run_is_cold_and_says_why(build, tmp_path, run, reason):
+    # The plan let the build through, and the build was meant to be warm: a build that is not gets
+    # a warning with the reason, as a QA build does, under the name of its own home.
+    kept = tmp_path / "host" / RELEASE_HOME
+    fill(kept, *CACHES, "gradle.properties")
+    result, home, outputs = choose_home(build, tmp_path, **{**RELEASE_RUN, **run})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert home == tmp_path / "temp" / "gradle-user-home"
+    assert home.is_dir() and list(home.iterdir()) == []
+    assert outputs == {"warm": "false"}
+    (warning,) = [line for line in result.stdout.splitlines() if line.startswith("::")]
+    assert warning.startswith("::warning title=Release Gradle home not used::") and warning.endswith(" The build is cold.")
+    assert reason in warning and "QA" not in result.stdout
+    assert "(cold: the release home cannot be used)" in result.stdout
+    assert files(kept) == sorted([*CACHES, "gradle.properties"])
+    assert sorted(path.name for path in kept.parent.iterdir()) == ["home"]
+    # A release that is refused its home is not given the home of the QA builds, on a branch they
+    # are built from or anywhere.
+    assert not (tmp_path / "host" / "android-qa-gradle").exists()
 
 
 def test_no_caller_says_which_run_may_use_the_qa_home(build, tmp_path):
@@ -1256,7 +1454,7 @@ def test_one_build_at_a_time_has_the_qa_home(build, tmp_path):
     assert files(home) == sorted([*CACHES, "daemon/8.9/daemon-1.out.log"]) and (host / QA_LOCK).read_text() == held
     # The step after the build is not run for a build that did not get the home: it took none
     # (no token), and the step that chose says that the build is cold.
-    assert step(build, "Tidy or discard the QA Gradle home")["if"] == TIDY_IF
+    assert step(build, TIDY)["if"] == TIDY_IF
     assert "token" not in second
 
     # The first build gives the home back, and the build after it has it.
@@ -1598,7 +1796,7 @@ def test_a_build_whose_home_was_not_ready_when_it_was_stopped_gives_it_back(buil
     script = step_by_id(build, "gradle-home")["run"]
     assert script.index('echo "token=$token"') < script.index("if ! prepare; then") < script.index('echo "warm=true" >> "$GITHUB_OUTPUT"')
     assert script.index("take || state=$?") < script.index('echo "token=$token"')
-    assert step(build, "Tidy or discard the QA Gradle home")["if"] == TIDY_IF
+    assert step(build, TIDY)["if"] == TIDY_IF
     # A build that is not the one the file names touches nothing, ready or not.
     result, again, current = choose_home(build, tmp_path, GITHUB_RUN_ID="79")
     held = (host / QA_LOCK).read_text()
@@ -1802,23 +2000,27 @@ def test_nothing_is_discarded_without_the_outputs_of_the_step_that_chose_the_hom
 
 def test_the_step_after_the_build_reads_nothing_the_build_could_have_changed(build, tmp_path):
     names = [item.get("name") for item in build["steps"]]
-    tidy = step(build, "Tidy or discard the QA Gradle home")
-    # Whatever happened to the build, and only after a build that took the QA home.
+    tidy = step(build, TIDY)
+    # Whatever happened to the build, and only after a build that took a warm home.
     assert tidy["if"] == TIDY_IF
     # The paths and the name of the build are what the step that chose the home said before any code
     # of the repository ran, not variables the build could have set for the steps after it:
     # GRADLE_USER_HOME, or HOME, which finish_home() sets to another directory in every test here.
+    # Which of the two homes it is, the kind of the build says, an input of the job as in the
+    # step that chose the home.
     assert tidy["env"] == {
-        "QA_ROOT": "${{ steps.gradle-home.outputs.root }}",
-        "QA_HOME": "${{ steps.gradle-home.outputs.home }}",
-        "QA_TOKEN": "${{ steps.gradle-home.outputs.token }}",
-        "QA_READY": "${{ steps.gradle-home.outputs.warm }}",
+        "KIND": "${{ inputs.kind }}",
+        "WARM_ROOT": "${{ steps.gradle-home.outputs.root }}",
+        "WARM_HOME": "${{ steps.gradle-home.outputs.home }}",
+        "WARM_TOKEN": "${{ steps.gradle-home.outputs.token }}",
+        "WARM_READY": "${{ steps.gradle-home.outputs.warm }}",
         "BUILD_OUTCOME": "${{ steps.build.outcome }}",
     }
+    assert tidy["env"]["KIND"] == step_by_id(build, "gradle-home")["env"]["KIND"]
     assert "GRADLE_USER_HOME" not in tidy["run"] and "$HOME" not in tidy["run"] and "${HOME" not in tidy["run"]
     # After the secrets are gone, and before the verdict: the step fails nothing, so the verdict is the build's.
-    assert names.index("Delete the keystore and local.properties") < names.index("Tidy or discard the QA Gradle home")
-    assert names[-1] == "Report the verdict" and names[-2] == "Tidy or discard the QA Gradle home"
+    assert names.index("Delete the keystore and local.properties") < names.index(TIDY)
+    assert names[-1] == "Report the verdict" and names[-2] == TIDY
     assert "exit 1" not in tidy["run"]
 
 
@@ -1936,6 +2138,198 @@ def test_a_qa_home_that_can_be_neither_tidied_nor_moved_away_stays_taken(build, 
     assert result.returncode == 0 and again == home and later["warm"] == "true" and list(home.iterdir()) == []
 
 
+# --- build: the release home ----------------------------------------------------------------
+#
+# The two steps are the ones the tests above run for the QA home, and every rule there is the
+# release home's as well. What is run again here is what a release depends on: that its home is
+# another directory than the QA home, that it is kept, tidied, discarded and taken over the same
+# way, and that neither kind of build touches the home of the other.
+
+
+def test_the_qa_home_and_the_release_home_are_two_directories(build, tmp_path):
+    host = tmp_path / "host"
+    # A QA build has the QA home. A release that starts meanwhile neither waits for it nor is cold:
+    # it has the release home, with a file of its own that names the build.
+    result, qa, first = choose_home(build, tmp_path, GITHUB_RUN_ID="77")
+    assert result.returncode == 0 and first["warm"] == "true" and qa == host / QA_HOME
+    result, release, second = choose_home(build, tmp_path, **RELEASE_RUN, GITHUB_RUN_ID="78")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert second["warm"] == "true" and release == host / RELEASE_HOME and "::" not in result.stdout
+    assert qa != release and qa.parent != release.parent
+    assert (host / QA_LOCK).read_text().split()[0] == first["token"]
+    assert (host / RELEASE_LOCK).read_text().split()[0] == second["token"]
+    # What a QA build leaves in its caches stays there: the release home holds what releases left.
+    fill(qa, *CACHES, "caches/modules-2/files-2.1/left-by-a-qa-build.jar")
+    fill(release, *CACHES, "daemon/8.9/daemon-1.out.log")
+    assert finish_home(build, tmp_path, "success", second, kind="release").returncode == 0
+    assert (host / QA_LOCK).read_text().split()[0] == first["token"]
+    assert finish_home(build, tmp_path, "success", first).returncode == 0
+    assert files(release) == sorted(CACHES)
+    assert files(qa) == sorted([*CACHES, "caches/modules-2/files-2.1/left-by-a-qa-build.jar"])
+    for base in (QA_BASE, RELEASE_BASE):
+        assert sorted(path.name for path in (host / base).iterdir()) == ["home", "intact"]
+    # A release that fails costs the release home, and the QA builds keep theirs. And the other way round.
+    result, release, third = choose_home(build, tmp_path, **RELEASE_RUN, GITHUB_RUN_ID="79")
+    assert third["warm"] == "true" and "The release home exists: earlier release builds of acme/app left it." in result.stdout
+    assert finish_home(build, tmp_path, "failure", third, kind="release").returncode == 0
+    assert list((host / RELEASE_BASE).iterdir()) == []
+    assert files(qa) == sorted([*CACHES, "caches/modules-2/files-2.1/left-by-a-qa-build.jar"]) and (host / QA_MARK).exists()
+    result, release, fourth = choose_home(build, tmp_path, **RELEASE_RUN, GITHUB_RUN_ID="80")
+    fill(release, *CACHES)
+    assert finish_home(build, tmp_path, "success", fourth, kind="release").returncode == 0
+    result, qa, fifth = choose_home(build, tmp_path, GITHUB_RUN_ID="81")
+    assert finish_home(build, tmp_path, "failure", fifth).returncode == 0
+    assert list((host / QA_BASE).iterdir()) == []
+    assert files(release) == sorted(CACHES) and (host / RELEASE_MARK).exists()
+
+
+def test_the_release_home_is_kept_between_releases_with_nothing_in_it_but_its_caches(build, tmp_path):
+    result, home, outputs = choose_home(build, tmp_path, **RELEASE_RUN)
+    assert result.returncode == 0, result.stdout + result.stderr
+    # The build ran, and left what a build can leave.
+    fill(home, *CACHES, *NOT_CACHES)
+    (home / "gradle.properties").write_text("KEY_PASSWORD=key-pass\n")
+    result = finish_home(build, tmp_path, "success", outputs, kind="release")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"Kept the release home for the next release build, with nothing in it but its caches: {home}" in result.stdout
+    assert "::" not in result.stdout and "QA" not in result.stdout
+    assert files(home) == sorted(CACHES)
+    assert sorted(path.name for path in home.parent.iterdir()) == ["home", "intact"]
+
+    # The next build: a preview of the next version, whose tag a person pushed. One home for the
+    # releases and the previews of a repository.
+    preview = {**RELEASE_RUN, "KIND": "preview", "RUN_REF": "refs/tags/v1.14.0-preview.1", "EVENT_NAME": "push"}
+    result, again, outputs = choose_home(build, tmp_path, **preview, GITHUB_RUN_ID="78")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert again == home and outputs["warm"] == "true" and outputs["token"].startswith("78-1-")
+    assert "The release home exists: earlier release builds of acme/app left it." in result.stdout
+    assert "::" not in result.stdout
+    for name in CACHES:
+        assert (home / name).read_text() == f"left in {name}"
+    assert finish_home(build, tmp_path, "success", outputs, kind="preview").returncode == 0
+
+    # Whatever the home holds when a build finds it, the build starts without configuration.
+    fill(home, "init.d/evil.gradle", "gradle.properties", "caches/build-cache-1/abcdef")
+    result, again, outputs = choose_home(build, tmp_path, **RELEASE_RUN, GITHUB_RUN_ID="79")
+    assert again == home and outputs["warm"] == "true" and files(home) == sorted(CACHES)
+    (warning,) = [line for line in result.stdout.splitlines() if line.startswith("::")]
+    assert warning.startswith(
+        "::warning title=Release Gradle home held more than its caches::Deleted from the release home before the build: "
+        "caches/build-cache-1 gradle.properties init.d. "
+    )
+    # And `reset` empties it, for one build.
+    assert finish_home(build, tmp_path, "success", outputs, kind="release").returncode == 0
+    result, again, outputs = choose_home(build, tmp_path, **{**RELEASE_RUN, "GRADLE_HOME": "reset"}, GITHUB_RUN_ID="80")
+    assert again == home and outputs["warm"] == "true" and list(home.iterdir()) == []
+    assert "Discarded the release home: gradle-home is reset." in result.stdout
+
+
+@pytest.mark.parametrize("outcome", ["failure", "cancelled"])
+def test_a_release_home_that_a_gradle_run_did_not_succeed_in_is_not_used_again(build, tmp_path, outcome):
+    host = tmp_path / "host"
+    qa = earlier_home(tmp_path, *CACHES)
+    result, home, outputs = choose_home(build, tmp_path, **RELEASE_RUN, RUNNER_NAME="tr-r5")
+    assert result.returncode == 0, result.stdout + result.stderr
+    fill(home, *CACHES, "caches/8.9/transforms/half-written/metadata.bin")
+    before = time.time()
+    result = finish_home(build, tmp_path, outcome, outputs, kind="release")
+    assert result.returncode == 0, result.stdout + result.stderr
+    (notice,) = [line for line in result.stdout.splitlines() if line.startswith("::")]
+    assert notice.startswith(
+        f"::notice title=Release Gradle home discarded::The Gradle run in the release home ended as {outcome}, so the "
+        "home is not used again: the next release build on this host starts with an empty one and is as slow as a cold build."
+    )
+    assert "QA" not in result.stdout
+    if outcome == "failure":
+        # Given back at once. Running the failed jobs again builds in a new home.
+        assert notice.endswith("If the failure is not the code's, run the failed jobs again.")
+        assert list(home.parent.iterdir()) == []
+    else:
+        # Taken for two more minutes, as the QA home is: what Gradle started ends with the job.
+        assert notice.endswith("the next release build takes it over when GitHub says so, or two minutes from now.")
+        assert [path.name for path in home.parent.iterdir()] == ["in-use"]
+        named, runner = (host / RELEASE_LOCK).read_text().splitlines()
+        assert named.split()[0] == outputs["token"] and runner == "tr-r5" and 118 <= int(named.split()[1]) - before <= 122
+        (host / RELEASE_LOCK).unlink()
+    assert files(qa) == sorted(CACHES) and (host / QA_MARK).exists()
+    result, again, later = choose_home(build, tmp_path, **RELEASE_RUN, GITHUB_RUN_ID="78")
+    assert result.returncode == 0 and again == home and later["warm"] == "true"
+    assert "The release home is new: this build fills it." in result.stdout and "::" not in result.stdout
+
+
+def test_one_release_at_a_time_has_the_release_home_and_a_dead_one_keeps_it_until_its_time_is_up(build, tmp_path):
+    # The token of a release may not read the runs of the repository: the files that call
+    # android-release.yml grant no `actions`, and a called workflow cannot ask for more than its
+    # caller has. So a release asks GitHub whether the job that has the home is over and is told
+    # 403, which is not a yes: the home is that build's until the time in its file.
+    host = tmp_path / "host"
+    home = host / RELEASE_HOME
+    fill(home, *CACHES, "caches/8.9/transforms/half-written/metadata.bin")
+    held = f"{STOPPED}-1-4242-7 {int(time.time()) + 55 * 60}\ntr-r5\n"
+    (host / RELEASE_LOCK).write_text(held)
+    with jobs_api() as api:
+        api.jobs[(STOPPED, 1)] = [job_on("tr-r5", conclusion="failure", name="release / primary / build")]
+        api.status = 403
+        result, cold, outputs = next_build(build, tmp_path, api, **RELEASE_RUN)
+        assert len(api.requests) == 1
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert cold == tmp_path / "temp" / "gradle-user-home" and outputs == {"warm": "false"}
+    assert f"GitHub did not say whether the job is over (run {STOPPED}, attempt 1, runner tr-r5): HTTP 403." in result.stdout
+    (notice,) = [line for line in result.stdout.splitlines() if line.startswith("::")]
+    assert notice.startswith(
+        f"::notice title=Release Gradle home in use::Another release build of acme/app has the release home (run {STOPPED}), "
+        "and one build at a time uses it. The build is cold. It is that build's until "
+    )
+    assert "(cold: the release home is in use)" in result.stdout
+    assert (host / RELEASE_LOCK).read_text() == held and (home / "caches/8.9/transforms/half-written/metadata.bin").exists()
+    # A QA build is not kept out by it: the file is the release home's.
+    result, qa, other = choose_home(build, tmp_path, GITHUB_RUN_ID="90")
+    assert other["warm"] == "true" and qa == host / QA_HOME and "::" not in result.stdout
+
+    # Where the token may ask, the answer frees the home at once, as for a QA build.
+    with jobs_api() as api:
+        api.jobs[(STOPPED, 1)] = [job_on("tr-r5", conclusion="failure", name="release / primary / build")]
+        result, again, outputs = next_build(build, tmp_path, api, **RELEASE_RUN)
+    assert again == home and outputs["warm"] == "true"
+    assert f"Taking the release home over from the build of run {STOPPED}, which did not give it back." in result.stdout
+    (warning,) = [line for line in result.stdout.splitlines() if line.startswith("::")]
+    assert warning.startswith(
+        f"::warning title=Release Gradle home discarded::The build that had the release home before (run {STOPPED}) did not finish in it"
+    )
+    assert list(home.iterdir()) == []
+
+    # And without an answer, the time in the file: when it is up, the home is taken over unasked.
+    (host / RELEASE_LOCK).write_text(f"{STOPPED}-1-4242-7 {int(time.time()) - 1}\ntr-r5\n")
+    with jobs_api() as api:
+        api.status = 403
+        result, again, outputs = next_build(build, tmp_path, api, **RELEASE_RUN)
+        assert api.requests == []
+    assert again == home and outputs["warm"] == "true"
+
+
+@pytest.mark.parametrize(
+    ("kind", "theirs"),
+    [("release", QA_RUN), ("preview", QA_RUN), ("qa", RELEASE_RUN), ("label", RELEASE_RUN), ("", QA_RUN), ("Release", RELEASE_RUN)],
+)
+def test_the_step_after_the_build_touches_only_the_home_of_its_own_kind(build, tmp_path, kind, theirs):
+    # The step deletes by paths it is handed, and the kind of the build says which home they may
+    # name. Handed the home of the other kind, or no kind at all, it leaves everything as it is.
+    host = tmp_path / "host"
+    result, home, outputs = choose_home(build, tmp_path, **theirs)
+    assert result.returncode == 0 and outputs["warm"] == "true"
+    fill(home, *CACHES, "daemon/8.9/daemon-1.out.log")
+    before = files(host)
+    for outcome in ("failure", "cancelled", "success", "skipped"):
+        result = finish_home(build, tmp_path, outcome, outputs, kind=kind)
+        assert result.returncode == 0, result.stdout + result.stderr
+        (warning,) = [line for line in result.stdout.splitlines() if line.startswith("::")]
+        assert "Gradle home left as it is::" in warning
+        assert files(host) == before
+    # The build whose home it is ends as any build does.
+    assert finish_home(build, tmp_path, "success", outputs, kind=theirs["KIND"]).returncode == 0
+    assert files(home) == sorted(CACHES)
+
+
 def shell_function(script: str, name: str) -> str:
     """The text of a function of a step's script, with the comment above it."""
     lines = script.splitlines()
@@ -1946,11 +2340,12 @@ def shell_function(script: str, name: str) -> str:
     return "\n".join(lines[start : end + 1])
 
 
-def test_both_steps_delete_the_same_from_the_qa_home(build):
-    # What is deleted before a build and after it is one list, and a home is discarded one way.
+def test_both_steps_delete_the_same_from_a_warm_home(build):
+    # What is deleted before a build and after it is one list, and a home is discarded one way:
+    # the same for the QA home and for the release home, which share every line of the two steps.
     chosen = step_by_id(build, "gradle-home")["run"]
-    tidy = step(build, "Tidy or discard the QA Gradle home")["run"]
-    for name in ("discard", "list_extra", "scrub"):
+    tidy = step(build, TIDY)["run"]
+    for name in ("home_of", "discard", "list_extra", "scrub", "find_link"):
         assert shell_function(chosen, name) == shell_function(tidy, name), name
         assert shell_function(chosen, name).count("\n") > 5
     # Kept by name, everything else goes: a file that nobody thought of is not kept.
@@ -1959,25 +2354,52 @@ def test_both_steps_delete_the_same_from_the_qa_home(build):
     assert "gradle-actions" not in chosen and "gradle-actions" not in tidy
 
 
-def test_no_other_step_and_no_other_workflow_names_the_qa_home(build, entry):
-    # The directory is the QA build's alone because nothing else is told where it is: the pull
-    # request jobs use the home of the runner's user, a release the one of its job.
+def test_the_two_homes_differ_in_their_directory_and_their_name_and_in_nothing_else(build):
+    # One function says which home a kind of build has and what it is called, and every path and
+    # every message is put together from that. So there is no rule that one home has and the other
+    # lacks, but for the one that has to differ: the refs whose runs may use it.
+    chosen = step_by_id(build, "gradle-home")["run"]
+    tidy = step(build, TIDY)["run"]
+    kinds = shell_function(chosen, "home_of")
+    for kind, which, title, word in (("qa|label", "qa", "QA", "QA"), ("release|preview", "release", "Release", "release")):
+        assert f"  {kind})\n      which={which}\n      Name={title}\n      name={word}\n      ;;" in kinds
+    assert 'root="$HOME/android-$which-gradle"' in chosen
+    assert '"$root" != /*/android-"$which"-gradle' in tidy
+    named = re.compile(r"\bQA\b|[Rr]elease (Gradle )?home|android-(qa|release)-gradle")
+    for script, own in (
+        (chosen, ['give_up "Only a run on the default branch', 'give_up "Only the run of a release tag']),
+        (tidy, []),
+    ):
+        lines = [line.strip() for line in script.splitlines() if not line.lstrip().startswith("#") and named.search(line)]
+        assert [line for line in lines if line not in ("Name=QA", "name=QA")] == [
+            line for line in lines if any(line.startswith(start) for start in own)
+        ]
+        assert len([line for line in lines if line not in ("Name=QA", "name=QA")]) == len(own)
+        # And each of the two words is used: a title and a sentence.
+        assert "title=$Name Gradle home" in script and "the $name home" in script
+
+
+def test_no_other_step_and_no_other_workflow_names_a_warm_home(build, entry):
+    # The two directories are these builds' alone because nothing else is told where they are: the
+    # pull request jobs use the home of the runner's user. The build workflow names each of them
+    # once, in the comment above the step that puts the path together.
     for path in sorted(WORKFLOWS.glob("*.yml")):
         text = path.read_text()
-        assert ("android-qa-gradle" in text) == (path.name == BUILD), path.name
+        for directory in ("android-qa-gradle", "android-release-gradle", "android-$which-gradle"):
+            assert (directory in text) == (path.name == BUILD), (path.name, directory)
         if path.name != BUILD:
             assert "GRADLE_USER_HOME" not in text, path.name
     for item in build["steps"]:
         text = json.dumps(item)
-        names_it = "android-qa-gradle" in text or "steps.gradle-home.outputs.home" in text
-        assert names_it == (item.get("id") == "gradle-home" or item.get("name") == "Tidy or discard the QA Gradle home"), item.get("name")
+        assert "android-qa-gradle" not in text and "android-release-gradle" not in text, item.get("name")
+        names_it = "android-$which-gradle" in text or "steps.gradle-home.outputs.home" in text
+        assert names_it == (item.get("id") == "gradle-home" or item.get("name") == TIDY), item.get("name")
         # And the home is set in one place. The Gradle step prints it.
         if "GRADLE_USER_HOME" in text:
             assert item.get("id") in ("gradle-home", "build"), item.get("name")
-    # A release asks for nothing, so its two builds are cold by the default of the input, and by
-    # their kind whatever the input says.
+    # A release says warm or cold, and never where: the kind of its two builds says which home.
     for name in ("primary", "fallback"):
-        assert "gradle-home" not in entry["jobs"][name]["with"]
+        assert entry["jobs"][name]["with"]["gradle-home"] in ("${{ inputs.gradle-home || 'warm' }}", "cold")
         assert entry["jobs"][name]["with"]["kind"] == "${{ needs.plan.outputs.preview == 'true' && 'preview' || 'release' }}"
 
 
@@ -1993,7 +2415,7 @@ def test_no_secret_is_written_to_the_gradle_user_home(build):
     # No step writes a gradle.properties: the two that name it list it among what they delete.
     for item in build["steps"]:
         if "gradle.properties" in item.get("run", ""):
-            assert item.get("id") == "gradle-home" or item.get("name") == "Tidy or discard the QA Gradle home"
+            assert item.get("id") == "gradle-home" or item.get("name") == TIDY
             for line in item["run"].splitlines():
                 if "gradle.properties" in line:
                     assert line.lstrip().startswith(("#", "for path in ")), line
@@ -2428,7 +2850,7 @@ def test_the_apks_are_verified_uploaded_and_the_secrets_deleted(build):
         "Upload the signed APKs",
         "Delete the keystore and local.properties",
         "Empty the work folder again",
-        "Tidy or discard the QA Gradle home",
+        TIDY,
         "Report the verdict",
     ]
     assert names[-len(order) :] == order
@@ -2517,9 +2939,8 @@ def test_primary_and_fallback_pass_the_same_inputs(entry):
     # The names in local-properties-secrets are known only to the caller, so every secret is handed on.
     assert primary["secrets"] == fallback["secrets"] == "inherit"
     assert "secrets" not in inner
-    # sentry-upload is left at its default: a release always gets the token. So is gradle-home: a
-    # release is built cold, and the QA home is the QA build's.
-    left_out = {"sentry-upload", "gradle-home"}
+    # sentry-upload is left at its default: a release always gets the token.
+    left_out = {"sentry-upload"}
     assert set(primary["with"]) == set(fallback["with"]) == set(inner["inputs"]) - left_out
     assert primary["with"]["attempt"] == "primary" and fallback["with"]["attempt"] == "fallback"
     # release or preview, from the plan's true or false: the word itself is not a job output.
@@ -2527,9 +2948,10 @@ def test_primary_and_fallback_pass_the_same_inputs(entry):
     planned = {"sha": "sha", "version-name": "version", "version-code": "version-code"}
     for name, output in planned.items():
         assert primary["with"][name] == fallback["with"][name] == f"${{{{ needs.plan.outputs.{output} }}}}"
-    forwarded = set(inner["inputs"]) - {"runs-on", "attempt", "kind", "ref", *left_out, *planned}
+    # gradle-home is the one input the two builds do not share: the second is cold whatever it says.
+    forwarded = set(inner["inputs"]) - {"runs-on", "attempt", "kind", "ref", "gradle-home", *left_out, *planned}
     assert forwarded == set(inputs) - {
-        "tag", "runner-labels", "fallback-runs-on", "source-branch", "required-checks", "release-notes-prompt",
+        "tag", "runner-labels", "fallback-runs-on", "source-branch", "required-checks", "release-notes-prompt", "gradle-home",
     }
     for name in forwarded:
         assert primary["with"][name] == fallback["with"][name] == f"${{{{ inputs.{name} }}}}"
@@ -2881,6 +3303,19 @@ def test_the_example_passes_only_what_the_workflow_declares(entry):
     # tag does, the rolling tags of the QA builds (qa-...) included.
     assert example[True]["push"]["tags"] == ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-preview.[0-9]+"]
     assert "workflow_dispatch" in example[True]
+    # A run started by hand can ask for a cold build, and nothing else is asked of it. The input is
+    # a boolean, so `inputs.cold` is false, and not the word "false", when the box is left alone.
+    dispatch = example[True]["workflow_dispatch"]["inputs"]
+    assert dispatch == {"cold": {**dispatch["cold"], "type": "boolean", "default": False, "required": False}}
+    assert job["with"]["gradle-home"] == "${{ inputs.cold && 'cold' || 'warm' }}"
+    # The version bump starts the workflow for the tag without any input, and a tag push has none:
+    # `inputs.cold` is then false or empty, and the release is built warm.
+    start = step(load("android-version-bump.yml")["jobs"]["tag"], "Start the release workflow")["run"]
+    assert 'gh workflow run "$RELEASE_WORKFLOW" --ref "$TAG" >&2' in start
+    assert " -f " not in start and " -F " not in start and "--field" not in start and "--raw-field" not in start
+    # The calling file grants no `actions`, and the workflow asks for none: see the test of the
+    # release home that is found taken.
+    assert "actions" not in example["permissions"]
 
 
 def test_readme_lists_every_input_with_its_default(entry):
@@ -2894,3 +3329,59 @@ def test_readme_lists_every_input_with_its_default(entry):
         assert shown == ("`''`" if default == "" else "<br>".join(f"`{line}`" for line in str(default).splitlines())), name
     for name in trigger(entry)["secrets"]:
         assert f"`{name}`" in section, name
+
+
+def test_the_readme_shows_the_calling_file_of_the_example():
+    example = yaml.safe_load(EXAMPLE.read_text())
+    usage = yaml.safe_load(README.read_text().split("## android-release.yml", 1)[1].split("```yaml", 1)[1].split("```", 1)[0])
+    # The triggers, the manual run's `cold` included, the group and the permissions.
+    for part in (True, "concurrency", "permissions"):
+        assert usage[part] == example[part], part
+    (shown,), (job,) = usage["jobs"].values(), example["jobs"].values()
+    assert shown == job
+
+
+def test_the_readme_describes_both_homes_in_one_place_and_what_changes_for_a_caller():
+    readme = README.read_text()
+    homes = readme.split("\n## The warm Gradle homes\n", 1)[1].split("\n## ", 1)[0]
+    # The two directories, as the step that chooses the home puts them together.
+    for which in ("qa", "release"):
+        assert f"`~/android-{which}-gradle/<owner>/<repo>/home`" in homes, which
+    assert 'root="$HOME/android-$which-gradle"' in step_by_id(load(BUILD)["jobs"]["build"], "gradle-home")["run"]
+    # What to do about a release that failed for what may be its home, here and where a release is described.
+    assert "**A release that fails for what may be its home is run once more with `gradle-home: cold`**" in homes
+    release = readme.split("\n## android-release.yml\n", 1)[1].split("\n## ", 1)[0]
+    assert "**When a release fails for what may be its Gradle home, run it once more cold.**" in release
+    assert "gh workflow run release.yml --ref vX.Y.Z -f cold=true" in release
+    # The section is one for both workflows, and neither workflow's chapter keeps one of its own.
+    assert "The QA Gradle home\n" not in readme and "#the-qa-gradle-home" not in readme and "#before-turning-it-on" not in readme
+    # The defaults that change with the move of the tag are named where the tags are described: a
+    # caller that does nothing gets both homes, and the earlier name of the input is still taken.
+    changes = readme.split("### Changes within `android-ci/v1`", 1)[1].split("\n## ", 1)[0].split("`android-ci/v1.3.0` builds", 1)[1]
+    for word in (
+        "**the release Gradle home of the repository**", "**Its QA builds change from cold to warm**",
+        "**deprecated**", "`gradle-home: cold` is the build of before", "**No calling file has to change, and none has to grant more.**",
+    ):
+        assert word in changes, word
+    inputs = trigger(load("android-qa.yml"))["inputs"]
+    assert (inputs["gradle-home"]["default"], inputs["qa-gradle-home"]["default"]) == ("warm", "")
+
+
+def test_every_link_within_the_readme_names_a_heading():
+    # GitHub's anchors: the heading in lower case, without punctuation, spaces as hyphens, and a
+    # number after the second heading of a name. A section that is moved or renamed takes its links along.
+    readme = README.read_text()
+    seen: dict[str, int] = {}
+    anchors = set()
+    fenced = False
+    for line in readme.splitlines():
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        heading = None if fenced else re.match(r"#{1,6} (.+)", line)
+        if heading:
+            slug = re.sub(r"[^\w\- ]", "", heading[1].strip().lower()).replace(" ", "-")
+            anchors.add(slug if slug not in seen else f"{slug}-{seen[slug]}")
+            seen[slug] = seen.get(slug, 0) + 1
+    links = set(re.findall(r"\]\(#([^)\s]+)\)", readme))
+    assert len(links) > 30 and "the-warm-gradle-homes" in links
+    assert sorted(links - anchors) == []

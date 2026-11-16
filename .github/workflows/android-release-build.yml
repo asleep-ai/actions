@@ -8,12 +8,14 @@ name: Android release build
 # keystore, checks every APK the build left and uploads them as one artifact
 # for the publish job.
 #
-# Every build starts from an emptied work folder and runs every task. A
-# release or a preview also starts from an empty Gradle user home, and so does
-# a QA or label build unless its caller asks for more. Asked for it
-# (gradle-home), a QA or label build on a self-hosted runner uses the QA home
-# of its repository instead, a directory that only such builds use, one at a
-# time, and that is kept between them: see the step that chooses the home.
+# Every build starts from an emptied work folder and runs every task. Its
+# Gradle user home is cold, a home of the job that is empty at its start,
+# unless the workflow that calls this file asks for more (gradle-home), which
+# both do unless their own caller says cold. Asked for it, a build on a
+# self-hosted runner uses a home of its repository that is kept between
+# builds: the QA home for a QA or label build, the release home for a release
+# or a preview. Two directories, each used by its own kind of build only, one
+# build at a time: see the step that chooses the home.
 #
 # This file is internal to those two workflows: call them, not this one. The
 # inputs are documented there and in android-ci/README.md.
@@ -106,14 +108,17 @@ on:
       gradle-home:
         description: >-
           cold, warm or reset. cold, the default: a Gradle user home of this
-          job, empty at its start and gone at its end. warm: the QA home of
-          the repository, which is kept between jobs. reset: that home,
-          emptied first. Anything but cold is honoured only for kind qa or
-          label, on a self-hosted runner, in a run that a push or a person
-          started on the default branch of the repository or on
-          release/<major>.x, and while no other build uses the home. Every
-          other build is cold, whatever the value. android-release.yml does
-          not pass it.
+          job, empty at its start and gone at its end. warm: the home of the
+          repository that is kept between jobs, the QA home for kind qa or
+          label and the release home for kind release or preview. reset: that
+          home, emptied first. Anything but cold is honoured only on a
+          self-hosted runner, in a run that a push or a person started on a
+          ref of the kind (the default branch of the repository or
+          release/<major>.x for qa and label, a release or preview tag for
+          release and preview), and while no other build uses the home. Every
+          other build is cold, whatever the value. android-release.yml and
+          android-qa.yml pass warm for their first build unless their caller
+          says otherwise, and cold for the build after a failed one.
         required: false
         type: string
         default: cold
@@ -144,7 +149,9 @@ on:
 # packages: read. android-qa.yml gives its first build actions: read on top,
 # for the one question the step that chooses the Gradle user home asks
 # GitHub; a declaration here would have to name it for the release too, whose
-# calling files do not grant it. android-ci's tests pin what the two give.
+# calling files do not grant it. So a release asks that question with a token
+# that may not, gets no answer, and goes by the time in the file instead.
+# android-ci's tests pin what the two give.
 
 defaults:
   run:
@@ -168,8 +175,8 @@ jobs:
     # code as well when the plan of the calling workflow passed something
     # empty: the same plan would pass it to the second build.
     #
-    # The verdict does not depend on the Gradle user home. A Gradle run in the
-    # QA home that failed for the code is code, as anywhere, and no second
+    # The verdict does not depend on the Gradle user home. A Gradle run in a
+    # warm home that failed for the code is code, as anywhere, and no second
     # build follows it. What is done about a home that may be to blame is
     # in the step that tidies or discards it.
     outputs:
@@ -372,30 +379,39 @@ jobs:
           distribution: ${{ inputs.java-distribution }}
           java-version: ${{ inputs.java-version }}
 
-      # Cold, for every release and preview and wherever nothing else is asked
-      # for: a Gradle user home in the job's temp directory, which the runner
-      # empties before and after every job. It starts without init scripts,
-      # dependency cache, build cache or daemons of any other job, and what
-      # this build leaves in it, values of local.properties included, is gone
-      # when the job ends.
+      # Cold, wherever nothing else is asked for: a Gradle user home in the
+      # job's temp directory, which the runner empties before and after every
+      # job. It starts without init scripts, dependency cache, build cache or
+      # daemons of any other job, and what this build leaves in it, values of
+      # local.properties included, is gone when the job ends.
       #
-      # Warm, for a QA or label build whose caller asks for it (gradle-home):
-      # the QA home of the repository,
-      # <HOME>/android-qa-gradle/<owner>/<repo>/home, a directory of the
-      # runner's user that no other step of these workflows names. It is kept
-      # between jobs, so a build finds the Gradle distribution, the
-      # dependencies and what Gradle derived from them already there.
+      # Warm, for a build whose caller asks for it (gradle-home): a home of
+      # the repository that is kept between jobs, so a build finds the Gradle
+      # distribution, the dependencies and what Gradle derived from them
+      # already there. There are two, and the kind of the build says which:
       #
-      # Who may use it is decided here, from the run alone: no input says
-      # which branch counts. A QA or label build, on a self-hosted runner, in
-      # a run that a push or a person started (github.event_name) on the
-      # default branch of the calling repository or on release/<major>.x
-      # (github.ref against github.event.repository.default_branch). Those
-      # are the builds of merged code that are signed anyway. Every other
-      # build is cold whatever was asked for: a release, a preview, a
+      #   qa, label          <HOME>/android-qa-gradle/<owner>/<repo>/home
+      #   release, preview   <HOME>/android-release-gradle/<owner>/<repo>/home
+      #
+      # Both are directories of the runner's user that no other step of these
+      # workflows names, and neither kind of build is ever given the home of
+      # the other: what the QA builds of every push leave in theirs is not
+      # what a release is built with. Everything below holds for each of the
+      # two on its own.
+      #
+      # Who may use a home is decided here, from the run alone: no input says
+      # which branch or tag counts. A build on a self-hosted runner, in a run
+      # that a push or a person started (github.event_name), on a ref of its
+      # kind (github.ref). For a QA or label build that is the default branch
+      # of the calling repository (github.event.repository.default_branch) or
+      # release/<major>.x: the builds of merged code that are signed anyway.
+      # For a release or a preview it is a tag vX.Y.Z or vX.Y.0-preview.N,
+      # which is the ref of every run that the version bump or a tag push
+      # starts. Every other build is cold whatever was asked for: a
       # GitHub-hosted runner, any other event, any other ref. A repository
       # that cuts its releases from another branch than its default branch
-      # builds that branch cold.
+      # builds the QA builds of that branch cold, and so is a release whose
+      # run was started on a branch with the tag as an input.
       #
       # One build at a time. The file `in-use` next to the home names the
       # build that has it: its run, the attempt of the run and the runner it
@@ -409,12 +425,14 @@ jobs:
       # jobs of the run attempt the file names. When every job of it that ran
       # on the named runner is completed, the build that took the home is
       # over, and this one takes the home over. That needs a token that may
-      # read the runs of the repository (actions: read); android-qa.yml gives
-      # it. Whenever GitHub cannot be asked or does not say that the job is
-      # over, the file counts until the time written in it: the timeout of
-      # the job and ten minutes, or two minutes after a Gradle run that was
-      # cancelled. So nothing is deleted or discarded under a build that
-      # runs, and no build reads what another one is writing.
+      # read the runs of the repository (actions: read). android-qa.yml gives
+      # it; android-release.yml cannot, because the files that call it grant
+      # no such permission, so a release asks and is not answered. Whenever
+      # GitHub cannot be asked or does not say that the job is over, the file
+      # counts until the time written in it: the timeout of the job and ten
+      # minutes, or two minutes after a Gradle run that was cancelled. So
+      # nothing is deleted or discarded under a build that runs, and no build
+      # reads what another one is writing.
       #
       # Only a home that a build finished in is used again. The file `intact`
       # next to the home says so: the build takes it away before it uses the
@@ -423,10 +441,10 @@ jobs:
       # discarded: an entry that a killed build left half written can fail
       # the next build in a way that reads like an error in the code.
       #
-      # One home per repository, for all its lines and for every runner of a
-      # host that runs as the same user: the same path on each of them. The
-      # pull request builds never use this directory, and this build never
-      # uses theirs.
+      # One home of each kind per repository, for all its lines and for every
+      # runner of a host that runs as the same user: the same path on each of
+      # them. The pull request builds never use these directories, and this
+      # build never uses theirs.
       #
       # The home holds caches and nothing else. Before the build, everything
       # in it is deleted but caches, wrapper and jdks, and inside those the
@@ -448,7 +466,7 @@ jobs:
       # nothing here checks them. What protects the home is who can write to
       # it.
       #
-      # Nothing about the QA home fails the step: whatever keeps it from
+      # Nothing about a warm home fails the step: whatever keeps it from
       # being used ends in a cold build, and in a warning unless the reason
       # is that another build has the home.
       - name: Choose the Gradle user home
@@ -462,7 +480,7 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           REPOSITORY: ${{ github.repository }}
           BUILD_TIMEOUT_MINUTES: ${{ inputs.build-timeout-minutes }}
-          # Only to ask whether the job that has the QA home is over.
+          # Only to ask whether the job that has the home is over.
           TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -475,10 +493,35 @@ jobs:
             echo "Gradle user home: $cold (cold: $1)"
             exit 0
           }
+          # The two warm homes, and what each is called: `which` in the name
+          # of its directory, `Name` where a title starts with it and `name`
+          # inside a sentence. The kind of the build says which of the two it
+          # is, and nothing else does: a QA or label build is never given the
+          # release home, and a release or a preview never the QA home.
+          home_of() {
+            case "$1" in
+              qa|label)
+                which=qa
+                Name=QA
+                name=QA
+                ;;
+              release|preview)
+                which=release
+                Name=Release
+                name=release
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+          if ! home_of "$KIND"; then
+            use_cold "kind is none of release, preview, qa and label"
+          fi
           # The build was meant to be warm and is not: the host has to hear of it.
           give_up() {
-            echo "::warning title=QA Gradle home not used::$1 The build is cold."
-            use_cold "the QA home cannot be used"
+            echo "::warning title=$Name Gradle home not used::$1 The build is cold."
+            use_cold "the $name home cannot be used"
           }
 
           case "$GRADLE_HOME" in
@@ -486,25 +529,33 @@ jobs:
             cold) use_cold "gradle-home is cold" ;;
             *) give_up "gradle-home is none of cold, warm and reset." ;;
           esac
-          if [[ "$KIND" != qa && "$KIND" != label ]]; then
-            use_cold "a release or a preview is built cold, whatever gradle-home says"
-          fi
           if [[ "$RUNNER_KIND" != self-hosted ]]; then
             use_cold "a GitHub-hosted runner keeps nothing between jobs"
           fi
-          # From here on it is a QA build that asked for the home and does
+          # From here on it is a build that was meant for the home and does
           # not get it. Its caller did not plan for that, so each reason is a
           # warning. The event, the ref and the default branch are the run's:
-          # no caller can say that its run is a push to a release branch.
+          # no caller can say that its run is a push to a release branch, or
+          # the run of a release tag.
           if [[ "$EVENT_NAME" != push && "$EVENT_NAME" != workflow_dispatch ]]; then
-            give_up "Only a run that a push or a person started uses the QA home, and this is a $EVENT_NAME run."
+            give_up "Only a run that a push or a person started uses the $name home, and this is a $EVENT_NAME run."
           fi
-          if [[ -z "$DEFAULT_BRANCH" ]]; then
-            give_up "The run does not name the default branch of the repository."
-          fi
-          release_line='^refs/heads/release/(0|[1-9][0-9]*)\.x$'
-          if [[ "$RUN_REF" != "refs/heads/$DEFAULT_BRANCH" && ! "$RUN_REF" =~ $release_line ]]; then
-            give_up "Only a run on the default branch of the repository ($DEFAULT_BRANCH) or on release/<major>.x uses the QA home, and this run is on $RUN_REF."
+          if [[ "$which" == qa ]]; then
+            if [[ -z "$DEFAULT_BRANCH" ]]; then
+              give_up "The run does not name the default branch of the repository."
+            fi
+            release_line='^refs/heads/release/(0|[1-9][0-9]*)\.x$'
+            if [[ "$RUN_REF" != "refs/heads/$DEFAULT_BRANCH" && ! "$RUN_REF" =~ $release_line ]]; then
+              give_up "Only a run on the default branch of the repository ($DEFAULT_BRANCH) or on release/<major>.x uses the QA home, and this run is on $RUN_REF."
+            fi
+          else
+            # The two forms of tag that android-release.yml builds, as its
+            # plan reads them: no leading zero, and a preview of X.Y.0 only.
+            release_tag='^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+            preview_tag='^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0-preview\.[1-9][0-9]*$'
+            if [[ ! "$RUN_REF" =~ $release_tag && ! "$RUN_REF" =~ $preview_tag ]]; then
+              give_up "Only the run of a release tag (vX.Y.Z) or of a preview tag (vX.Y.0-preview.N) uses the release home, and this run is on $RUN_REF."
+            fi
           fi
 
           # <owner>/<repo>, as two directories: no two repositories share a
@@ -514,13 +565,13 @@ jobs:
             give_up "The name of the repository cannot name a directory."
           fi
           if [[ -z "${HOME:-}" || "$HOME" != /* || "$HOME" == *..* || ! -d "$HOME" ]]; then
-            give_up "HOME is not a directory, so there is no place for the QA home."
+            give_up "HOME is not a directory, so there is no place for the $name home."
           fi
           minutes="${BUILD_TIMEOUT_MINUTES%%.*}"
           if [[ ! "$minutes" =~ ^[0-9]{1,5}$ ]]; then
-            give_up "build-timeout-minutes is not a number, so nothing says how long this build may have the QA home."
+            give_up "build-timeout-minutes is not a number, so nothing says how long this build may have the $name home."
           fi
-          root="$HOME/android-qa-gradle"
+          root="$HOME/android-$which-gradle"
           base="$root/$REPOSITORY"
           home="$base/home"
           lock="$base/in-use"
@@ -589,12 +640,12 @@ jobs:
 
           # A function that is asked "did it work" runs without errexit, so
           # each of these returns at its first failure itself.
-          problem="The QA home could not be prepared; the reason is in the lines above."
+          problem="The $name home could not be prepared; the reason is in the lines above."
           place() {
             local path
             for path in "$root" "${base%/*}" "$base"; do
               if [[ -L "$path" ]]; then
-                problem="$path is a symbolic link, and the QA home is a directory of its own."
+                problem="$path is a symbolic link, and the $name home is a directory of its own."
                 return 1
               fi
             done
@@ -645,7 +696,7 @@ jobs:
           take() {
             local seen holder_runner="" moved found result=0
             if [[ -d "$lock" ]]; then
-              problem="$lock is a directory, and it is the file that names the build that has the QA home. Delete it on the host."
+              problem="$lock is a directory, and it is the file that names the build that has the $name home. Delete it on the host."
               return 1
             fi
             claim || result=$?
@@ -665,7 +716,7 @@ jobs:
               # not that it exists.
               seen=$(cat "$lock" 2> /dev/null) || seen=""
               if [[ -z "$seen" && ! -e "$lock" && ! -L "$lock" ]]; then
-                problem="$lock, the file that names the build that has the QA home, could not be made, and no other build has made it: ${claim_error:-the link failed without a message}."
+                problem="$lock, the file that names the build that has the $name home, could not be made, and no other build has made it: ${claim_error:-the link failed without a message}."
                 return 1
               fi
             fi
@@ -673,7 +724,7 @@ jobs:
             if [[ ! "$holder" =~ ^[0-9]+-[0-9]+-[0-9]+-[0-9]+$ || ! "$held_until" =~ ^[0-9]{1,12}$ ]]; then
               holder=""
               held_until=""
-              problem="$lock does not name a build of this workflow. Delete it on the host while no QA build of the repository runs."
+              problem="$lock does not name a build of this workflow. Delete it on the host while no $name build of the repository runs."
               return 1
             fi
             if (( now <= 10#$held_until )) && ! over "$holder" "$holder_runner"; then
@@ -701,7 +752,7 @@ jobs:
               return 2
             fi
             rm -f "$moved"
-            echo "Taking the QA home over from the build of run ${holder%%-*}, which did not give it back."
+            echo "Taking the $name home over from the build of run ${holder%%-*}, which did not give it back."
             result=0
             claim || result=$?
             if [[ "$result" == 2 ]]; then
@@ -731,10 +782,10 @@ jobs:
               rm -f "$lock"
             fi
             if [[ -e "$gone" || -L "$gone" ]] && ! rm -rf "$gone"; then
-              echo "::warning title=QA Gradle home not deleted completely::The QA home was moved away, and not all of it could be deleted; the reason is in the lines above. No build uses it any more, and the next QA build on this host tries again. If this warning stays, delete $gone on the host."
+              echo "::warning title=$Name Gradle home not deleted completely::The $name home was moved away, and not all of it could be deleted; the reason is in the lines above. No build uses it any more, and the next $name build on this host tries again. If this warning stays, delete $gone on the host."
             fi
           }
-          # What a QA home holds besides its caches, in `extra`. Kept are
+          # What a warm home holds besides its caches, in `extra`. Kept are
           # caches (what Gradle downloaded and what it derived from that),
           # wrapper (the Gradle distributions) and jdks (toolchains Gradle
           # downloaded). Not kept: everything else at the top, which is where
@@ -787,7 +838,7 @@ jobs:
             # What a discard could not delete, and what a build that was
             # killed in the moment it took the home left of that.
             if ! find "$base" -mindepth 1 -maxdepth 1 \( -name 'discarded-*' -o \( \( -name 'claim-*' -o -name 'stale-*' \) -mmin +60 \) \) -exec rm -rf {} +; then
-              echo "::warning title=QA Gradle home leftovers::Not everything that an earlier build left next to the QA home could be deleted; the reason is in the lines above. It is no home and no build uses it, but it takes room: delete the discarded-* directories in $base on the host."
+              echo "::warning title=$Name Gradle home leftovers::Not everything that an earlier build left next to the $name home could be deleted; the reason is in the lines above. It is no home and no build uses it, but it takes room: delete the discarded-* directories in $base on the host."
             fi
             if [[ -f "$mark" && ! -L "$mark" ]]; then
               finished=true
@@ -795,33 +846,33 @@ jobs:
             rm -rf "$mark" || return 1
             if [[ -L "$home" ]]; then
               rm -f "$home" || return 1
-              echo "::warning title=QA Gradle home discarded::$home was a symbolic link. The link is deleted, and the build starts with an empty QA home."
+              echo "::warning title=$Name Gradle home discarded::$home was a symbolic link. The link is deleted, and the build starts with an empty $name home."
             elif [[ -d "$home" && "$finished" != true ]]; then
               discard || return 1
-              echo "::warning title=QA Gradle home discarded::The build that had the QA home before${holder:+ (run ${holder%%-*})} did not finish in it: its job died or was killed before its last steps. Such a home is not used again, so this build starts with an empty one."
+              echo "::warning title=$Name Gradle home discarded::The build that had the $name home before${holder:+ (run ${holder%%-*})} did not finish in it: its job died or was killed before its last steps. Such a home is not used again, so this build starts with an empty one."
             elif [[ -d "$home" ]]; then
               find_link "$home" || return 1
               if [[ -n "$link" ]]; then
                 discard || return 1
-                echo "::warning title=QA Gradle home discarded::$link was a symbolic link: the QA home shares nothing with another Gradle user home. The build starts with an empty QA home."
+                echo "::warning title=$Name Gradle home discarded::$link was a symbolic link: the $name home shares nothing with another Gradle user home. The build starts with an empty $name home."
               elif [[ "$GRADLE_HOME" == reset ]]; then
                 discard || return 1
-                echo "Discarded the QA home: gradle-home is reset."
+                echo "Discarded the $name home: gradle-home is reset."
               fi
             elif [[ -e "$home" ]]; then
               rm -f "$home" || return 1
             fi
             if [[ -d "$home" ]]; then
-              echo "The QA home exists: earlier QA builds of $REPOSITORY left it."
+              echo "The $name home exists: earlier $name builds of $REPOSITORY left it."
             else
-              echo "The QA home is new: this build fills it."
+              echo "The $name home is new: this build fills it."
             fi
             mkdir -p "$home" || return 1
             chmod 700 "$home" || return 1
             scrub "$home" || return 1
             if [[ "${#removed[@]}" != 0 ]]; then
               names=$(for path in "${removed[@]}"; do echo "${path#"$home"/}"; done | LC_ALL=C sort | tr '\n' ' ')
-              echo "::warning title=QA Gradle home held more than its caches::Deleted from the QA home before the build: ${names% }. The build before left nothing there but the caches, and no build has a reason to write there afterwards, so look for what did."
+              echo "::warning title=$Name Gradle home held more than its caches::Deleted from the $name home before the build: ${names% }. The build before left nothing there but the caches, and no build has a reason to write there afterwards, so look for what did."
             fi
           }
 
@@ -839,8 +890,8 @@ jobs:
             if [[ -n "$held_until" ]]; then
               how_long=" It is that build's until $(clock "$held_until") at the latest, and sooner when its job ends."
             fi
-            echo "::notice title=QA Gradle home in use::Another QA build of $REPOSITORY has the QA home${holder:+ (run ${holder%%-*})}, and one build at a time uses it. The build is cold.$how_long$not_emptied"
-            use_cold "the QA home is in use"
+            echo "::notice title=$Name Gradle home in use::Another $name build of $REPOSITORY has the $name home${holder:+ (run ${holder%%-*})}, and one build at a time uses it. The build is cold.$how_long$not_emptied"
+            use_cold "the $name home is in use"
           elif [[ "$state" != 0 ]]; then
             give_up "$problem"
           fi
@@ -858,13 +909,13 @@ jobs:
           # the next build as it is.
           if ! prepare; then
             if ! discard give-back; then
-              problem="$problem $home could not be moved away either. It stays marked as in use, so QA builds on this host are cold until one of them takes it over, after the time this build has, and tries again. Or delete $base on the host."
+              problem="$problem $home could not be moved away either. It stays marked as in use, so $name builds on this host are cold until one of them takes it over, after the time this build has, and tries again. Or delete $base on the host."
             fi
             give_up "$problem"
           fi
           echo "GRADLE_USER_HOME=$home" >> "$GITHUB_ENV"
           echo "warm=true" >> "$GITHUB_OUTPUT"
-          echo "Gradle user home: $home (the QA home of $REPOSITORY)"
+          echo "Gradle user home: $home (the $name home of $REPOSITORY)"
 
       # For the wrapper validation and the job summary. The Actions cache is
       # off on every runner: nothing is restored into a build that signs, and
@@ -966,13 +1017,14 @@ jobs:
           # of an earlier build, no build cache entry from anywhere. The copy
           # in the temp directory is what gradle-log-verdict reads.
           #
-          # That holds in the QA home too, which is why the two flags do not
-          # depend on it. The work folder was empty, and no task output is
-          # read from a cache or written to one: every task of the project
-          # runs, and no value of local.properties ends up in the home inside
-          # a cached output. What the QA home saves is the downloads (the
-          # Gradle distribution, the dependencies), what Gradle derives from
-          # them, and the compiled build scripts.
+          # That holds in a warm home too, the QA home and the release home
+          # alike, which is why the two flags do not depend on it. The work
+          # folder was empty, and no task output is read from a cache or
+          # written to one: every task of the project runs, and no value of
+          # local.properties ends up in the home inside a cached output. What
+          # a warm home saves is the downloads (the Gradle distribution, the
+          # dependencies), what Gradle derives from them, and the compiled
+          # build scripts.
           #
           # -PciBuildKind says which of the four kinds the build is, for a
           # build that puts it into the name of the APK. A build that does not
@@ -1129,7 +1181,7 @@ jobs:
       # The build outputs hold the values of local.properties (generated
       # sources, the APK), and a self-hosted runner would keep them for the
       # jobs that follow. A cold Gradle user home is in the temp directory,
-      # which the runner empties itself; the QA home is seen to below.
+      # which the runner empties itself; a warm home is seen to below.
       - name: Empty the work folder again
         if: ${{ always() }}
         env:
@@ -1144,8 +1196,11 @@ jobs:
             echo "Emptied $GITHUB_WORKSPACE."
           fi
 
-      # Only after a build that took the QA home, which outlives the job. The
-      # step gives the home back (it deletes `in-use`) in every case but two.
+      # Only after a build that took a warm home, the QA home or the release
+      # home, which outlives the job. The step is the same for both, and so
+      # is every rule below; the kind of the build says which of the two it
+      # is handed, as in the step that chose it. The step gives the home back
+      # (it deletes `in-use`) in every case but two.
       # A home that could be neither tidied nor moved away stays taken, so
       # that no build uses it as it is. And after a Gradle run that was
       # cancelled (by a run of a later commit, by a person or by the timeout
@@ -1157,13 +1212,14 @@ jobs:
       #
       # This step is not what frees the home after a job that died: no step
       # of such a job runs. The step that chooses the home sees to that, by
-      # asking GitHub. A build whose step that chose the home was stopped
-      # before the home was ready (`warm` is not set) gives it back as it is.
+      # asking GitHub, or by the time in the file where GitHub does not
+      # answer. A build whose step that chose the home was stopped before
+      # the home was ready (`warm` is not set) gives it back as it is.
       #
       # A Gradle run that did not succeed leaves a home that is not used
-      # again: it is moved away and deleted, and the next QA build on this
-      # host starts with an empty one. The failure may be the code's, and
-      # then a good home is thrown away for one slow build; it may be the
+      # again: it is moved away and deleted, and the next build of that kind
+      # on this host starts with an empty one. The failure may be the code's,
+      # and then a good home is thrown away for one slow build; it may be the
       # home's (an entry that a killed build left half written can read like
       # a compile error), and then every build after it would fail the same
       # way. The two cannot be told apart here, and the verdict does not try:
@@ -1181,48 +1237,80 @@ jobs:
       #
       # Nothing is read from a place the build could have changed: the paths
       # and the name this build took the home under are outputs of the step
-      # that chose it, not GRADLE_USER_HOME or HOME, which a build can set
-      # for the steps after it. And nothing is touched unless `in-use` still
-      # names this build. The step never fails.
-      - name: Tidy or discard the QA Gradle home
+      # that chose it, and the kind of the build is an input of the job, not
+      # GRADLE_USER_HOME or HOME, which a build can set for the steps after
+      # it. And nothing is touched unless `in-use` still names this build.
+      # The step never fails.
+      - name: Tidy or discard the warm Gradle home
         if: ${{ always() && steps.gradle-home.outputs.token != '' && steps.gradle-home.outputs.warm != 'false' }}
         env:
-          QA_ROOT: ${{ steps.gradle-home.outputs.root }}
-          QA_HOME: ${{ steps.gradle-home.outputs.home }}
-          QA_TOKEN: ${{ steps.gradle-home.outputs.token }}
-          QA_READY: ${{ steps.gradle-home.outputs.warm }}
+          KIND: ${{ inputs.kind }}
+          WARM_ROOT: ${{ steps.gradle-home.outputs.root }}
+          WARM_HOME: ${{ steps.gradle-home.outputs.home }}
+          WARM_TOKEN: ${{ steps.gradle-home.outputs.token }}
+          WARM_READY: ${{ steps.gradle-home.outputs.warm }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
         run: |
           set -euo pipefail
-          root="$QA_ROOT"
-          home="$QA_HOME"
-          token="$QA_TOKEN"
+          # As in the step that chose the home, word for word.
+
+          # The two warm homes, and what each is called: `which` in the name
+          # of its directory, `Name` where a title starts with it and `name`
+          # inside a sentence. The kind of the build says which of the two it
+          # is, and nothing else does: a QA or label build is never given the
+          # release home, and a release or a preview never the QA home.
+          home_of() {
+            case "$1" in
+              qa|label)
+                which=qa
+                Name=QA
+                name=QA
+                ;;
+              release|preview)
+                which=release
+                Name=Release
+                name=release
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+          if ! home_of "$KIND"; then
+            echo "::warning title=Gradle home left as it is::kind is none of release, preview, qa and label, so nothing says which home '$WARM_HOME' is."
+            exit 0
+          fi
+          root="$WARM_ROOT"
+          home="$WARM_HOME"
+          token="$WARM_TOKEN"
           base="${home%/home}"
           lock="$base/in-use"
           mark="$base/intact"
           repository_name='^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$'
-          if [[ "$root" != /*/android-qa-gradle || "$home" != "$root"/*/home || ! "${base#"$root"/}" =~ $repository_name || "$home" == *..* || -z "$token" ]]; then
-            echo "::warning title=QA Gradle home left as it is::'$home' is not a QA home under '$root'."
+          # Only the home of this kind of build: a path under the other one
+          # is not this step's to delete, whatever handed it over.
+          if [[ "$root" != /*/android-"$which"-gradle || "$home" != "$root"/*/home || ! "${base#"$root"/}" =~ $repository_name || "$home" == *..* || -z "$token" ]]; then
+            echo "::warning title=$Name Gradle home left as it is::'$home' is not a $name home under '$root'."
             exit 0
           fi
           holder=""
           holder_runner=""
           { { read -r holder _; IFS= read -r holder_runner; } < "$lock"; } 2> /dev/null || true
           if [[ "$holder" != "$token" ]]; then
-            echo "::warning title=QA Gradle home left as it is::The QA home is not this build's any more${holder:+: the build of run ${holder%%-*} has it}. The job ran past the time it had and a later build took the home over, or the file that names the build was deleted on the host. Nothing is deleted."
+            echo "::warning title=$Name Gradle home left as it is::The $name home is not this build's any more${holder:+: the build of run ${holder%%-*} has it}. The job ran past the time it had and a later build took the home over, or the file that names the build was deleted on the host. Nothing is deleted."
             exit 0
           fi
-          if [[ "$QA_READY" != true ]]; then
+          if [[ "$WARM_READY" != true ]]; then
             # Whatever state the home is in, it is marked as that: a home
             # whose preparing was begun has no `intact`, and the next build
             # discards it.
             rm -f "$lock"
-            echo "The step that chose the QA home was stopped before the home was ready, and Gradle did not run in it. The home is given back as it is."
+            echo "The step that chose the $name home was stopped before the home was ready, and Gradle did not run in it. The home is given back as it is."
             exit 0
           fi
           if [[ ! -e "$home" && ! -L "$home" ]]; then
             rm -f "$lock"
-            echo "The QA home is gone: it was deleted on the host. The next QA build starts with an empty one."
+            echo "The $name home is gone: it was deleted on the host. The next $name build starts with an empty one."
             exit 0
           fi
 
@@ -1244,10 +1332,10 @@ jobs:
               rm -f "$lock"
             fi
             if [[ -e "$gone" || -L "$gone" ]] && ! rm -rf "$gone"; then
-              echo "::warning title=QA Gradle home not deleted completely::The QA home was moved away, and not all of it could be deleted; the reason is in the lines above. No build uses it any more, and the next QA build on this host tries again. If this warning stays, delete $gone on the host."
+              echo "::warning title=$Name Gradle home not deleted completely::The $name home was moved away, and not all of it could be deleted; the reason is in the lines above. No build uses it any more, and the next $name build on this host tries again. If this warning stays, delete $gone on the host."
             fi
           }
-          # What a QA home holds besides its caches, in `extra`. Kept are
+          # What a warm home holds besides its caches, in `extra`. Kept are
           # caches (what Gradle downloaded and what it derived from that),
           # wrapper (the Gradle distributions) and jdks (toolchains Gradle
           # downloaded). Not kept: everything else at the top, which is where
@@ -1296,7 +1384,7 @@ jobs:
             fi
           }
 
-          taken="It stays marked as in use, so QA builds on this host are cold until one of them takes it over, after the time this build had, and tries again. Or delete $base on the host."
+          taken="It stays marked as in use, so $name builds on this host are cold until one of them takes it over, after the time this build had, and tries again. Or delete $base on the host."
           if [[ "$BUILD_OUTCOME" == cancelled ]]; then
             # The file is replaced in one step, with the time in it changed:
             # this job has two more minutes, not the rest of its timeout.
@@ -1304,23 +1392,23 @@ jobs:
             # get to finish.
             briefly="$base/claim-$token"
             if printf '%s %s\n%s\n' "$token" "$(( $(date +%s) + 120 ))" "$holder_runner" > "$briefly" && mv -f "$briefly" "$lock"; then
-              kept="It stays this build's until the job is over: the next QA build takes it over when GitHub says so, or two minutes from now."
+              kept="It stays this build's until the job is over: the next $name build takes it over when GitHub says so, or two minutes from now."
             else
               rm -f "$briefly"
-              kept="It stays this build's until the job is over: the next QA build takes it over when GitHub says so, or after the time this build had."
+              kept="It stays this build's until the job is over: the next $name build takes it over when GitHub says so, or after the time this build had."
             fi
             if discard; then
-              echo "::notice title=QA Gradle home discarded::The Gradle run in the QA home ended as $BUILD_OUTCOME, so the home is not used again: the next QA build on this host starts with an empty one and is as slow as a cold build. $kept"
+              echo "::notice title=$Name Gradle home discarded::The Gradle run in the $name home ended as $BUILD_OUTCOME, so the home is not used again: the next $name build on this host starts with an empty one and is as slow as a cold build. $kept"
             else
-              echo "::warning title=QA Gradle home not discarded::The Gradle run in the QA home ended as $BUILD_OUTCOME, and $home could not be moved away; the reason is in the lines above. $kept That build discards it."
+              echo "::warning title=$Name Gradle home not discarded::The Gradle run in the $name home ended as $BUILD_OUTCOME, and $home could not be moved away; the reason is in the lines above. $kept That build discards it."
             fi
             exit 0
           fi
           if [[ "$BUILD_OUTCOME" == failure ]]; then
             if discard give-back; then
-              echo "::notice title=QA Gradle home discarded::The Gradle run in the QA home ended as $BUILD_OUTCOME, so the home is not used again: the next QA build on this host starts with an empty one and is as slow as a cold build. If the failure is not the code's, run the failed jobs again."
+              echo "::notice title=$Name Gradle home discarded::The Gradle run in the $name home ended as $BUILD_OUTCOME, so the home is not used again: the next $name build on this host starts with an empty one and is as slow as a cold build. If the failure is not the code's, run the failed jobs again."
             else
-              echo "::warning title=QA Gradle home not discarded::The Gradle run in the QA home ended as $BUILD_OUTCOME, and $home could not be moved away; the reason is in the lines above. $taken"
+              echo "::warning title=$Name Gradle home not discarded::The Gradle run in the $name home ended as $BUILD_OUTCOME, and $home could not be moved away; the reason is in the lines above. $taken"
             fi
             exit 0
           fi
@@ -1333,13 +1421,13 @@ jobs:
             rm -f "$lock"
             if [[ "${#removed[@]}" != 0 ]]; then
               names=$(for path in "${removed[@]}"; do echo "${path#"$home"/}"; done | LC_ALL=C sort | tr '\n' ' ')
-              echo "Deleted from the QA home, as after every build: ${names% }."
+              echo "Deleted from the $name home, as after every build: ${names% }."
             fi
-            echo "Kept the QA home for the next QA build, with nothing in it but its caches: $home"
+            echo "Kept the $name home for the next $name build, with nothing in it but its caches: $home"
           elif discard give-back; then
-            echo "::warning title=QA Gradle home discarded::The QA home could not be left with nothing in it but its caches${link:+: $link is a symbolic link}. The home is not used again, and the next QA build on this host starts with an empty one."
+            echo "::warning title=$Name Gradle home discarded::The $name home could not be left with nothing in it but its caches${link:+: $link is a symbolic link}. The home is not used again, and the next $name build on this host starts with an empty one."
           else
-            echo "::warning title=QA Gradle home not discarded::The QA home could neither be tidied nor moved away; the reason is in the lines above. $taken"
+            echo "::warning title=$Name Gradle home not discarded::The $name home could neither be tidied nor moved away; the reason is in the lines above. $taken"
           fi
 
       # The secrets check and the check of the plan are left out of
