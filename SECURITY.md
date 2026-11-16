@@ -8,10 +8,16 @@ We aim to respond within 5 business days and will coordinate a fix and disclosur
 
 ## Scope
 
-The actions in this repo execute untrusted commit messages (`%B` from `git log`) and pass them to third-party APIs (OpenAI). Concerns specifically in scope:
+Some actions read untrusted commit messages (`%B` from `git log`) and pass them to third-party APIs (OpenAI). Repository text is data, never a source of authorization. Concerns specifically in scope:
 
 - Command injection through commit subject/body content
 - Credential leakage in workflow logs (`OPENAI_API_KEY`, `GITHUB_TOKEN`)
 - Tag/ref handling that could trick consumers into running the wrong code
 
-Out of scope: prompt-injection of the AI-generated notes themselves — the output is reviewed before release publication, and the action is not a security boundary.
+AI-generated notes and reviews are untrusted advisory output. Prompt injection, misleading content and accidental disclosure are relevant risks. Callers must add review where needed; this repository’s release workflow currently publishes generated notes automatically, so human review must not be assumed. No action is a sandbox for untrusted code.
+
+## Public contribution boundary
+
+Keep pull-request CI on disposable GitHub-hosted runners with read-only permissions and no secrets. Do not execute PR head code in a privileged `pull_request_target` job. Never share signing workspaces, writable toolchains, Docker sockets or caches with untrusted PR jobs. Pin consumed actions to reviewed full commit SHAs and protect release/tag publishing through repository administration. These are operator requirements; documentation does not configure or verify those settings.
+
+`code-review.yml` automates Codex agent reviews only for eligible same-repository PRs by write-authorized human actors. Forks, bots and privileged PR-target triggers are rejected. The agent explores source in a read-only sandbox with privilege reduction on a disposable hosted VM; advisory comments are published by a separate job. No automatic approval or merge is performed. Read `codex-review/README.md` for remaining prompt-injection, repository-data and API-spend risks. Workflow publication does not itself configure branch protection, fork policies, or consumer adoption.
