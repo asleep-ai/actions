@@ -24,7 +24,19 @@ test('rejects forks, drafts, bots and privileged event types',async()=>{
 });
 test('requires both original and rerun actor write access',async()=>{const f=fixture();f.process.env.GITHUB_TRIGGERING_ACTOR='outsider';f.github.rest.repos.getCollaboratorPermissionLevel=async({username})=>({data:{permission:username==='writer'?'write':'read'}});await run('GATE',f);assert.equal(f.outputs.allowed,'false');});
 test('stale revisions never receive API key job',async()=>{const f=fixture();f.github.rest.pulls.get=async()=>({data:{...f.pr,head:{...f.pr.head,sha:'c'.repeat(40)}}});await run('GATE',f);assert.equal(f.outputs.allowed,'false');});
-test('invalid model fails before spending',async()=>{const f=fixture();f.process.env.REVIEW_MODEL='';await assert.rejects(run('GATE',f));});
+test('omitted or empty model resolves to Sol',async()=>{
+  for(const model of [undefined, '']){const f=fixture();f.process.env.REVIEW_MODEL=model;await run('GATE',f);assert.equal(f.outputs.allowed,'true');assert.equal(f.outputs.model,'gpt-6.1-sol');}
+});
+test('explicit model override is preserved',async()=>{const f=fixture();f.process.env.REVIEW_MODEL='gpt-6-astra';await run('GATE',f);assert.equal(f.outputs.model,'gpt-6-astra');});
+test('invalid model fails before spending',async()=>{
+  for(const model of [' ', 'gpt model', '${evil}', 'x'.repeat(101)]){const f=fixture();f.process.env.REVIEW_MODEL=model;await assert.rejects(run('GATE',f));assert.equal(f.outputs.allowed,'false');}
+});
+test('optional input and agent use the same resolved model',()=>{
+  const input=workflow.split('      model:')[1].split('      post-comment:')[0];
+  assert.ok(input.includes('required: false'));assert.ok(input.includes('default: gpt-6.1-sol'));
+  assert.ok(workflow.includes('model: ${{ steps.gate.outputs.model }}'));
+  assert.ok(workflow.includes('model: ${{ needs.gate.outputs.model }}'));
+});
 test('publishing treats output as data and neutralizes mentions',async()=>{const f=fixture();f.process.env.REVIEW_MESSAGE='@everyone ${evil} ::error::';await run('PUBLISH',f);assert.equal(f.calls.length,1);assert.ok(f.calls[0].body.includes('@\u200beveryone'));assert.ok(f.calls[0].body.includes('${evil}'));});
 test('stale reviews are never posted',async()=>{const f=fixture();f.process.env.REVIEW_HEAD='c'.repeat(40);await run('PUBLISH',f);assert.equal(f.calls.length,0);});
 test('only updates own marker comments and caps size',async()=>{const f=fixture();f.process.env.REVIEW_MESSAGE='x'.repeat(70000);f.github.paginate=async()=>[{id:99,user:{login:'github-actions[bot]'},body:'<!-- asleep-codex-agent-review -->old'}];await run('PUBLISH',f);assert.equal(f.calls[0].comment_id,99);assert.ok(f.calls[0].body.length<60000);});
