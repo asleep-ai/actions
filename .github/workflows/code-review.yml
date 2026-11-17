@@ -3,9 +3,10 @@ on:
   workflow_call:
     inputs:
       model:
-        description: Exact Codex-compatible API model ID approved for the calling project
-        required: true
+        description: Codex-compatible API model ID; omitted or empty uses GPT-6.1 Sol
+        required: false
         type: string
+        default: gpt-6.1-sol
       post-comment:
         description: Publish advisory feedback in a separate least-privilege job
         type: boolean
@@ -29,6 +30,7 @@ jobs:
       head: ${{ steps.gate.outputs.head }}
       base: ${{ steps.gate.outputs.base }}
       number: ${{ steps.gate.outputs.number }}
+      model: ${{ steps.gate.outputs.model }}
     steps:
       - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: gate
@@ -42,7 +44,8 @@ jobs:
             if (context.eventName !== 'pull_request' || !['opened', 'synchronize', 'reopened', 'ready_for_review'].includes(event.action)) return;
             const pr = event.pull_request;
             if (!pr || pr.draft || pr.head.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`) return;
-            if (!/^[A-Za-z0-9_.:-]{1,100}$/.test(process.env.REVIEW_MODEL || '')) throw new Error('Set an explicit approved API model ID');
+            const model = process.env.REVIEW_MODEL || 'gpt-6.1-sol';
+            if (!/^[A-Za-z0-9_.:-]{1,100}$/.test(model)) throw new Error('Set a valid API model ID');
             for (const actor of new Set([context.actor, process.env.GITHUB_TRIGGERING_ACTOR || context.actor])) {
               if (actor.endsWith('[bot]')) return;
               const {data} = await github.rest.repos.getCollaboratorPermissionLevel({...context.repo, username: actor});
@@ -54,6 +57,7 @@ jobs:
             core.setOutput('head', pr.head.sha);
             core.setOutput('base', pr.base.sha);
             core.setOutput('number', String(pr.number));
+            core.setOutput('model', model);
             core.setOutput('allowed', 'true');
             // END GATE
   review:
@@ -98,7 +102,7 @@ jobs:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           codex-version: '0.167.2'
           output-file: ${{ runner.temp }}/codex-review.txt
-          model: ${{ inputs.model }}
+          model: ${{ needs.gate.outputs.model }}
           safety-strategy: drop-sudo
           permission-profile: ':read-only'
           codex-home: ${{ runner.temp }}/trusted-codex-home

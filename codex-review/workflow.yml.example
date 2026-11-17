@@ -9,6 +9,7 @@ jobs:
   review:
     uses: asleep-ai/actions/.github/workflows/code-review.yml@REVIEWED_FULL_COMMIT_SHA
     with:
+      # Optional override; an unset variable defaults to gpt-6.1-sol.
       model: ${{ vars.CODEX_REVIEW_MODEL }}
       post-comment: true
     secrets:
