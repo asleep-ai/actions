@@ -61,9 +61,11 @@ inputs:
   token:
     description: >-
       For next with pr: token that can read the pull request (pull-requests:
-      read). With version-code-scheme build-number, also the token that reads
-      the refs and the releases of the repository (contents: read, for next)
-      and reserves a build number (contents: write, for qa and code).
+      read). Also the token that reads the build numbers of the major
+      (contents: read; with minor-blocks once, to refuse the formula for a
+      major that has them), and with version-code-scheme build-number reads
+      the releases (contents: read, for next) and reserves a build number
+      (contents: write, for qa and code).
     required: false
     default: ${{ github.token }}
   version:
@@ -160,8 +162,10 @@ inputs:
       For next, code and qa with version-code-scheme build-number, optional.
       The highest versionCode of the app that is out where the repository's
       releases do not show it, such as the app in Google Play built from
-      another repository. Every build of its major is numbered above it, and
-      a build of a lower major is refused.
+      another repository. Every build of its major is numbered above it. A
+      build of a lower major is refused while that major has no build, and
+      passed over with a notice once it has (a maintenance line).
+      minor-blocks does not read it, and says so in a warning.
     required: false
     default: ''
 

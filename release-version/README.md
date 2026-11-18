@@ -9,7 +9,7 @@ Composite action for repositories whose versions are git tags. One input, `opera
 | `qa` | Plans a QA build of a branch head, or a label build (a named test build made after a release): the version it leads up to, its version name and versionCode, and the tag of the rolling pre-release it is published as. |
 | `changes` | Lists what a commit adds to the commit a tag names, such as the QA build before it. |
 
-The action reads and computes. It creates no tag and pushes nothing; [`android-version-bump.yml`](../android-ci/README.md#android-version-bumpyml) and [`android-qa.yml`](../android-ci/README.md#android-qayml) are the workflows that do, with this action's outputs. The one thing it writes is a build number: with `version-code-scheme: build-number`, `qa` and `code` reserve one as the ref `refs/build-numbers/<major>/<n>` ([Build numbers](#build-numbers)).
+The action reads and computes, with one exception. It creates no release tag, moves no rolling tag and pushes nothing: [`android-version-bump.yml`](../android-ci/README.md#android-version-bumpyml) and [`android-qa.yml`](../android-ci/README.md#android-qayml) are the workflows that do, with this action's outputs. The exception is a build number: with `version-code-scheme: build-number`, `qa` and `code` reserve one through the GitHub API, as a tag object (no tag ref) and the ref `refs/build-numbers/<major>/<n>` that names it ([Build numbers](#build-numbers)).
 
 ## Usage
 
@@ -62,7 +62,7 @@ The `release-version/v1` tag does not exist until the first release; pin a full 
 | `prerelease` | `next` | `''` | Optional. Empty plans the release. `preview` plans a preview of the same version, which has to be a new minor or major version (`X.Y.0`). See [A preview](#a-preview). |
 | `source-branch` | `next`, `qa` | `''` | For `next`, optional: the branch releases are normally cut from. When given, the commit has to be on the branch of its release line. See [Release lines](#release-lines). For `qa`, required. |
 | `tag-prefix` | all | `v` | What a release tag starts with, before `X.Y.Z`. Letters, digits and `. _ / -`, not starting with `-`; may be empty. |
-| `token` | `next` with `pr`; `next`, `code`, `qa` with `build-number` | `github.token` | Token that can read the pull request (`pull-requests: read`). With `version-code-scheme: build-number`, also the token that reads the refs and releases of the repository (`contents: read`, for `next`) and reserves a build number (`contents: write`, for `qa` and `code`). |
+| `token` | `next` with `pr`; `next`, `code`, `qa` | `github.token` | Token that can read the pull request (`pull-requests: read`). Also the token that reads the build numbers of the major (`contents: read`; with the formula once, to [refuse a major that has them](#the-formula-next-to-build-numbers)), and with `version-code-scheme: build-number` reads the releases (`contents: read`, for `next`) and reserves a build number (`contents: write`, for `qa` and `code`). |
 | `version` | `code`, `next`, `qa` | `''` | For `code`: the version, as `X.Y.Z` or as its tag; with `kind: preview`, as `X.Y.0-preview.N`. For `next`, optional: the exact version to release instead of a bump. See [An exact version](#an-exact-version). For `qa`, optional: the version of this one build, the next minor or the next major version and later than the version the build has without it; not with `label`. See [qa](#qa). |
 | `kind` | `code` | `release` | `release`, `preview`, or `qa` for a QA build of the minor version of `version`. |
 | `qa-sequence` | `code` with `qa`, `qa` | `''` | Number of the QA build, 1 or higher. A later build has a higher number. Not read for a label build. |
@@ -72,8 +72,9 @@ The `release-version/v1` tag does not exist until the first release; pin a full 
 | `label` | `qa` | `''` | Optional. Makes the build a label build: a named test build numbered right after the last release of its line. |
 | `since` | `changes` | `''` | Name of the tag that marks the earlier build. It need not exist. |
 | `version-code` | `changes` | `''` | Optional. The versionCode of the build that is about to be published as the `since` tag; `code-taken-by` then says whether a rolling tag holds it already, and `since-code` which versionCode the build of the `since` tag has. |
+| `release-exists` | `code` with `build-number` | `''` | Optional. `true` when the tag has a GitHub Release already: the build then keeps the number an earlier attempt of the same run reserved, and is refused when there is none ([Reserving](#reserving)). `false` or empty: a build that has not been released. The formula does not read it. |
 | `version-code-scheme` | `next`, `code`, `qa` | `minor-blocks` | How a build gets its versionCode. `minor-blocks`, the default (empty is the same): [the formula](#code), from the version. `build-number`: the next [build number](#build-numbers) of the major, which `qa` and `code` reserve and `next` only looks up. The version names are the same in both. |
-| `version-code-floor` | `next`, `code`, `qa` with `build-number` | `''` | Optional. The highest versionCode of the app that is out where the repository's releases do not show it. Every build of its major is numbered above it, and a build of a lower major is refused. |
+| `version-code-floor` | `next`, `code`, `qa` with `build-number` | `''` | Optional. The highest versionCode of the app that is out where the repository's releases do not show it. Every build of its major is numbered above it. A build of a lower major is refused while that major has no build, and passed over with a notice once it has ([Where a major starts](#where-a-major-starts)). With `minor-blocks` it is not read, and a warning says so. |
 
 Inputs reach the script as environment variables, never through shell interpolation.
 
@@ -289,9 +290,14 @@ versionCode = X × 100000000 + n        n: the build number of the major version
 
 1. The step creates a tag object through the GitHub API: the commit that is built (`sha`), the message `The build number of run <GITHUB_RUN_ID> of <repository>`, and the commit's time as the tagger's. The same run makes the same object in every attempt.
 2. It lists `refs/build-numbers/<X>/`. When one of the refs names that object, an earlier attempt of the run reserved it: the run keeps that number, and nothing is written. That holds for a plan that reserved and then failed, as for a run whose plan passed and whose build failed.
-3. Otherwise it takes the next number ([below](#where-a-major-starts)), checks [the safety rule](#the-safety-rule), and creates `refs/build-numbers/<X>/<n>` naming the object. GitHub creates a ref only when it does not exist: when another build took `n` in between, the step tries `n + 1`, up to 100 times.
+3. With `release-exists: true` (`code` of a tag whose GitHub Release exists), a run that found no number of its own is refused here, before it reserves: a new run of a released tag would take a number above every build since, later releases included, and a device that took it would refuse those. The release is built again by running its own run again.
+4. Otherwise it takes the next number ([below](#where-a-major-starts)), checks [the safety rule](#the-safety-rule), and creates `refs/build-numbers/<X>/<n>` naming the object. GitHub creates a ref only when it does not exist: when another build took `n` in between, the step tries `n + 1`, up to 100 times. Any other refusal (a ruleset, the token's permission) fails the step at once, with what to do.
 
-The token needs `contents: write` for that, `contents: read` to look (`next`). Every other run, the same commit's included, gets a new number. A number whose build never happens is a gap, which costs nothing.
+The token needs `contents: write` for that, `contents: read` to look (`next`). Every other run, the same commit's included, gets a new number. A number whose build never happens is a gap, which costs nothing. The object stands for the run, not for the call: a workflow that runs the step twice in one run for one commit gets one number for both when the calls follow each other, and two when they run at once. Call it once per run.
+
+- A server error, or a request that got no answer, is made again up to three times (after 1, 2 and 4 seconds). Every request may be: a read, a tag object that is the same object again, and a ref that exists by then, which counts as taken.
+- The pages of a long answer are followed where the `Link` header points, as long as that is on the API of the token (`GITHUB_API_URL`: scheme, host and path). GitHub names the repository there by its id, `…/repositories/<id>/releases?page=2`.
+- The refs grow by one per build, and each plan reads those of its major. When that gets long, delete the lower ones and keep the highest few: the highest is the counter. A run whose ref was deleted takes a new number when it is run again.
 
 ### Where a major starts
 
@@ -300,17 +306,23 @@ The token needs `contents: write` for that, `contents: read` to look (`next`). E
   - in the file names of the `.apk` and `.aab` assets of the repository's GitHub Releases and pre-releases, drafts left out. A versionCode is a part of the name of digits only between `_`, `-` and the ends of the name: `App_qa_2.0.0-qa.6_200000006.apk` holds `200000006`, `app-release.apk` none. Any such part counts, so the `64` of `x86_64` is read as a code, which matters only in major 0;
   - in the messages of the rolling tags `qa-*`, `<version name> (<versionCode>)`, whatever the files are called.
 - Without any, the first build of major `X` is `X × 100000000 + 1`: `1` for major 0.
-- `version-code-floor` is a code that is out where neither shows it. Within its major, the next number is above it, refs or not. Below the major it does nothing. Above every code of the major (`101300002` for a build of major 0) it refuses the build.
+- `version-code-floor` is a code that is out where neither shows it. Within its major, the next number is above it, refs or not. Below the major it does nothing. Above every code of a major that has no build yet (`101300002` for the first build of major 0) it refuses the build. Above every code of a major that has builds already, a reserved number or a code out, it is the floor of a later line (one calling file builds the maintenance line too): it is not used, and a notice says so.
 
 ### The safety rule
 
 Before it reserves, the step refuses the build, with the reason, when:
 
 - the build's major is outside 0 to 20;
-- `version-code-floor` is above every code of the major;
+- `version-code-floor` is above every code of the major, and the major has no build yet;
 - the code the build would get is not above the highest code of its major that is out, as listed above. That happens when the refs are behind what was published: a build made with the formula after the switch, or one made by hand. The error names the code and where it was found, and says to pass it as `version-code-floor`.
 
 A number kept from an earlier attempt of the same run is not checked again: what was published since is newer than that build, and the caller decides what an older build means (`stale` of [changes](#changes)).
+
+### The formula next to build numbers
+
+The scheme is an input, and every calling file passes its own: a branch that did not get the switch, or a tag on a commit from before it, would compute the formula for a major that has build numbers, and the two keep no order (`2.0.1` would be `200050100`, above every build number of 2.x so far). So with `minor-blocks`, `next`, `code` and `qa` read the refs of their major once, after every other rule, and refuse the plan when there are any. A repository that never switched has none, and plans as it always did. When the API cannot be asked (no answer, a refusal), the plan goes on with a warning: the question is new, and a repository that never switched should not depend on it.
+
+A `version-code-floor` given with `minor-blocks` is not read, and a warning says so.
 
 ### A new repository
 
@@ -321,6 +333,7 @@ A repository that uses `build-number` from its first build has no versionCode ou
 - `python3` 3.9 or newer and `git` on `PATH`. GitHub-hosted runners provide both.
 - For `next`, `qa` and `changes`: a checkout with `fetch-depth: 0`.
 - With `build-number`: for `code`, a checkout that has `sha`; a token with `contents: write` for `qa` and `code`, `contents: read` for `next`.
+- With `minor-blocks`: a token with `contents: read` for `next`, `code` and `qa`, which read the refs of the major once. Without it the plan goes on with a warning.
 
 ## Development
 
