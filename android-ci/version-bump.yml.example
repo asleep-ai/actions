@@ -91,3 +91,6 @@ jobs:
       prerelease: ${{ inputs.prerelease != 'none' && inputs.prerelease || '' }}
       dry_run: ${{ inputs.dry_run }}
       confirm: ${{ inputs.confirm }}
+      # As in qa.yml and release.yml, so that the plan shows and checks the
+      # versionCode the release will get.
+      # version-code-scheme: build-number

@@ -399,7 +399,8 @@ def test_the_branch_and_the_checks_are_checked_for_every_tag_before_anything_is_
         "TARGET_SHA": "${{ steps.tag.outputs.sha }}",
         "REQUIRED_CHECKS": "${{ inputs.required-checks }}",
     }
-    assert plan["permissions"] == {"contents": "read", "checks": "read"}
+    # contents: write for the build number, which the plan reserves with build-number.
+    assert plan["permissions"] == {"contents": "write", "checks": "read"}
     # The primary build needs the plan, so a refusal here means that no job reads the signing key.
     assert entry["jobs"]["primary"]["needs"] == "plan"
 
@@ -524,7 +525,19 @@ def test_plan_takes_the_version_code_from_the_one_formula(entry):
         "operation": "code",
         "kind": "${{ steps.tag.outputs.kind }}",
         "version": "${{ steps.tag.outputs.tag }}",
+        # With build-number, the next build number of the tag's major, reserved for the tagged
+        # commit with the default token (contents: write). The formula reads neither.
+        "sha": "${{ steps.tag.outputs.sha }}",
+        "version-code-scheme": "${{ inputs.version-code-scheme }}",
+        "version-code-floor": "${{ inputs.version-code-floor }}",
     }
+    assert plan["permissions"]["contents"] == "write"
+    # Reserved once the tag, its branch and its checks have passed: a refused tag takes no number.
+    names = [item.get("id") or item.get("name") for item in plan["steps"]]
+    assert names.index("line") < names.index("Check the commit's checks") < names.index("code") < names.index("pick")
+    inputs = trigger(entry)["inputs"]
+    assert inputs["version-code-scheme"] == {**inputs["version-code-scheme"], "type": "string", "default": "minor-blocks", "required": False}
+    assert inputs["version-code-floor"] == {**inputs["version-code-floor"], "type": "string", "default": "", "required": False}
     # To the other jobs the kind goes as true or false: the runner drops a job output that holds
     # the value of a secret, and "release" is a likely key alias.
     assert "kind" not in plan["outputs"]
@@ -2952,6 +2965,7 @@ def test_primary_and_fallback_pass_the_same_inputs(entry):
     forwarded = set(inner["inputs"]) - {"runs-on", "attempt", "kind", "ref", "gradle-home", *left_out, *planned}
     assert forwarded == set(inputs) - {
         "tag", "runner-labels", "fallback-runs-on", "source-branch", "required-checks", "release-notes-prompt", "gradle-home",
+        "version-code-scheme", "version-code-floor",
     }
     for name in forwarded:
         assert primary["with"][name] == fallback["with"][name] == f"${{{{ inputs.{name} }}}}"
@@ -2984,10 +2998,12 @@ def test_publish_takes_the_apk_of_the_build_that_passed(entry):
         "${{ !cancelled() && (needs.primary.result == 'success' || needs.fallback.result == 'success') }}"
     )
     assert publish["runs-on"] == "ubuntu-latest"
-    # The only job that can write, and it runs none of the repository's code.
+    # The only job that publishes, and it runs none of the repository's code. The plan may write
+    # a ref, the build number of build-number, and runs none of it either.
     assert publish["permissions"] == {"contents": "write", "pull-requests": "read"}
     assert entry["permissions"] == {"contents": "read", "packages": "read"}
-    assert entry["jobs"]["plan"]["permissions"] == {"contents": "read", "checks": "read"}
+    assert entry["jobs"]["plan"]["permissions"] == {"contents": "write", "checks": "read"}
+    assert "gh release" not in json.dumps(entry["jobs"]["plan"])
     download = step(publish, "Download the signed APKs")["with"]
     # The name the build job uploads under, built from the results and not read from an output.
     assert download["name"] == "android-release-apk-${{ needs.primary.result == 'success' && 'primary' || 'fallback' }}"

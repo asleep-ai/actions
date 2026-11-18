@@ -19,6 +19,10 @@ name: Android release
 # QA builds have a home of their own, which no release is given, and a pull
 # request build uses neither.
 #
+# The versionCode follows from the tag by default. With version-code-scheme
+# build-number it is the next build number of the tag's major instead, which
+# the plan reserves in the repository.
+#
 # The caller's contract, every input and the secrets are in
 # android-ci/README.md.
 on:
@@ -151,6 +155,26 @@ on:
         required: false
         type: string
         default: ''
+      version-code-scheme:
+        description: >-
+          How the build gets its versionCode. minor-blocks, the default (empty
+          is the same): the formula, from the tag. build-number: major *
+          100000000 plus the next build number of the major, which the plan
+          reserves in the repository as refs/build-numbers/<major>/<n>
+          (contents: write). Pass the same value to android-qa.yml and
+          android-version-bump.yml.
+        required: false
+        type: string
+        default: minor-blocks
+      version-code-floor:
+        description: >-
+          Optional, with build-number: the highest versionCode of the app that
+          is out where the repository's releases do not show it. Every build
+          of its major is numbered above it, and a build of a lower major is
+          refused.
+        required: false
+        type: string
+        default: ''
       build-timeout-minutes:
         description: >-
           Timeout of the build job, on either kind of runner. Size it for a
@@ -264,7 +288,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: read
+      # Reads the repository; with version-code-scheme build-number it also
+      # reserves the build number, a ref of the repository. A permission
+      # cannot follow an input, so the job has it with the formula too, and
+      # writes nothing then. The files that call this workflow grant it for
+      # the publish job already. No code of the checkout is run.
+      contents: write
       checks: read
     # Whether the tag is a preview is passed as true or false, not as the
     # name of the kind: the runner drops a job output that contains the value
@@ -598,6 +627,11 @@ jobs:
 
       # The version is the tag without its v: X.Y.Z, or X.Y.0-preview.N with
       # the code of a preview, below the release of X.Y.0.
+      #
+      # With version-code-scheme build-number the versionCode is the next
+      # build number of the tag's major, reserved here for the tagged commit
+      # once every check above has passed. A run that is started again keeps
+      # its number; a new run for the same tag reserves a new one.
       - name: Compute the versionCode
         id: code
         uses: asleep-ai/actions/release-version@android-ci/v1
@@ -605,6 +639,9 @@ jobs:
           operation: code
           kind: ${{ steps.tag.outputs.kind }}
           version: ${{ steps.tag.outputs.tag }}
+          sha: ${{ steps.tag.outputs.sha }}
+          version-code-scheme: ${{ inputs.version-code-scheme }}
+          version-code-floor: ${{ inputs.version-code-floor }}
 
       - name: Pick the runner
         id: pick

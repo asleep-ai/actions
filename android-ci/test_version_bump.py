@@ -43,6 +43,7 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
         "PREVIOUS_PRERELEASE_TAG": "",
         "NOTICE": "",
         "VERSION_CODE": "101350100",
+        "BUILD_NUMBER": "",
         "TARGET_SHA": "3ff9b1a3" + "0" * 32,
         "LINE_BRANCH": "develop",
         "PRS": prs,
@@ -110,6 +111,21 @@ def test_the_summary_states_the_two_versions_and_what_is_included(jobs, tmp_path
     text = summary.read_text()
     assert f"> [!WARNING]\n> {notice}.\n" in text
     assert "The preview before this one" not in text
+    assert "build number" not in text
+
+    # With build-number the release reserves its number when it is built: the plan shows the one
+    # it would get now.
+    summary.write_text("")
+    env.update({"TAG": "v2.0.1", "PREVIOUS_TAG": "v2.0.0", "NOTICE": "", "VERSION_CODE": "200050004", "BUILD_NUMBER": "50004"})
+    result = run_script(script, env, tmp_path)
+    assert result.returncode == 0, result.stderr
+    text = summary.read_text()
+    assert (
+        "- versionCode: 200050004 if it were built now (build number 50004). The release reserves its own when it is "
+        "built, so a build made before then moves it up.\n"
+    ) in text
+    assert "- versionCode: 200050004\n" not in text
+    assert step(jobs["plan"], "Write the plan to the summary")["env"]["BUILD_NUMBER"] == "${{ steps.version.outputs.build-number }}"
 
 
 # --- plan: the release workflow of the commit ----------------------------------------------
@@ -817,6 +833,9 @@ def test_the_version_is_planned_again_before_the_push(jobs):
         # A preview is numbered again too: another preview of the version cut meanwhile changes the tag.
         "prerelease": "${{ inputs.prerelease }}",
         "source-branch": source,
+        # Held to the limits of the scheme the release is built with, as the plan was.
+        "version-code-scheme": "${{ inputs.version-code-scheme }}",
+        "version-code-floor": "${{ inputs.version-code-floor }}",
     }
     env = tag["steps"][ids.index("push")]["env"]
     assert env["TAG"] == "${{ needs.plan.outputs.tag }}" and env["TAG_NOW"] == "${{ steps.version.outputs.tag }}"
@@ -836,7 +855,12 @@ def test_the_version_is_planned_again_before_the_push(jobs):
         "version": "${{ inputs.version }}",
         "prerelease": "${{ inputs.prerelease }}",
         "source-branch": source,
+        # With build-number, the number the release would get now; nothing is reserved, and the
+        # plan job only reads.
+        "version-code-scheme": "${{ inputs.version-code-scheme }}",
+        "version-code-floor": "${{ inputs.version-code-floor }}",
     }
+    assert jobs["plan"]["permissions"]["contents"] == "read"
     main = step(jobs["plan"], "Check that the main branch can move")
     assert main["env"]["SOURCE_BRANCH"] == source
     assert main["env"]["LINE_BRANCH"] == "${{ steps.version.outputs.branch }}"
@@ -941,8 +965,14 @@ def test_inputs_secrets_and_outputs(jobs):
     call = trigger(load(ENTRY))
     assert list(call["inputs"]) == [
         "pr", "sha", "bump", "version", "prerelease", "dry_run", "confirm", "source-branch", "required-checks",
-        "main-branch", "release-workflow", "environment",
+        "main-branch", "release-workflow", "environment", "version-code-scheme", "version-code-floor",
     ]
+    # The values the release is built with, with its defaults: the formula, and no floor.
+    release = trigger(load("android-release.yml"))["inputs"]
+    for name in ("version-code-scheme", "version-code-floor"):
+        assert {key: call["inputs"][name][key] for key in ("type", "default", "required")} == {
+            key: release[name][key] for key in ("type", "default", "required")
+        }, name
     # A release unless the run says otherwise.
     assert call["inputs"]["prerelease"] == {**call["inputs"]["prerelease"], "type": "string", "default": "", "required": False}
     # A run is a dry run unless it says otherwise, and a run that says otherwise has to name the

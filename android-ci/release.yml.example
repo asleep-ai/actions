@@ -37,7 +37,7 @@ concurrency:
 # The called workflow can use no more than what is granted here, and it fails
 # to start when one of these is missing.
 permissions:
-  contents: write       # the GitHub Release
+  contents: write       # the GitHub Release, and a build number
   packages: read        # private GitHub Packages of this repository
   checks: read          # the checks of the tagged commit
   pull-requests: read   # pull request descriptions for the release notes
@@ -52,6 +52,9 @@ jobs:
       # starts this workflow without inputs and a tag push has none, so the
       # releases they start are warm.
       gradle-home: ${{ inputs.cold && 'cold' || 'warm' }}
+      # As in qa.yml and version-bump.yml: the formula by default, or the
+      # next build number of the tag's major.
+      # version-code-scheme: build-number
       # Secrets and variables written to local.properties under their own
       # names, next to the four signing keys.
       local-properties-secrets: |
