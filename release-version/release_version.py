@@ -367,8 +367,9 @@ def http_call(method: str, url: str, token: str, body: Optional[dict]) -> tuple:
             return response.status, {name.lower(): value for name, value in response.headers.items()}, response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, {name.lower(): value for name, value in (exc.headers or {}).items()}, exc.read(2000)
+    # No answer: build_numbers asks again before it gives up.
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
-        raise Failure(f"cannot reach {url}: {str(exc) or type(exc).__name__}") from None
+        raise build_numbers.Unreachable(f"cannot reach {url}: {str(exc) or type(exc).__name__}") from None
 
 
 def version_code_scheme(env: Mapping[str, str]) -> str:
@@ -387,19 +388,28 @@ def checked_major(major: int) -> None:
         raise Failure(f"the build is of major {major}, and {exc}. Nothing is built") from None
 
 
-def build_number(env: Mapping[str, str], call: build_numbers.Call, major: int, target: str, keep: bool) -> BuildNumber:
+def repository_api(env: Mapping[str, str], call: build_numbers.Call) -> build_numbers.Repository:
+    repository = env.get("GITHUB_REPOSITORY", "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repository):
+        raise Failure("GITHUB_REPOSITORY is not set to owner/name")
+    return build_numbers.Repository(
+        env.get("GITHUB_API_URL") or "https://api.github.com", repository, env.get("TOKEN", "").strip(), call
+    )
+
+
+def build_number(
+    env: Mapping[str, str], call: build_numbers.Call, major: int, target: str, keep: bool, kept_only: str = ""
+) -> BuildNumber:
     """The build number of major `major` for a build of `target`: reserved, or with keep false only looked at.
 
     The codes the rolling tags name count as out next to the release assets:
     a QA build is published as the asset of a rolling pre-release, and its
-    tag says which code it has whatever the file is called.
+    tag says which code it has whatever the file is called. With `kept_only`,
+    only a number an earlier attempt of the run reserved is taken; otherwise
+    the plan is refused with that reason.
     """
+    api = repository_api(env, call)
     repository = env.get("GITHUB_REPOSITORY", "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repository):
-        raise Failure("GITHUB_REPOSITORY is not set to owner/name")
-    api = build_numbers.Repository(
-        env.get("GITHUB_API_URL") or "https://api.github.com", repository, env.get("TOKEN", "").strip(), call
-    )
     seen = [Shipped(code, f"the build {name} that {tag} holds") for tag, name, code in rolling_builds()]
     try:
         floor = build_numbers.parse_floor(env.get("VERSION_CODE_FLOOR", ""))
@@ -411,12 +421,49 @@ def build_number(env: Mapping[str, str], call: build_numbers.Call, major: int, t
         marker = f"The build number of run {run} of {repository}" if run else f"A build of {repository} ({secrets.token_hex(8)})"
         seconds = int(git("show", "-s", "--format=%ct", target).stdout.strip())
         date = datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        return build_numbers.reserve(api, major, target, marker, date, seen, floor)
+        return build_numbers.reserve(api, major, target, marker, date, seen, floor, kept_only)
     except BuildNumberError as exc:
         raise Failure(str(exc)) from None
 
 
+def formula_guard(env: Mapping[str, str], call: build_numbers.Call, major: int) -> None:
+    """Refuse a versionCode of the formula for a major that has build numbers.
+
+    The scheme is the calling file's, and the calling file is the one of the
+    commit that is built: qa.yml of the branch that was pushed, release.yml
+    of the tagged commit. A branch or a commit from before the switch would
+    still build with the formula, and its codes do not keep one order with
+    build numbers. One read: a repository that never switched has no ref, and
+    builds as before. When GitHub cannot be asked, the plan goes on with a
+    warning, as it did before the question existed.
+    """
+    if env.get("VERSION_CODE_FLOOR", "").strip():
+        print(
+            "::warning title=release-version::version-code-floor is given, and version-code-scheme is "
+            f"{MINOR_BLOCKS}: the floor is for build numbers, and is not read. Set version-code-scheme: "
+            f"{BUILD_NUMBER} in the calling file, or take the floor out"
+        )
+    try:
+        reserved = repository_api(env, call).reserved(major)
+    except (Failure, BuildNumberError) as exc:
+        print(
+            f"::warning title=release-version::Could not ask whether major {major} has build numbers ({exc}). "
+            "The plan goes on with the formula"
+        )
+        return
+    if reserved:
+        raise Failure(
+            f"version-code-scheme is {MINOR_BLOCKS} here, and {build_numbers.REFS}/{major}/ holds build numbers "
+            f"(up to {max(reserved)}): the builds of major {major} are numbered with {BUILD_NUMBER}, and a code of "
+            "the formula keeps no order with them. Nothing is built. The scheme comes from the calling file of the "
+            f"commit that is built: pass version-code-scheme: {BUILD_NUMBER} in qa.yml, release.yml and "
+            "version-bump.yml of every branch that is built, and do not release a commit from before the switch"
+        )
+
+
 def print_build_number(number: BuildNumber) -> None:
+    if number.notice:
+        print(f"::notice title=release-version::{escape(number.notice)}")
     if number.kept:
         print(f"Build number {number.number} of major {number.major} ({number.ref}): {number.why}.")
     elif number.ref:
@@ -633,6 +680,8 @@ def plan_next(env: Mapping[str, str], fetch: Fetch, call: build_numbers.Call = h
         # Not reserved: the release workflow reserves the number when it builds the tag. What the
         # plan shows is the number it would get now, and the plan is refused where the build would be.
         looked = build_number(env, call, version[0], target, keep=False) if scheme == BUILD_NUMBER else None
+        if scheme == MINOR_BLOCKS:
+            formula_guard(env, call, version[0])
         return Plan(
             version=format_version(version),
             tag=tag,
@@ -671,6 +720,8 @@ def plan_next(env: Mapping[str, str], fetch: Fetch, call: build_numbers.Call = h
             )
         since = last_commit
     looked = build_number(env, call, version[0], target, keep=False) if scheme == BUILD_NUMBER else None
+    if scheme == MINOR_BLOCKS:
+        formula_guard(env, call, version[0])
     return Plan(
         version=name,
         tag=prefix + name,
@@ -963,6 +1014,8 @@ def plan_qa(env: Mapping[str, str], call: build_numbers.Call = http_call) -> QaP
 
     # Reserved last, once the plan has passed every rule: a run that is refused takes no number.
     reserved = build_number(env, call, version[0], target, keep=True) if scheme == BUILD_NUMBER else None
+    if scheme == MINOR_BLOCKS:
+        formula_guard(env, call, version[0])
     return QaPlan(
         version=format_version(version),
         version_name=name,
@@ -1040,6 +1093,9 @@ def run_code(env: Mapping[str, str], call: build_numbers.Call = http_call) -> No
     if kind not in KINDS:
         raise Failure(f"kind must be one of {', '.join(KINDS)}, got {kind!r}")
     scheme = version_code_scheme(env)
+    exists = env.get("RELEASE_EXISTS", "").strip()
+    if exists not in ("", "true", "false"):
+        raise Failure(f"release-exists must be true or false, got {exists!r}")
     # The version may be given as its tag.
     if prefix and text.startswith(prefix):
         text = text[len(prefix):]
@@ -1075,9 +1131,24 @@ def run_code(env: Mapping[str, str], call: build_numbers.Call = http_call) -> No
         sha = env.get("SHA", "").strip()
         if not sha:
             raise Failure("sha is the commit that is built, and the build-number scheme needs it to reserve a number")
-        reserved = build_number(env, call, version[0], named_commit(sha), keep=True)
+        # The formula gave a tag the same code in every run, so building a released tag again was
+        # safe. A new run takes the next number of the major instead: above every build since,
+        # a later release included, and a device that took it would refuse those. Only the run
+        # that built the release, run again, keeps its number.
+        kept_only = ""
+        if exists == "true":
+            kept_only = (
+                f"{prefix}{name} has a GitHub Release already, and no attempt of this run reserved a build number "
+                f"for it. With {BUILD_NUMBER} a release that is out is built again only by running its own run "
+                "again (Re-run failed jobs or Re-run all jobs on the run that built it): a new run would take the "
+                f"next number of major {version[0]}, above every build since, a later release included, and a "
+                "device that took it would refuse those. Nothing is built"
+            )
+        reserved = build_number(env, call, version[0], named_commit(sha), keep=True, kept_only=kept_only)
         code = reserved.code
         print_build_number(reserved)
+    else:
+        formula_guard(env, call, version[0])
     print(f"versionCode of {kind} {name}: {code}")
     write_outputs(env, {"version": name, "version-code": str(code), **scheme_outputs(env, reserved)})
 

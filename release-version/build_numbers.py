@@ -24,21 +24,26 @@ assets of the repository's GitHub Releases and pre-releases, and the codes the
 rolling QA tags name. Without any, it starts at 1. version-code-floor is a code
 that is out where none of this shows it (the app built from another
 repository, or before its GitHub Releases); the next number is above it too.
+A floor above every code of a major that has builds already is the floor of a
+later major's line (one calling file builds every line), and is passed over
+with a notice.
 
 The safety rule. A build whose versionCode would not be above every code of its
 major that is out is refused with the reason, before any number is reserved: a
 device with the higher code would not take it. That is what happens when the
 refs are behind what was published (a build of another scheme, one made by
-hand), and when the floor is above every code of the major. A major above 20
-has no codes at all.
+hand), and when the floor is above every code of a major that has no build
+yet. A major above 20 has no codes at all.
 
 The API is reached through a function the caller passes, so the tests run
-against a stand-in.
+against a stand-in. A server error, or a request that got no answer, is made
+again a few times; every request here may be.
 """
 from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
@@ -51,6 +56,10 @@ TAGGER = {"name": "github-actions[bot]", "email": "41898282+github-actions[bot]@
 # Builds that reserve at the same moment move up one each. This many taken numbers in a row are
 # something else.
 MAX_TRIES = 100
+# Seconds before each new try of a request that GitHub answered with a server error, or that did
+# not reach it. Every request here may be made again: a read, a tag object that is the same object
+# again, and a ref that exists by then, which the reservation takes for a taken number.
+RETRY_DELAYS = (1, 2, 4)
 # The assets whose file names may hold a versionCode: APKs and app bundles.
 PACKAGE = re.compile(r".+\.(apk|aab)", re.IGNORECASE)
 CODE_PART = re.compile(r"[1-9][0-9]*")
@@ -63,6 +72,10 @@ Call = Callable[[str, str, str, Optional[dict]], tuple]
 
 class BuildNumberError(Exception):
     """No number can be reserved, or the build would not install over what is out."""
+
+
+class Unreachable(BuildNumberError):
+    """A request did not reach GitHub, or got no answer. It may be made again."""
 
 
 @dataclass(frozen=True)
@@ -81,6 +94,7 @@ class BuildNumber:
     why: str  # where the number comes from, for the log
     ref: str  # the ref that holds it; empty when the plan only looked
     kept: bool  # an earlier attempt of the same run reserved it
+    notice: str = ""  # something to say that did not stop the build
 
 
 def codes_in_name(name: str) -> list:
@@ -115,6 +129,25 @@ def codes_of(major: int) -> tuple:
         raise BuildNumberError(f"the build is of major {major}, and {exc}. Nothing is built") from None
 
 
+def floor_of_a_later_line(major: int, reserved: Iterable[int], shipped: Iterable[Shipped], floor: Optional[int]) -> str:
+    """Why the floor is not used for a build of the major, or empty when it is.
+
+    A floor above every code of a major that has builds already (a number
+    reserved, a code out) is the floor of a later major: the calling file
+    builds a maintenance line too. It is not used for that line's builds. A
+    major without any build is refused instead (next_number).
+    """
+    low, high = codes_of(major)
+    if floor is None or floor < high:
+        return ""
+    if not list(reserved) and not any(low <= item.code <= high for item in shipped):
+        return ""
+    return (
+        f"version-code-floor {floor} is above every versionCode of major {major}, which has builds of its own "
+        "already: it is the floor of a later major's line, and is not used for this build"
+    )
+
+
 def next_number(major: int, reserved: Iterable[int], shipped: Iterable[Shipped], floor: Optional[int]) -> tuple:
     """The number the next build of the major gets, and why.
 
@@ -124,14 +157,18 @@ def next_number(major: int, reserved: Iterable[int], shipped: Iterable[Shipped],
     low, high = codes_of(major)
     base = major * MAJOR_BLOCK
     reserved = sorted(set(reserved))
+    shipped = list(shipped)
     out = [item for item in shipped if low <= item.code <= high]
     highest = max(out, key=lambda item: item.code, default=None)
+    if floor_of_a_later_line(major, reserved, shipped, floor):
+        floor = None
     if floor is not None and floor >= high:
         raise BuildNumberError(
             f"version-code-floor is {floor}, and no versionCode of major {major} is above it (the highest is {high}), "
-            f"so no build of major {major} would install over the app that has it. Nothing is built. Build a later "
-            "major version (next-version in the calling file), or check the floor: it is the highest versionCode "
-            "of the app that is out where this repository's releases do not show it"
+            f"and major {major} has no build yet, so none of it would install over the app that has the floor. "
+            "Nothing is built. Build a later major version (next-version in the calling file), or check the "
+            "floor: it is the highest versionCode of the app that is out where this repository's releases do not "
+            "show it"
         )
     if reserved:
         number = reserved[-1] + 1
@@ -164,12 +201,25 @@ class Repository:
     """The calls to the GitHub API of one repository that build numbers make."""
 
     def __init__(self, api_url: str, repository: str, token: str, call: Call):
-        self.base = f"{api_url.rstrip('/')}/repos/{repository}/"
+        # The API the token is for: scheme, host and path, /api/v3/ of GitHub Enterprise Server included.
+        self.root = f"{api_url.rstrip('/')}/"
+        self.base = f"{self.root}repos/{repository}/"
         self.token = token
         self.call = call
 
     def _ask(self, method: str, url: str, body: Optional[dict] = None) -> tuple:
-        status, headers, raw = self.call(method, url, self.token, body)
+        # A server error or no answer at all is asked again, a few times, before it is the answer.
+        for delay in (*RETRY_DELAYS, None):
+            try:
+                status, headers, raw = self.call(method, url, self.token, body)
+            except Unreachable:
+                if delay is None:
+                    raise
+                time.sleep(delay)
+                continue
+            if status < 500 or delay is None:
+                break
+            time.sleep(delay)
         try:
             document = json.loads(raw) if raw and raw.strip() else None
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -179,8 +229,19 @@ class Repository:
     @staticmethod
     def _refusal(what: str, status: int, document: object, scope: str) -> BuildNumberError:
         message = document.get("message") if isinstance(document, dict) else None
-        said = f": {message}" if isinstance(message, str) and message else ""
-        hint = f" The job's token needs {scope}." if status in (401, 403, 404) else ""
+        message = message if isinstance(message, str) else ""
+        said = f": {message}" if message else ""
+        # What to do, as far as the answer says it.
+        if "rate limit" in message.lower():
+            hint = " GitHub limits the requests of the token for now: run the job again later."
+        elif status == 422 and "rule" in message.lower():
+            hint = f" A ruleset of the repository refuses it: let the job token create {REFS}/*, or keep those refs out of the ruleset."
+        elif status in (401, 403, 404):
+            hint = f" The job's token needs {scope}."
+        elif status >= 500:
+            hint = " GitHub answered with a server error, also when asked again: run the job again later."
+        else:
+            hint = ""
         return BuildNumberError(f"cannot {what}: HTTP {status}{said}.{hint}")
 
     def _listed(self, path: str, what: str) -> list:
@@ -193,9 +254,10 @@ class Repository:
             items.extend(item for item in document if isinstance(item, dict))
             following = NEXT_PAGE.search(headers.get("link", ""))
             url = following[1] if following else ""
-            # The token goes with every page: only to the API it was meant for.
-            if url and not url.startswith(self.base):
-                raise BuildNumberError(f"the next page of the answer to {what} is not on {self.base}: {url}")
+            # The token goes with every page: only to the API it was meant for. GitHub names the
+            # next page by the repository's id, /repositories/<id>/..., not by its name.
+            if url and not url.startswith(self.root):
+                raise BuildNumberError(f"the next page of the answer to {what} is not on {self.root}: {url}")
         return items
 
     def reserved(self, major: int) -> dict:
@@ -264,11 +326,15 @@ def reserve(
     date: str,
     seen: Iterable[Shipped],
     floor: Optional[int],
+    kept_only: str = "",
 ) -> BuildNumber:
     """Reserve the next number of the major for this run, or find the one an earlier attempt reserved.
 
     `marker` stands for the run, `date` is the time the tag object carries,
     and `seen` the codes that are out besides the assets: the rolling tags.
+    With `kept_only`, a build that may only keep a number is refused with that
+    reason when no earlier attempt of the run reserved one, before anything is
+    reserved: a rebuild of a release that is out.
     """
     codes_of(major)
     own = repository.tag_object(commit, marker, date)
@@ -280,14 +346,18 @@ def reserve(
             major, number, build_code(major, number), "reserved by an earlier attempt of this run, and kept",
             f"{REFS}/{major}/{number}", True,
         )
-    number, why = next_number(major, reserved, [*repository.shipped(), *seen], floor)
+    if kept_only:
+        raise BuildNumberError(kept_only)
+    shipped = [*repository.shipped(), *seen]
+    number, why = next_number(major, reserved, shipped, floor)
+    notice = floor_of_a_later_line(major, reserved, shipped, floor)
     taken = []
     for _ in range(MAX_TRIES):
         ref = f"{REFS}/{major}/{number}"
         if repository.create_ref(ref, own):
             if taken:
                 why = f"{why}; {', '.join(taken)} taken meanwhile by another build"
-            return BuildNumber(major, number, build_code(major, number), why, ref, False)
+            return BuildNumber(major, number, build_code(major, number), why, ref, False, notice)
         taken.append(str(number))
         number += 1
         try:
@@ -303,5 +373,8 @@ def reserve(
 def look(repository: Repository, major: int, seen: Iterable[Shipped], floor: Optional[int]) -> BuildNumber:
     """The number the next build of the major would get now. Nothing is reserved."""
     codes_of(major)
-    number, why = next_number(major, repository.reserved(major), [*repository.shipped(), *seen], floor)
-    return BuildNumber(major, number, build_code(major, number), why, "", False)
+    reserved = repository.reserved(major)
+    shipped = [*repository.shipped(), *seen]
+    number, why = next_number(major, reserved, shipped, floor)
+    notice = floor_of_a_later_line(major, reserved, shipped, floor)
+    return BuildNumber(major, number, build_code(major, number), why, "", False, notice)

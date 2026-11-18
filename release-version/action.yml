@@ -136,6 +136,15 @@ inputs:
       which versionCode the build the since tag holds has.
     required: false
     default: ''
+  release-exists:
+    description: >-
+      For code with version-code-scheme build-number, optional: true when
+      the tag has a GitHub Release already. The build then keeps the number
+      an earlier attempt of the same run reserved, and is refused when there
+      is none: a new run of a released tag would take a number above every
+      build since. The formula does not read it.
+    required: false
+    default: ''
   version-code-scheme:
     description: >-
       For next, code and qa, optional. How a build gets its versionCode.
@@ -296,4 +305,5 @@ runs:
         VERSION_CODE: ${{ inputs.version-code }}
         VERSION_CODE_SCHEME: ${{ inputs.version-code-scheme }}
         VERSION_CODE_FLOOR: ${{ inputs.version-code-floor }}
+        RELEASE_EXISTS: ${{ inputs.release-exists }}
       run: python3 "$GITHUB_ACTION_PATH/release_version.py"

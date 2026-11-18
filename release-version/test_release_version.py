@@ -62,7 +62,21 @@ def merged(sha: str) -> dict:
     return {"state": "closed", "merged": True, "merge_commit_sha": sha}
 
 
-def run(tmp_path, fetch=None, **inputs):
+def no_build_numbers(method, url, token, body):
+    """The API of a repository that never reserved a build number: the one thing the formula asks.
+
+    With the formula, a plan reads the build numbers of its major once, and is refused when there
+    are any. A repository that never switched has none, and plans as it always did.
+    """
+    assert method == "GET" and url.startswith(f"{API}/repos/acme/app/git/matching-refs/build-numbers/"), (method, url)
+    no_build_numbers.asked.append(url[len(f"{API}/repos/acme/app/git/matching-refs/"):])
+    return 200, {}, b"[]"
+
+
+no_build_numbers.asked = []
+
+
+def run(tmp_path, fetch=None, call=None, **inputs):
     output = tmp_path / "github-output"
     output.write_text("")
     env = {
@@ -75,7 +89,7 @@ def run(tmp_path, fetch=None, **inputs):
         "GITHUB_OUTPUT": str(output),
     }
     env.update({name.upper(): value for name, value in inputs.items()})
-    code = release_version.main(env, fetch or pulls())
+    code = release_version.main(env, fetch or pulls(), call or no_build_numbers)
     return code, parse_outputs(output.read_text())
 
 

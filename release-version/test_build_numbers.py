@@ -37,6 +37,8 @@ from test_release_version import (  # noqa: E402,F401
 )
 
 REPOSITORY = API + "/repos/acme/app/"
+# How GitHub names the repository in the Link header of a page: by its id, not by its name.
+BY_ID = API + "/repositories/123456789/"
 
 
 class FakeGitHub:
@@ -55,6 +57,13 @@ class FakeGitHub:
         self.after_list = None
         # (method, path) -> (status, message): what the API refuses.
         self.refuse = {}
+        # The next pages are linked as GitHub links them, /repositories/<id>/..., or under the name.
+        self.link_by_id = True
+        # matching-refs/build-numbers/2/ answering for every ref that starts with build-numbers/2,
+        # those of major 20 included, as a prefix without its slash would.
+        self.loose_prefix = False
+        # (method, path prefix, status or "unreachable"), answered once each before anything else.
+        self.trouble = []
 
     def release(self, tag, *assets, prerelease=False, draft=False):
         self.releases.append({
@@ -74,32 +83,40 @@ class FakeGitHub:
     def _answer(self, status, document, headers=None):
         return status, headers or {}, json.dumps(document).encode()
 
-    def _page(self, url, items):
-        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    def _page(self, path, items):
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
         page = int(query.get("page", ["1"])[0])
         chunk = items[(page - 1) * self.page_size:page * self.page_size]
         headers = {}
         if page * self.page_size < len(items):
-            parts = urllib.parse.urlsplit(url)
             following = urllib.parse.urlencode({**{k: v[0] for k, v in query.items()}, "page": page + 1})
-            headers["link"] = f'<{urllib.parse.urlunsplit(parts._replace(query=following))}>; rel="next"'
+            root = BY_ID if self.link_by_id else REPOSITORY
+            headers["link"] = f'<{root}{path.split("?")[0]}?{following}>; rel="next", <{root}{path.split("?")[0]}?page=99>; rel="last"'
         return self._answer(200, chunk, headers)
 
     def __call__(self, method, url, token, body):
-        assert url.startswith(REPOSITORY), url
+        assert url.startswith((REPOSITORY, BY_ID)), url
         assert token == "job-token"
-        path = url[len(REPOSITORY):]
+        path = url[len(REPOSITORY if url.startswith(REPOSITORY) else BY_ID):]
         self.requests.append((method, path.split("?")[0]))
+        for index, (troubled_method, troubled_path, what) in enumerate(self.trouble):
+            if method == troubled_method and path.startswith(troubled_path):
+                del self.trouble[index]
+                if what == "unreachable":
+                    raise build_numbers.Unreachable(f"cannot reach {url}: timed out")
+                return self._answer(what, {"message": "Server Error"})
         for (refused_method, refused_path), (status, message) in self.refuse.items():
             if method == refused_method and path.startswith(refused_path):
                 return self._answer(status, {"message": message})
         if method == "GET" and path.startswith("releases"):
-            return self._page(url, self.releases)
+            return self._page(path, self.releases)
         if method == "GET" and path.startswith("git/matching-refs/"):
             prefix = "refs/" + path.split("?")[0][len("git/matching-refs/"):]
+            if self.loose_prefix:
+                prefix = prefix.rstrip("/")
             with self.lock:
                 listed = [{"ref": name, "object": {"sha": sha, "type": "tag"}} for name, sha in sorted(self.refs.items()) if name.startswith(prefix)]
-            answer = self._page(url, listed)
+            answer = self._page(path, listed)
             if self.after_list:
                 self.after_list()
             return answer
@@ -121,7 +138,13 @@ class FakeGitHub:
 
 
 def no_api(method, url, token, body):
-    raise AssertionError(f"the formula asks GitHub nothing, and {method} {url} was asked")
+    raise AssertionError(f"nothing is asked before this refusal, and {method} {url} was asked")
+
+
+@pytest.fixture(autouse=True)
+def no_waiting(monkeypatch):
+    # A request that is made again waits first; not in the tests.
+    monkeypatch.setattr(build_numbers, "RETRY_DELAYS", (0, 0, 0))
 
 
 def run(tmp_path, gh, run_id="7001", **inputs):
@@ -214,13 +237,43 @@ def test_the_floor_lifts_the_next_number_and_only_within_its_major():
 
 
 @pytest.mark.parametrize("floor", [101_300_002, 99_999_999])
-def test_a_floor_above_every_code_of_the_major_is_refused(floor):
+def test_a_floor_above_every_code_of_a_major_without_builds_is_refused(floor):
     # A new repository that takes over an app at 101300002 and builds 0.0.1: no build of major 0
     # installs over it.
     with pytest.raises(BuildNumberError) as refused:
         next_number(0, [], [], floor)
-    assert f"version-code-floor is {floor}, and no versionCode of major 0 is above it (the highest is 99999999)" in str(refused.value)
+    assert f"version-code-floor is {floor}, and no versionCode of major 0 is above it (the highest is 99999999), and major 0 has no build yet" in str(refused.value)
     assert "next-version" in str(refused.value)
+    assert build_numbers.floor_of_a_later_line(0, [], [], floor) == ""
+
+
+def test_a_floor_above_a_major_that_has_builds_is_a_later_lines_and_passed_over():
+    # One qa.yml builds develop (2.x) and release/1.x. A floor for 2.x is above every code of 1.x,
+    # which has builds of its own: it is the floor of the later line, and not this one's.
+    out = [Shipped(101_300_002, "the build 1.13.2-qa.2 that qa-release-1.x holds")]
+    assert next_number(1, [], out, 200_000_006)[0] == 1_300_003
+    assert next_number(1, [1_300_005], [], 200_000_006)[0] == 1_300_006
+    said = "version-code-floor 200000006 is above every versionCode of major 1, which has builds of its own already"
+    assert build_numbers.floor_of_a_later_line(1, [], out, 200_000_006).startswith(said)
+    assert build_numbers.floor_of_a_later_line(1, [1_300_005], [], 200_000_006).startswith(said)
+    # Within the major, or below it, the floor is the floor.
+    assert build_numbers.floor_of_a_later_line(2, [], out, 200_000_006) == ""
+    assert build_numbers.floor_of_a_later_line(3, [5], out, 200_000_006) == ""
+
+
+def test_a_maintenance_line_builds_with_the_floor_of_the_later_line_given(lines, repo, tmp_path, capsys):
+    #   develop:      base(v1.13.0) ── a ── b(v2.0.0) ── c
+    #   release/1.x:    └── h1(v1.13.1) ── h2
+    rolling(repo, "qa-release-1.x", "1.13.2-qa.2", 101_300_002, lines["h2"])
+    gh = FakeGitHub()
+    code, out = qa(tmp_path, gh, lines["h2"], ref="refs/heads/release/1.x", version_code_floor="200000006")
+    assert (code, out["version-code"]) == (0, "101300003")
+    log = capsys.readouterr().out
+    assert "::notice title=release-version::version-code-floor 200000006 is above every versionCode of major 1, which has builds of its own already" in log
+    # The later line itself is lifted by it.
+    code, out = qa(tmp_path, gh, lines["c"], version_code_floor="200000006", run_id="7002")
+    assert (code, out["version-code"]) == (0, "200000007")
+    assert "::notice" not in capsys.readouterr().out
 
 
 def test_numbers_behind_what_is_out_are_refused():
@@ -308,14 +361,129 @@ def test_a_ref_that_cannot_be_created_fails_with_what_the_token_needs():
     assert "cannot list the releases: HTTP 404: Not Found. The job's token needs contents: read." == str(refused.value)
 
 
-def test_every_page_of_the_answer_is_read():
+@pytest.mark.parametrize("by_id", [True, False])
+def test_every_page_of_the_answer_is_read(by_id):
+    # GitHub links the next page by the repository's id: /repositories/<id>/releases?page=2, as
+    # sleephub-android's releases do. A link under the name is followed as well.
     gh = FakeGitHub(page_size=2)
+    gh.link_by_id = by_id
     for patch in range(5):
         gh.release(f"v2.0.{patch}", f"App_release_2.0.{patch}_2000000{patch + 10}.apk")
     for number in range(1, 6):
         gh.reserve_by_hand(1, number)
     assert max(item.code for item in repository(gh).shipped()) == 200_000_014
     assert sorted(repository(gh).reserved(1)) == [1, 2, 3, 4, 5]
+    assert gh.requests.count(("GET", "releases")) == 3 and gh.requests.count(("GET", "git/matching-refs/build-numbers/1/")) == 3
+
+
+@pytest.mark.parametrize(
+    ("api", "link", "followed"),
+    [
+        ("https://api.github.invalid", "https://api.github.invalid/repositories/1/releases?page=2", True),
+        ("https://ghe.invalid/api/v3", "https://ghe.invalid/api/v3/repositories/1/releases?page=2", True),
+        # The token goes to the API it is for, and nowhere else.
+        ("https://api.github.invalid", "https://api.github.invalid.example/repositories/1/releases?page=2", False),
+        ("https://api.github.invalid", "http://api.github.invalid/repositories/1/releases?page=2", False),
+        ("https://ghe.invalid/api/v3", "https://ghe.invalid/other/repositories/1/releases?page=2", False),
+    ],
+)
+def test_a_next_page_is_followed_only_on_the_api_of_the_token(api, link, followed):
+    asked = []
+
+    def call(method, url, token, body):
+        asked.append(url)
+        if len(asked) == 1:
+            return 200, {"link": f'<{link}>; rel="next"'}, b"[]"
+        return 200, {}, b"[]"
+
+    listing = build_numbers.Repository(api, "acme/app", "job-token", call)
+    if followed:
+        assert listing.shipped() == [] and asked == [f"{api}/repos/acme/app/releases?per_page=100", link]
+    else:
+        with pytest.raises(BuildNumberError) as refused:
+            listing.shipped()
+        assert str(refused.value) == f"the next page of the answer to list the releases is not on {api}/: {link}"
+        assert asked == [f"{api}/repos/acme/app/releases?per_page=100"]
+
+
+def test_a_prefix_that_also_matches_a_later_major_does_not_count_its_refs():
+    # build-numbers/2 is the start of build-numbers/20 as well. Should GitHub match the prefix
+    # without its slash, the refs of major 20 are not numbers of major 2.
+    gh = FakeGitHub()
+    gh.loose_prefix = True
+    gh.reserve_by_hand(2, 5)
+    gh.reserve_by_hand(20, 900)
+    gh.reserve_by_hand(21, 3)
+    assert sorted(repository(gh).reserved(2)) == [5]
+    number = build_numbers.reserve(repository(gh), 2, "a" * 40, "run 1", "2026-11-18T00:00:00Z", [], None)
+    assert number.number == 6
+
+
+def test_a_server_error_or_no_answer_is_asked_again_before_it_is_the_answer():
+    gh = FakeGitHub()
+    gh.trouble = [("GET", "releases", 502), ("GET", "releases", "unreachable"), ("POST", "git/tags", 500), ("POST", "git/refs", 503)]
+    number = build_numbers.reserve(repository(gh), 2, "a" * 40, "run 1", "2026-11-18T00:00:00Z", [], None)
+    assert (number.number, gh.trouble) == (1, [])
+    assert gh.requests.count(("GET", "releases")) == 3 and gh.requests.count(("POST", "git/refs")) == 2
+    # Four tries in all; then the answer is the answer.
+    gh.trouble = [("GET", "releases", 502)] * 4
+    with pytest.raises(BuildNumberError) as refused:
+        build_numbers.look(repository(gh), 2, [], None)
+    assert str(refused.value) == (
+        "cannot list the releases: HTTP 502: Server Error. GitHub answered with a server error, also when asked "
+        "again: run the job again later."
+    )
+    gh.trouble = [("GET", "git/matching-refs/", "unreachable")] * 4
+    with pytest.raises(build_numbers.Unreachable):
+        build_numbers.look(repository(gh), 2, [], None)
+    # A refusal is not asked again.
+    gh.refuse[("GET", "releases")] = (404, "Not Found")
+    before = gh.requests.count(("GET", "releases"))
+    with pytest.raises(BuildNumberError):
+        build_numbers.look(repository(gh), 2, [], None)
+    assert gh.requests.count(("GET", "releases")) == before + 1
+
+
+def test_a_build_that_finds_every_number_taken_gives_up(monkeypatch):
+    monkeypatch.setattr(build_numbers, "MAX_TRIES", 3)
+    gh = FakeGitHub()
+    gh.refuse[("POST", "git/refs")] = (422, "Reference already exists")
+    with pytest.raises(BuildNumberError) as refused:
+        build_numbers.reserve(repository(gh), 2, "a" * 40, "run 1", "2026-11-18T00:00:00Z", [], None)
+    assert str(refused.value) == "3 build numbers of major 2 in a row were taken while this build tried them, up to 3. Run the plan again"
+    assert gh.requests.count(("POST", "git/refs")) == 3
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "hint"),
+    [
+        # A ruleset refuses the ref: no number is taken, and no other number is tried.
+        (422, "Repository rule violations found\n\nCannot create ref due to creations being restricted.",
+         "A ruleset of the repository refuses it: let the job token create refs/build-numbers/*, or keep those refs out of the ruleset."),
+        (403, "You have exceeded a secondary rate limit.", "GitHub limits the requests of the token for now: run the job again later."),
+        (403, "Resource not accessible by integration", "The job's token needs contents: write."),
+        (422, "Object does not exist", ""),
+    ],
+)
+def test_a_ref_that_is_refused_for_another_reason_than_being_taken_fails_at_once(status, message, hint):
+    gh = FakeGitHub()
+    gh.refuse[("POST", "git/refs")] = (status, message)
+    with pytest.raises(BuildNumberError) as refused:
+        build_numbers.reserve(repository(gh), 2, "a" * 40, "run 1", "2026-11-18T00:00:00Z", [], None)
+    assert str(refused.value) == f"cannot create refs/build-numbers/2/1: HTTP {status}: {message}.{' ' + hint if hint else ''}"
+    assert gh.requests.count(("POST", "git/refs")) == 1 and gh.refs == {}
+
+
+def test_a_tag_object_that_cannot_be_created_reserves_nothing():
+    gh = FakeGitHub()
+    gh.refuse[("POST", "git/tags")] = (403, "Resource not accessible by integration")
+    with pytest.raises(BuildNumberError) as refused:
+        build_numbers.reserve(repository(gh), 2, "a" * 40, "run 1", "2026-11-18T00:00:00Z", [], None)
+    assert str(refused.value) == (
+        "cannot create the object of a build number: HTTP 403: Resource not accessible by integration. "
+        "The job's token needs contents: write."
+    )
+    assert gh.refs == {} and ("POST", "git/refs") not in gh.requests
 
 
 def test_a_draft_is_not_out():
@@ -509,6 +677,38 @@ def test_a_run_that_is_run_again_keeps_its_number_and_another_run_gets_a_new_one
     assert codes == {"200000003"}
 
 
+def test_a_release_that_is_out_is_built_again_only_by_its_own_run(lines, repo, tmp_path, capsys):
+    # With the formula a tag has one code, so a new run of a released tag was safe. A new run takes
+    # the next build number: v2.0.1 built again after v2.0.2 would be above v2.0.2, and a device
+    # that took it would refuse v2.0.2 and every build after it.
+    gh = FakeGitHub()
+    git(repo, "tag", "v2.0.1", lines["c"])
+    _, first = release(tmp_path, gh, "v2.0.1", lines["c"], run_id="8001", release_exists="false")
+    assert first["version-code"] == "200000001"
+    _, later = qa(tmp_path, gh, lines["c"], run_id="8002")
+    assert later["version-code"] == "200000002"
+    # The run that built it, run again (the release is out by then): it keeps its number.
+    code, again = release(tmp_path, gh, "v2.0.1", lines["c"], run_id="8001", release_exists="true")
+    assert (code, again["version-code"]) == (0, "200000001")
+    # Another run: refused before anything is reserved.
+    capsys.readouterr()
+    code, out = release(tmp_path, gh, "v2.0.1", lines["c"], run_id="8003", release_exists="true")
+    assert (code, out) == (1, {})
+    message = error_of(capsys)
+    assert message.startswith("v2.0.1 has a GitHub Release already, and no attempt of this run reserved a build number for it.")
+    assert "Re-run failed jobs or Re-run all jobs on the run that built it" in message
+    assert gh.numbers(2) == [1, 2]
+    # A release that is not out yet (its first run failed before it published) is built by a new run.
+    code, out = release(tmp_path, gh, "v2.0.1", lines["c"], run_id="8004", release_exists="false")
+    assert (code, out["version-code"]) == (0, "200000003")
+    # The formula gives the tag its one code in every run, and does not read it.
+    code, out = release(tmp_path, FakeGitHub(), "v2.0.1", lines["c"], run_id="8005", release_exists="true", version_code_scheme="")
+    assert (code, out["version-code"]) == (0, "200050100")
+    code, _ = release(tmp_path, FakeGitHub(), "v2.0.1", lines["c"], release_exists="yes")
+    assert code == 1
+    assert "release-exists must be true or false, got 'yes'" in error_of(capsys)
+
+
 def test_a_run_whose_reservation_was_made_but_not_answered_finds_it(repo, tmp_path):
     # The ref was created and the answer got lost: the plan failed, and its job is run again.
     git(repo, "tag", "v2.0.0")
@@ -654,15 +854,70 @@ def test_the_version_bump_refuses_what_the_release_would_refuse(repo, tmp_path, 
 # --- the formula, as before -----------------------------------------------------------------------
 
 
-def test_the_formula_asks_github_nothing_and_writes_no_build_number(lines, repo, tmp_path):
+def test_the_formula_reads_the_build_numbers_of_its_major_once_and_writes_nothing(lines, repo, tmp_path):
+    # A repository that never switched has no build number: the formula computes what it always
+    # did, after one read of the refs of the major.
     for scheme in ("", "minor-blocks", " minor-blocks\n"):
-        code, out = qa(tmp_path, no_api, lines["c"], version_code_scheme=scheme)
+        gh = FakeGitHub()
+        code, out = qa(tmp_path, gh, lines["c"], version_code_scheme=scheme)
         assert (code, out["version-code"], out["version-code-scheme"]) == (0, "200000057", "minor-blocks")
         assert "build-number" not in out
+        code, out = run(tmp_path, gh, operation="next", sha=lines["c"], bump="minor", version_code_scheme=scheme)
+        assert (code, out["version-code"]) == (0, "200150000")
         git(repo, "tag", "-f", "v2.0.1", lines["c"])
-        code, out = release(tmp_path, no_api, "v2.0.1", lines["c"], version_code_scheme=scheme)
+        code, out = release(tmp_path, gh, "v2.0.1", lines["c"], version_code_scheme=scheme)
         assert (code, out) == (0, {"version": "2.0.1", "version-code": "200050100", "version-code-scheme": "minor-blocks"})
         git(repo, "tag", "-d", "v2.0.1")
+        assert gh.requests == [("GET", "git/matching-refs/build-numbers/2/")] * 3
+
+
+@pytest.mark.parametrize("operation", ["qa", "code", "next"])
+def test_the_formula_is_refused_for_a_major_that_has_build_numbers(lines, repo, tmp_path, capsys, operation):
+    # The scheme is the calling file's, and the calling file is the commit's: a branch that did not
+    # get the switch, or a tag on a commit from before it, would build 2.x with the formula after
+    # 2.x has build numbers. 2.0.1 would be 200050100, above every build number of 2.x so far.
+    gh = FakeGitHub()
+    gh.reserve_by_hand(2, 7)
+    git(repo, "tag", "v2.0.1", lines["c"])
+    later = commit(repo, "Fix (#40)")
+    origin(repo, "develop")
+    inputs = {
+        "qa": {"operation": "qa", "sha": later, "ref": "refs/heads/develop", "qa_sequence": "57", "source_branch": "develop"},
+        "code": {"operation": "code", "kind": "release", "version": "v2.0.1", "sha": lines["c"]},
+        "next": {"operation": "next", "sha": later},
+    }[operation]
+    code, out = run(tmp_path, gh, version_code_scheme="minor-blocks", **inputs)
+    assert (code, out) == (1, {})
+    message = error_of(capsys)
+    assert "version-code-scheme is minor-blocks here, and refs/build-numbers/2/ holds build numbers (up to 7)" in message
+    assert "do not release a commit from before the switch" in message
+    assert gh.writes() == []
+    # A major without build numbers is not held to those of another one: 1.x still builds with the formula.
+    code, out = run(tmp_path, gh, version_code_scheme="minor-blocks", operation="code", kind="release", version="v1.13.1")
+    assert (code, out["version-code"]) == (0, "101350100")
+
+
+def test_the_formula_goes_on_when_github_cannot_say(lines, tmp_path, capsys):
+    # The question is new for the formula: a repository that never switched builds as it did when
+    # GitHub does not answer, with a warning.
+    gh = FakeGitHub()
+    gh.refuse[("GET", "git/matching-refs/")] = (503, "Service Unavailable")
+    code, out = qa(tmp_path, gh, lines["c"], version_code_scheme="")
+    assert (code, out["version-code"]) == (0, "200000057")
+    log = capsys.readouterr().out
+    assert "::warning title=release-version::Could not ask whether major 2 has build numbers (cannot list the build numbers of major 2: HTTP 503: Service Unavailable." in log
+    # Asked again before it gave up.
+    assert gh.requests.count(("GET", "git/matching-refs/build-numbers/2/")) == 4
+
+
+def test_a_floor_with_the_formula_is_not_read_and_says_so(lines, tmp_path, capsys):
+    for floor in ("200000006", "abc"):
+        code, out = qa(tmp_path, FakeGitHub(), lines["c"], version_code_scheme="", version_code_floor=floor)
+        assert (code, out["version-code"]) == (0, "200000057")
+        assert (
+            "::warning title=release-version::version-code-floor is given, and version-code-scheme is minor-blocks: "
+            "the floor is for build numbers, and is not read."
+        ) in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("scheme", ["build-number", " build-number ", "build-number\n", "\tbuild-number\r\n"])
