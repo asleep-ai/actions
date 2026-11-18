@@ -605,6 +605,32 @@ def test_a_release_version_from_before_build_numbers_stops_the_plan(entry, tmp_p
         ) in result.stdout
 
 
+@pytest.mark.parametrize(
+    "space",
+    [" ", " ", "\t", "\n", "\r\n", "\x0b", "\x0c", "\x1c", "\x85", " ", " ", "　", "  \t"],
+    ids=lambda space: "-".join(f"U+{ord(character):04X}" for character in space),
+)
+def test_whatever_release_version_strips_from_the_scheme_the_check_strips_too(entry, tmp_path, space):
+    # release-version reads the input with Python's str.strip(). The check after it has to read
+    # the same word, or an input with a no-break space around build-number gets the formula from
+    # a release-version from before build numbers, unchecked: bash's [:space:] has no NBSP.
+    import sys
+
+    sys.path.insert(0, str(ROOT / "release-version"))
+    import release_version
+
+    given = f"{space}build-number{space}"
+    assert release_version.version_code_scheme({"VERSION_CODE_SCHEME": given}) == "build-number"
+    script = step(entry["jobs"]["plan"], CHECK_SCHEME)["run"]
+    # From before build numbers: no scheme read.
+    result = run_script(script, {"GIVEN": given, "READ": ""}, tmp_path)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "::error title=release-version is from before build numbers::version-code-scheme is build-number, and release-version answered with no scheme" in result.stdout
+    # A release-version that read it.
+    result = run_script(script, {"GIVEN": given, "READ": "build-number"}, tmp_path)
+    assert (result.returncode, result.stdout) == (0, "version-code-scheme: build-number.\n"), result.stderr
+
+
 def test_plan_takes_the_version_code_from_the_one_formula(entry):
     plan = entry["jobs"]["plan"]
     code = step_by_id(plan, "code")

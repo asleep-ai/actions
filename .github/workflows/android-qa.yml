@@ -486,8 +486,9 @@ jobs:
           READ: ${{ steps.qa.outputs.version-code-scheme }}
         run: |
           set -euo pipefail
-          given="${GIVEN#"${GIVEN%%[![:space:]]*}"}"
-          given="${given%"${given##*[![:space:]]}"}"
+          # Stripped the way release-version strips it, Python's str.strip(): every input it
+          # reads as build-number is checked. A no-break space is whitespace there, not in bash.
+          given=$(python3 -I -c 'import os, sys; sys.stdout.write(os.environ["GIVEN"].strip())')
           if [[ "$given" == build-number && "$READ" != build-number ]]; then
             echo "::error title=release-version is from before build numbers::version-code-scheme is build-number, and release-version answered with ${READ:-no scheme}: the release-version this workflow runs (asleep-ai/actions/release-version@android-ci/v1) is one from before build numbers, and computed the formula's versionCode. Nothing is built. Move the tag android-ci/v1 to a version with build numbers first; to try a branch of these workflows, point their uses: at that branch as well."
             exit 1
