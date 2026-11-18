@@ -265,6 +265,51 @@ def test_a_floor_above_a_major_that_has_builds_is_a_later_lines_and_passed_over(
     assert build_numbers.floor_of_a_later_line(3, [5], out, 200_000_006) == ""
 
 
+@pytest.mark.parametrize(
+    ("reserved", "shipped"),
+    [
+        # Builds of major 2 known by a reserved number only, or by an APK that is out only.
+        ([5], []),
+        ([], [Shipped(200_000_005, "in the name of App_qa_2.0.1-qa.5_200000005.apk, an asset of the pre-release qa-develop")]),
+    ],
+)
+def test_a_floor_at_the_last_code_of_a_major_with_builds_is_its_own_and_refused(reserved, shipped):
+    # 299999999 is the highest code of major 2: no build of 2 can be above it. It is not above
+    # every code of 2, so it is not a later line's floor to pass over; the major is used up.
+    high = 299_999_999
+    assert build_numbers.floor_of_a_later_line(2, reserved, shipped, high) == ""
+    with pytest.raises(BuildNumberError) as refused:
+        next_number(2, reserved, shipped, high)
+    message = str(refused.value)
+    assert message.startswith(
+        "version-code-floor is 299999999, and no versionCode of major 2 is above it (the highest is 299999999), and "
+        "the floor is the last code of major 2 itself, not the floor of a later major's line, so no build of major 2 "
+        "would install over the app that has the floor. Nothing is built."
+    )
+    assert "has no build yet" not in message
+    # One above it is the next major's block: a later line's floor, passed over with a notice.
+    assert next_number(2, reserved, shipped, high + 1)[0] == 6
+    assert build_numbers.floor_of_a_later_line(2, reserved, shipped, high + 1).startswith(
+        "version-code-floor 300000000 is above every versionCode of major 2, which has builds of its own already"
+    )
+    gh = FakeGitHub()
+    for number in reserved:
+        gh.reserve_by_hand(2, number)
+    seen = list(shipped)
+    with pytest.raises(BuildNumberError):
+        build_numbers.reserve(repository(gh), 2, "a" * 40, "run 1", "2026-11-19T00:00:00Z", seen, high)
+    assert gh.numbers(2) == reserved
+    number = build_numbers.reserve(repository(gh), 2, "a" * 40, "run 1", "2026-11-19T00:00:00Z", seen, high + 1)
+    assert (number.number, number.notice.startswith("version-code-floor 300000000 is above every versionCode of major 2")) == (6, True)
+
+
+def test_a_floor_at_the_last_code_of_a_major_without_builds_is_refused():
+    with pytest.raises(BuildNumberError) as refused:
+        next_number(2, [], [], 299_999_999)
+    assert "(the highest is 299999999), and major 2 has no build yet, so no build of major 2 would install" in str(refused.value)
+    assert build_numbers.floor_of_a_later_line(2, [], [], 299_999_999) == ""
+
+
 def test_a_maintenance_line_builds_with_the_floor_of_the_later_line_given(lines, repo, tmp_path, capsys):
     #   develop:      base(v1.13.0) ── a ── b(v2.0.0) ── c
     #   release/1.x:    └── h1(v1.13.1) ── h2

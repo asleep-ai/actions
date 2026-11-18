@@ -135,10 +135,11 @@ def floor_of_a_later_line(major: int, reserved: Iterable[int], shipped: Iterable
     A floor above every code of a major that has builds already (a number
     reserved, a code out) is the floor of a later major: the calling file
     builds a maintenance line too. It is not used for that line's builds. A
-    major without any build is refused instead (next_number).
+    major without any build is refused instead (next_number). A floor that is
+    the major's last code is its own, used up, and refused as well.
     """
     low, high = codes_of(major)
-    if floor is None or floor < high:
+    if floor is None or floor <= high:
         return ""
     if not list(reserved) and not any(low <= item.code <= high for item in shipped):
         return ""
@@ -163,9 +164,16 @@ def next_number(major: int, reserved: Iterable[int], shipped: Iterable[Shipped],
     if floor_of_a_later_line(major, reserved, shipped, floor):
         floor = None
     if floor is not None and floor >= high:
+        # A floor above the major is refused only for a major without builds (a later line's is
+        # passed over above); one at its last code is the major's own, whatever it has built.
+        why = (
+            f"major {major} has no build yet"
+            if not reserved and not out
+            else f"the floor is the last code of major {major} itself, not the floor of a later major's line"
+        )
         raise BuildNumberError(
             f"version-code-floor is {floor}, and no versionCode of major {major} is above it (the highest is {high}), "
-            f"and major {major} has no build yet, so none of it would install over the app that has the floor. "
+            f"and {why}, so no build of major {major} would install over the app that has the floor. "
             "Nothing is built. Build a later major version (next-version in the calling file), or check the "
             "floor: it is the highest versionCode of the app that is out where this repository's releases do not "
             "show it"
