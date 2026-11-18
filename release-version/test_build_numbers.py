@@ -182,6 +182,10 @@ def release(tmp_path, gh, tag, sha, kind="release", **inputs):
     ("name", "codes"),
     [
         ("SleepHub_qa_2.0.0-qa.6_200000006.apk", [200_000_006]),
+        # As sleephub-android names its assets (2026-11-18): a QA build, and a test build of an
+        # earlier flow whose label follows the code.
+        ("SleepHub_qa_2.0.0-qa.7_200000007.apk", [200_000_007]),
+        ("SleepHub_release_1.11.2_101150086-handok-reset-off.84.apk", [101_150_086]),
         ("HeySleep-2.0.0-preview.1-200049001.apk", [200_049_001]),
         ("SweetSleep_release_1.12.0_101200000.aab", [101_200_000]),
         ("App_qa_0.0.1-qa.580_37.apk", [37]),
