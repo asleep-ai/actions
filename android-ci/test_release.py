@@ -116,7 +116,7 @@ def test_a_new_release_of_the_highest_tag_is_planned(entry, tmp_path):
     directory = gh_directory(tmp_path, TAGS, released=RELEASED)
     result, outputs = check_tag(entry, tmp_path, "v1.10.1", directory)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert outputs == {"tag": "v1.10.1", "sha": SHA, "latest": "true", "kind": "release"}
+    assert outputs == {"tag": "v1.10.1", "sha": SHA, "latest": "true", "kind": "release", "exists": "false"}
 
 
 def test_the_first_release_is_the_latest(entry, tmp_path):
@@ -174,6 +174,49 @@ def test_an_older_release_that_exists_can_be_built_again(entry, tmp_path):
     # It does not take the latest mark from the newer release.
     assert outputs["latest"] == "false"
     assert "GitHub Release exists: true" in result.stdout
+    # With the formula it gets the code it had. release-version is told that the release exists:
+    # with build numbers only the run that built it, run again, may build it.
+    assert outputs["exists"] == "true"
+    assert step_by_id(entry["jobs"]["plan"], "code")["with"]["release-exists"] == "${{ steps.tag.outputs.exists }}"
+
+
+def test_a_released_tag_is_built_again_with_build_numbers_only_by_its_own_run(entry, lines, tmp_path, monkeypatch):
+    # The tag step says the release exists, and the plan hands that to release-version. A new run
+    # would take the next build number of the major, above every build since; the run that built
+    # the release keeps its number.
+    import sys
+
+    sys.path.insert(0, str(ROOT / "release-version"))
+    import release_version
+    from test_build_numbers import FakeGitHub
+    from test_release_version import API, parse_outputs
+
+    result, tagged = check_tag(entry, tmp_path, "v1.9.0", gh_directory(tmp_path, TAGS, released=RELEASED + ["v1.9.0", "v1.10.1"]))
+    assert result.returncode == 0 and tagged["exists"] == "true"
+    assert step_by_id(entry["jobs"]["plan"], "code")["with"]["release-exists"] == "${{ steps.tag.outputs.exists }}"
+    monkeypatch.chdir(lines["clone"])
+    gh = FakeGitHub()
+
+    def plan_code(run_id, exists):
+        output = tmp_path / f"code-{run_id}-{exists}"
+        output.write_text("")
+        env = {
+            "OPERATION": "code", "KIND": tagged["kind"], "VERSION": tagged["tag"], "SHA": lines["a"], "TAG_PREFIX": "v",
+            "RELEASE_EXISTS": exists, "VERSION_CODE_SCHEME": "build-number", "TOKEN": "job-token",
+            "GITHUB_REPOSITORY": "acme/app", "GITHUB_API_URL": API, "GITHUB_RUN_ID": run_id, "GITHUB_OUTPUT": str(output),
+        }
+        return release_version.main(env, release_version.http_get, gh), parse_outputs(output.read_text())
+
+    # Its first build, before the release was published.
+    code, first = plan_code("5001", "false")
+    assert (code, first["version-code"]) == (0, "100000001")
+    # That run, run again once the release exists: the same number.
+    code, again = plan_code("5001", tagged["exists"])
+    assert (code, again["version-code"]) == (0, "100000001")
+    # A new run: refused before it reserves.
+    code, out = plan_code("5002", tagged["exists"])
+    assert (code, out) == (1, {})
+    assert gh.numbers(1) == [1]
 
 
 def test_a_release_of_a_lower_line_is_not_the_latest(entry, tmp_path):
@@ -181,7 +224,7 @@ def test_a_release_of_a_lower_line_is_not_the_latest(entry, tmp_path):
     directory = gh_directory(tmp_path, LINE_TAGS, released=["v1.13.0", "v1.13.1", "v2.0.0", "v2.0.1"])
     result, outputs = check_tag(entry, tmp_path, "v1.13.2", directory)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert outputs == {"tag": "v1.13.2", "sha": SHA, "latest": "false", "kind": "release"}
+    assert outputs == {"tag": "v1.13.2", "sha": SHA, "latest": "false", "kind": "release", "exists": "false"}
 
 
 def test_a_release_of_the_highest_line_is_the_latest(entry, tmp_path):
@@ -199,7 +242,7 @@ PREVIEW_TAGS = LINE_TAGS + ["v2.1.0-preview.1", "v2.1.0-preview.2", "v2.1.0-prev
 def test_a_preview_tag_is_built_as_a_preview_and_is_never_the_latest(entry, tmp_path, tag):
     result, outputs = check_tag(entry, tmp_path, tag, gh_directory(tmp_path, PREVIEW_TAGS, released=LINE_TAGS))
     assert result.returncode == 0, result.stdout + result.stderr
-    assert outputs == {"tag": tag, "sha": SHA, "latest": "false", "kind": "preview"}
+    assert outputs == {"tag": tag, "sha": SHA, "latest": "false", "kind": "preview", "exists": "false"}
     assert f"Preview {tag} at {SHA}. Latest: false. GitHub Release exists: false." in result.stdout
 
 
@@ -207,14 +250,14 @@ def test_the_first_build_of_a_repository_can_be_a_preview(entry, tmp_path):
     # One caller has no release yet, and shows 2.0.0 at demo sites before it releases it.
     result, outputs = check_tag(entry, tmp_path, "v2.0.0-preview.1", gh_directory(tmp_path, ["v2.0.0-preview.1"]))
     assert result.returncode == 0, result.stdout + result.stderr
-    assert outputs == {"tag": "v2.0.0-preview.1", "sha": SHA, "latest": "false", "kind": "preview"}
+    assert outputs == {"tag": "v2.0.0-preview.1", "sha": SHA, "latest": "false", "kind": "preview", "exists": "false"}
 
 
 def test_a_preview_does_not_change_which_release_is_the_latest(entry, tmp_path):
     # The highest release tag stays the latest release, whatever previews exist above it.
     result, outputs = check_tag(entry, tmp_path, "v2.0.1", gh_directory(tmp_path, PREVIEW_TAGS, released=LINE_TAGS[:-1]))
     assert result.returncode == 0, result.stdout + result.stderr
-    assert outputs == {"tag": "v2.0.1", "sha": SHA, "latest": "true", "kind": "release"}
+    assert outputs == {"tag": "v2.0.1", "sha": SHA, "latest": "true", "kind": "release", "exists": "false"}
 
 
 def test_a_new_preview_has_to_be_the_highest_of_its_version(entry, tmp_path):
@@ -225,7 +268,7 @@ def test_a_new_preview_has_to_be_the_highest_of_its_version(entry, tmp_path):
     directory = gh_directory(tmp_path / "again", PREVIEW_TAGS, released=["v2.1.0-preview.2"])
     result, outputs = check_tag(entry, tmp_path / "again", "v2.1.0-preview.2", directory)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert outputs["kind"] == "preview" and outputs["latest"] == "false"
+    assert outputs["kind"] == "preview" and outputs["latest"] == "false" and outputs["exists"] == "true"
 
 
 @pytest.mark.parametrize(
@@ -375,6 +418,7 @@ def test_the_branch_and_the_checks_are_checked_for_every_tag_before_anything_is_
         "Check the branch of the tagged commit",
         "Check the commit's checks",
         "Compute the versionCode",
+        "Check the scheme release-version read",
         "Pick the runner",
     ]
     # No step is conditional on who pushed the tag or on what started the run.
@@ -515,6 +559,52 @@ def test_a_tag_on_a_commit_whose_check_did_not_succeed_is_not_built(entry, tmp_p
     assert ("::error title=The commit has not passed its checks::" in result.stdout) == (code == 1)
 
 
+CHECK_SCHEME = "Check the scheme release-version read"
+
+
+@pytest.mark.parametrize(
+    ("given", "read", "passes"),
+    [
+        ("build-number", "build-number", True),
+        (" build-number\n", "build-number", True),
+        # A release-version from before build numbers: it ignores the input, writes no scheme, and
+        # computes the formula. android-ci/v1 not moved yet, or a branch of the workflows.
+        ("build-number", "", False),
+        ("\tbuild-number \r\n", "", False),
+        ("build-number", "minor-blocks", False),
+        # The formula, from either release-version.
+        ("", "", True),
+        ("minor-blocks", "", True),
+        ("", "minor-blocks", True),
+        ("minor-blocks", "minor-blocks", True),
+    ],
+)
+def test_a_release_version_from_before_build_numbers_stops_the_plan(entry, tmp_path, given, read, passes):
+    # The same step in the three workflows, right after the step that runs release-version.
+    plans = {name: load(name)["jobs"]["plan"] for name in (ENTRY, "android-qa.yml", "android-version-bump.yml")}
+    checks = {name: step(plan, CHECK_SCHEME) for name, plan in plans.items()}
+    assert len({check["run"] for check in checks.values()}) == 1
+    assert {name: check["env"]["READ"] for name, check in checks.items()} == {
+        ENTRY: "${{ steps.code.outputs.version-code-scheme }}",
+        "android-qa.yml": "${{ steps.qa.outputs.version-code-scheme }}",
+        "android-version-bump.yml": "${{ steps.version.outputs.version-code-scheme }}",
+    }
+    for name, check in checks.items():
+        assert check["env"]["GIVEN"] == "${{ inputs.version-code-scheme }}" and "if" not in check, name
+        steps = plans[name]["steps"]
+        assert steps[steps.index(check) - 1]["uses"] == "asleep-ai/actions/release-version@android-ci/v1", name
+    result = run_script(checks[ENTRY]["run"], {"GIVEN": given, "READ": read}, tmp_path)
+    assert (result.returncode == 0) == passes, result.stdout + result.stderr
+    if passes:
+        assert result.stdout == f"version-code-scheme: {read or 'minor-blocks'}.\n"
+    else:
+        assert (
+            f"::error title=release-version is from before build numbers::version-code-scheme is build-number, and "
+            f"release-version answered with {read or 'no scheme'}: the release-version this workflow runs "
+            "(asleep-ai/actions/release-version@android-ci/v1) is one from before build numbers"
+        ) in result.stdout
+
+
 def test_plan_takes_the_version_code_from_the_one_formula(entry):
     plan = entry["jobs"]["plan"]
     code = step_by_id(plan, "code")
@@ -528,6 +618,8 @@ def test_plan_takes_the_version_code_from_the_one_formula(entry):
         # With build-number, the next build number of the tag's major, reserved for the tagged
         # commit with the default token (contents: write). The formula reads neither.
         "sha": "${{ steps.tag.outputs.sha }}",
+        # A tag whose GitHub Release exists keeps the number of its own run, or is refused.
+        "release-exists": "${{ steps.tag.outputs.exists }}",
         "version-code-scheme": "${{ inputs.version-code-scheme }}",
         "version-code-floor": "${{ inputs.version-code-floor }}",
     }
@@ -535,6 +627,8 @@ def test_plan_takes_the_version_code_from_the_one_formula(entry):
     # Reserved once the tag, its branch and its checks have passed: a refused tag takes no number.
     names = [item.get("id") or item.get("name") for item in plan["steps"]]
     assert names.index("line") < names.index("Check the commit's checks") < names.index("code") < names.index("pick")
+    names = [item.get("id") or item.get("name") for item in plan["steps"]]
+    assert names[names.index("code") + 1] == CHECK_SCHEME
     inputs = trigger(entry)["inputs"]
     assert inputs["version-code-scheme"] == {**inputs["version-code-scheme"], "type": "string", "default": "minor-blocks", "required": False}
     assert inputs["version-code-floor"] == {**inputs["version-code-floor"], "type": "string", "default": "", "required": False}

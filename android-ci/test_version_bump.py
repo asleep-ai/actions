@@ -871,12 +871,19 @@ def test_the_version_is_planned_again_before_the_push(jobs):
 
 GH_STUB = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$GH_CALLS"
+if [[ "$1" == api ]]; then
+  case "$GH_RELEASE" in
+    exists) echo "v1.0.1"; exit 0 ;;
+    missing) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+    *) echo "gh: Server Error (HTTP 502)" >&2; exit 1 ;;
+  esac
+fi
 echo "gh output that must not reach the summary"
 exit "${GH_EXIT:-0}"
 """
 
 
-def start_release(jobs, tmp_path, workflow="release.yml", gh_exit="0"):
+def start_release(jobs, tmp_path, workflow="release.yml", gh_exit="0", tag_exists="false", scheme="minor-blocks", release="missing"):
     executable(tmp_path / "gh", GH_STUB)
     calls, summary = tmp_path / "calls", tmp_path / "summary"
     calls.write_text("")
@@ -885,14 +892,57 @@ def start_release(jobs, tmp_path, workflow="release.yml", gh_exit="0"):
         "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
         "GH_CALLS": str(calls),
         "GH_EXIT": gh_exit,
+        "GH_RELEASE": release,
         "GH_REPO": "acme/app",
         "TAG": "v1.0.1",
         "RELEASE_WORKFLOW": workflow,
+        "TAG_EXISTS": tag_exists,
+        "VERSION_CODE_SCHEME": scheme,
         "GITHUB_SERVER_URL": "https://github.invalid",
         "GITHUB_STEP_SUMMARY": str(summary),
     }
     result = run_script(step(jobs["tag"], "Start the release workflow")["run"], env, tmp_path)
     return result, calls.read_text().splitlines(), summary.read_text()
+
+
+ASKED = "api repos/acme/app/releases/tags/v1.0.1 --jq .tag_name"
+STARTED = "workflow run release.yml --ref v1.0.1"
+
+
+@pytest.mark.parametrize(
+    ("tag_exists", "scheme", "release", "calls"),
+    [
+        # The tag was pushed by this attempt: the release is started, nothing asked.
+        ("false", "build-number", "exists", [STARTED]),
+        # The formula gives a tag the same code in every run: a job run again starts it as before.
+        ("true", "minor-blocks", "exists", [STARTED]),
+        # Pushed by an earlier attempt, and the release is out: a new release run would take a
+        # build number above every build since. Not started.
+        ("true", "build-number", "exists", [ASKED]),
+        # Pushed by an earlier attempt that did not get to start the release: started now.
+        ("true", "build-number", "missing", [ASKED, STARTED]),
+        # GitHub cannot say: started, and the release's plan decides.
+        ("true", "build-number", "error", [ASKED, STARTED]),
+    ],
+)
+def test_a_release_that_is_out_is_not_started_again_with_build_numbers(jobs, tmp_path, tag_exists, scheme, release, calls):
+    result, asked, summary = start_release(jobs, tmp_path, tag_exists=tag_exists, scheme=scheme, release=release)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert asked == calls
+    if STARTED in calls:
+        assert "Started [`release.yml`]" in summary
+    else:
+        assert (
+            "`v1.0.1` was tagged by an earlier attempt of this run, and its GitHub Release exists: `release.yml` is "
+            "not started again. With build numbers a release is built again only by running its own run again."
+        ) in summary
+        assert "Tagged v1.0.1 before; its release exists, and release.yml is not started again." in result.stdout
+    assert ("::warning::Cannot tell whether the release v1.0.1 exists" in result.stdout) == (release == "error")
+    env = step(jobs["tag"], "Start the release workflow")["env"]
+    assert env["TAG_EXISTS"] == "${{ steps.state.outputs.exists }}"
+    # The scheme as the plan's release-version read it, not the input.
+    assert env["VERSION_CODE_SCHEME"] == "${{ needs.plan.outputs.version-code-scheme }}"
+    assert jobs["plan"]["outputs"]["version-code-scheme"] == "${{ steps.version.outputs.version-code-scheme || 'minor-blocks' }}"
 
 
 def test_the_release_workflow_is_started_for_the_tag(jobs, tmp_path):
@@ -944,13 +994,14 @@ def test_only_the_tag_job_writes_and_only_after_the_plan(jobs):
     names = [item.get("name") for item in plan["steps"][1:]]
     assert names == [
         "Plan the version",
+        "Check the scheme release-version read",
         "Write the plan to the summary",
         "Check the release workflow of the commit",
         "Check the commit's checks",
         "Check that the main branch can move",
         "Check the confirmation",
     ]
-    for name in names[2:]:
+    for name in names[1:]:
         assert "if" not in step(plan, name), f"{name}: a dry run shows the same refusals"
     guard = step(plan, "Check the release workflow of the commit")
     assert guard["env"] == {

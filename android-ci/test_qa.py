@@ -67,7 +67,8 @@ def test_the_plan_is_the_qa_operation_of_release_version_for_the_ref_of_the_run(
     names = [item.get("name") or item.get("uses") for item in plan["steps"]]
     assert names == [
         "Check the wait for the checks", "Check gradle-home", "actions/checkout@v7", "Plan the QA build",
-        "Write the plan to the summary", "Cancel the runs of earlier commits", "Pick the runner",
+        "Check the scheme release-version read", "Write the plan to the summary", "Cancel the runs of earlier commits",
+        "Pick the runner",
     ]
     # Every tag and the whole history of the commit the run started for, and no token left behind.
     assert plan["steps"][2]["with"] == {"ref": "${{ github.sha }}", "fetch-depth": 0, "persist-credentials": False}
@@ -1916,10 +1917,15 @@ def test_a_scheme_with_whitespace_holds_the_build_to_build_numbers_up_to_publish
     else:
         assert result.returncode == 0, result.stdout + result.stderr
         assert state["tag"] == FIRST_OBJECT
-    # No job after the plan reads the input: the plan's step is the one place it goes.
-    text = (WORKFLOWS / ENTRY).read_text()
-    assert text.count("inputs.version-code-scheme") == 1
-    assert step(entry["jobs"]["plan"], "Plan the QA build")["with"]["version-code-scheme"] == "${{ inputs.version-code-scheme }}"
+    # No job after the plan reads the input: it goes to release-version, and to the step after it
+    # that checks what release-version answered, both in the plan job.
+    plan = entry["jobs"]["plan"]
+    assert step(plan, "Plan the QA build")["with"]["version-code-scheme"] == "${{ inputs.version-code-scheme }}"
+    assert step(plan, "Check the scheme release-version read")["env"]["GIVEN"] == "${{ inputs.version-code-scheme }}"
+    assert json.dumps(plan).count("inputs.version-code-scheme") == 2
+    for name, job in entry["jobs"].items():
+        if name != "plan":
+            assert "inputs.version-code-scheme" not in json.dumps(job), name
 
 
 def test_the_notes_of_a_build_with_a_build_number_say_what_it_installs_over(publish, tmp_path):
