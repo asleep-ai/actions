@@ -381,6 +381,11 @@ jobs:
       number: ${{ steps.qa.outputs.number }}
       version-code: ${{ steps.qa.outputs.version-code }}
       previous-tag: ${{ steps.qa.outputs.previous-tag }}
+      # The scheme as release-version read it, one of two words: the jobs
+      # after the plan compare this, never the input, which may hold
+      # whitespace around the word. A release-version from before the output
+      # (the tag android-ci/v1 not moved yet) computed the formula.
+      version-code-scheme: ${{ steps.qa.outputs.version-code-scheme || 'minor-blocks' }}
       runs-on: ${{ steps.pick.outputs.runs-on }}
       self-hosted: ${{ steps.pick.outputs.self-hosted }}
     steps:
@@ -1075,6 +1080,12 @@ jobs:
       # two). An output that arrives empty was dropped by the runner because
       # it held the value of a secret; the job says so instead of going on
       # with half a name.
+      #
+      # The scheme comes from the plan too, as release-version read it, and
+      # is handed on from here: the step that publishes compares this, never
+      # the input. One that is empty or not one of the two words stops the
+      # job, so that no build is published past the check of build numbers
+      # for want of the word.
       - name: Name the build
         id: names
         env:
@@ -1083,13 +1094,14 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
           NUMBER: ${{ needs.plan.outputs.number }}
           VERSION_CODE: ${{ needs.plan.outputs.version-code }}
+          VERSION_CODE_SCHEME: ${{ needs.plan.outputs.version-code-scheme }}
           SOURCE_BRANCH: ${{ inputs.source-branch || github.event.repository.default_branch }}
           LABEL: ${{ inputs.label }}
           VERSION_GIVEN: ${{ inputs.version }}
         run: |
           set -euo pipefail
           missing=""
-          for name in SHA VERSION NUMBER VERSION_CODE; do
+          for name in SHA VERSION NUMBER VERSION_CODE VERSION_CODE_SCHEME; do
             if [[ -z "${!name}" ]]; then
               missing="${missing:+$missing, }$name"
             fi
@@ -1098,6 +1110,13 @@ jobs:
             echo "::error title=The plan is incomplete::Empty: $missing. The plan job passed, so the runner dropped the output: it does that to an output that contains the value of a secret. Look for a secret whose value is a short word or number."
             exit 1
           fi
+          case "$VERSION_CODE_SCHEME" in
+            minor-blocks|build-number) ;;
+            *)
+              echo "::error title=The plan is incomplete::The plan's version-code-scheme is '$VERSION_CODE_SCHEME', and release-version gives minor-blocks or build-number. Nothing is published."
+              exit 1
+              ;;
+          esac
           if [[ -n "$MAJOR" ]]; then
             branch="release/$MAJOR.x"
           else
@@ -1122,6 +1141,7 @@ jobs:
             echo "apart=$apart"
             echo "version-name=$version_name"
             echo "tag=$tag"
+            echo "version-code-scheme=$VERSION_CODE_SCHEME"
           } >> "$GITHUB_OUTPUT"
           echo "$kind build $version_name ($VERSION_CODE) of $branch, published as $tag."
 
@@ -1205,7 +1225,8 @@ jobs:
           UNCHANGED: ${{ steps.changes.outputs.unchanged }}
           CODE_TAKEN_BY: ${{ steps.changes.outputs.code-taken-by }}
           SINCE_CODE: ${{ steps.changes.outputs.since-code }}
-          VERSION_CODE_SCHEME: ${{ inputs.version-code-scheme }}
+          # The word the plan read and the step above checked, not the input.
+          VERSION_CODE_SCHEME: ${{ steps.names.outputs.version-code-scheme }}
           APK_DIRECTORY: ${{ runner.temp }}/android-qa-apk
           STAGING_DIRECTORY: ${{ runner.temp }}/android-qa-upload
           NOTES_FILE: ${{ runner.temp }}/android-qa-notes.md

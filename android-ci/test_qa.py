@@ -38,6 +38,9 @@ README = ROOT / "android-ci" / "README.md"
 
 # How the jobs put the version name together from the plan's outputs and the label input.
 VERSION_NAME = "${{ format('{0}-{1}.{2}', needs.plan.outputs.version, inputs.label || 'qa', needs.plan.outputs.number) }}"
+# The scheme the plan hands on: the word release-version read, or the formula for a
+# release-version that has no such output.
+PLAN_SCHEME = "${{ steps.qa.outputs.version-code-scheme || 'minor-blocks' }}"
 KIND = "${{ inputs.label != '' && 'label' || 'qa' }}"
 
 
@@ -114,6 +117,9 @@ def test_no_output_of_the_plan_holds_a_name_a_person_chose(entry):
         "number": "${{ steps.qa.outputs.number }}",
         "version-code": "${{ steps.qa.outputs.version-code }}",
         "previous-tag": "${{ steps.qa.outputs.previous-tag }}",
+        # One of two words, as release-version read the input. A release-version without the
+        # output computed the formula.
+        "version-code-scheme": PLAN_SCHEME,
         "runs-on": "${{ steps.pick.outputs.runs-on }}",
         "self-hosted": "${{ steps.pick.outputs.self-hosted }}",
     }
@@ -799,6 +805,7 @@ def name_build(publish, tmp_path, **overrides):
         "VERSION": "1.13.1",
         "NUMBER": "57",
         "VERSION_CODE": "101300057",
+        "VERSION_CODE_SCHEME": "minor-blocks",
         "SOURCE_BRANCH": "develop",
         "LABEL": "",
         "VERSION_GIVEN": "",
@@ -857,6 +864,7 @@ def test_the_jobs_name_a_build_as_the_plan_does(entry, publish, lines, tmp_path,
         "apart": label or version,
         "version-name": plan.version_name,
         "tag": plan.release_tag,
+        "version-code-scheme": "minor-blocks",
     }
     assert plan.branch == branch and plan.kind == ("label" if label else "qa")
     # The expressions of the build jobs and of the workflow's output, read as GitHub evaluates them.
@@ -869,7 +877,7 @@ def test_the_jobs_name_a_build_as_the_plan_does(entry, publish, lines, tmp_path,
     assert "release-tag" not in outputs
 
 
-@pytest.mark.parametrize("empty", ["SHA", "VERSION", "NUMBER", "VERSION_CODE"])
+@pytest.mark.parametrize("empty", ["SHA", "VERSION", "NUMBER", "VERSION_CODE", "VERSION_CODE_SCHEME"])
 def test_an_output_the_runner_dropped_ends_the_publish_job_with_the_reason(publish, checks, tmp_path, empty):
     # A secret whose value is a word of the plan (a version, a number) empties the output without
     # failing the plan. The first step of the job that publishes says so.
@@ -884,8 +892,25 @@ def test_an_output_the_runner_dropped_ends_the_publish_job_with_the_reason(publi
     env = step(publish, "Name the build")["env"]
     assert env["SOURCE_BRANCH"] == "${{ inputs.source-branch || github.event.repository.default_branch }}"
     assert env["LABEL"] == "${{ inputs.label }}" and env["VERSION_GIVEN"] == "${{ inputs.version }}"
-    for name, output in {"SHA": "sha", "MAJOR": "major", "VERSION": "version", "NUMBER": "number", "VERSION_CODE": "version-code"}.items():
+    planned = {
+        "SHA": "sha", "MAJOR": "major", "VERSION": "version", "NUMBER": "number", "VERSION_CODE": "version-code",
+        "VERSION_CODE_SCHEME": "version-code-scheme",
+    }
+    for name, output in planned.items():
         assert env[name] == f"${{{{ needs.plan.outputs.{output} }}}}"
+
+
+@pytest.mark.parametrize(("scheme", "passes"), [("minor-blocks", True), ("build-number", True), (" build-number ", False), ("build-number\n", False), ("Build-Number", False), ("true", False)])
+def test_the_scheme_from_the_plan_is_one_of_two_words(publish, tmp_path, scheme, passes):
+    # release-version gives the word without whitespace. Anything else did not come from it, and
+    # the step that publishes is not left to compare it.
+    result, names = name_build(publish, tmp_path, VERSION_CODE_SCHEME=scheme)
+    assert (result.returncode == 0) == passes, result.stdout + result.stderr
+    if passes:
+        assert names["version-code-scheme"] == scheme
+    else:
+        assert "::error title=The plan is incomplete::The plan's version-code-scheme is " in result.stdout
+        assert names == {}
 
 
 # --- built: the check a release requires ----------------------------------------------------------
@@ -1841,10 +1866,60 @@ def test_a_build_number_below_the_published_one_is_not_published_over_it(publish
         assert calls == [] and state["tag"] == BEFORE_TAG and summary == ""
     env = step(publish, "Publish the rolling pre-release")["env"]
     assert env["SINCE_CODE"] == "${{ steps.changes.outputs.since-code }}"
-    assert env["VERSION_CODE_SCHEME"] == "${{ inputs.version-code-scheme }}"
+    # The word the plan read, checked by the first step of the job; never the input.
+    assert env["VERSION_CODE_SCHEME"] == "${{ steps.names.outputs.version-code-scheme }}"
     # The code the since tag holds is asked with the versionCode of this build.
     changes = step(publish, "List the changes since the build before")["with"]
     assert changes["version-code"] == "${{ needs.plan.outputs.version-code }}"
+
+
+@pytest.mark.parametrize("given", ["build-number", " build-number ", "build-number\n", "\tbuild-number\r\n"])
+@pytest.mark.parametrize(("held", "outcome"), [("200000099", "refused"), ("", "published")])
+def test_a_scheme_with_whitespace_holds_the_build_to_build_numbers_up_to_publish(entry, publish, lines, tmp_path, given, held, outcome):
+    # The calling file's value reaches release-version as it was written. The plan reads
+    # " build-number " as build-number and reserves a build number; the job that publishes has to
+    # read it the same way, or a build goes out over one with a higher versionCode. Each link of the
+    # chain is run: the plan's step, the plan's output, the first step of publish, the publish step.
+    from test_build_numbers import FakeGitHub
+    from test_release_version import API, parse_outputs
+
+    output = tmp_path / "plan-output"
+    output.write_text("")
+    env = {
+        "OPERATION": "qa", "REF": "refs/heads/develop", "SHA": lines["develop"], "SOURCE_BRANCH": "develop",
+        "QA_SEQUENCE": "57", "TAG_PREFIX": "v", "VERSION_CODE_SCHEME": given, "TOKEN": "job-token",
+        "GITHUB_REPOSITORY": "acme/app", "GITHUB_API_URL": API, "GITHUB_RUN_ID": "9001", "GITHUB_OUTPUT": str(output),
+    }
+    assert release_version.main(env, release_version.http_get, FakeGitHub()) == 0
+    planned = parse_outputs(output.read_text())
+    assert (planned["version-code-scheme"], planned["version-name"], planned["version-code"]) == ("build-number", "2.0.1-qa.57", "200000001")
+    # The plan job's output, read as GitHub reads `a || 'minor-blocks'`.
+    assert entry["jobs"]["plan"]["outputs"]["version-code-scheme"] == PLAN_SCHEME
+    handed_on = planned.get("version-code-scheme") or "minor-blocks"
+    result, names = name_build(
+        publish, tmp_path, SHA=lines["develop"], VERSION=planned["version"], NUMBER=planned["number"],
+        VERSION_CODE=planned["version-code"], VERSION_CODE_SCHEME=handed_on,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert names["version-code-scheme"] == "build-number"
+    # The pre-release holds a build of an earlier commit with a higher code, or none at all.
+    directory = gh_directory(tmp_path, release=True, tag=BEFORE_TAG, assets=("old.apk",))
+    result, calls, state, _ = publish_build(
+        publish, tmp_path, directory, SHA=lines["develop"], VERSION=planned["version"],
+        VERSION_NAME=names["version-name"], VERSION_CODE=planned["version-code"],
+        VERSION_CODE_SCHEME=names["version-code-scheme"], SINCE_CODE=held,
+    )
+    if outcome == "refused":
+        assert result.returncode == 1
+        assert "::error title=A higher versionCode is published::2.0.1-qa.57 has the versionCode 200000001" in result.stdout
+        assert calls == [] and state["tag"] == BEFORE_TAG
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert state["tag"] == FIRST_OBJECT
+    # No job after the plan reads the input: the plan's step is the one place it goes.
+    text = (WORKFLOWS / ENTRY).read_text()
+    assert text.count("inputs.version-code-scheme") == 1
+    assert step(entry["jobs"]["plan"], "Plan the QA build")["with"]["version-code-scheme"] == "${{ inputs.version-code-scheme }}"
 
 
 def test_the_notes_of_a_build_with_a_build_number_say_what_it_installs_over(publish, tmp_path):
