@@ -1387,7 +1387,7 @@ Moving the tag `android-ci/v1` to this release:
 |------|--------|---------------|----------------------------|
 | inputs `version-code-scheme`, `version-code-floor` of `android-qa.yml`, `android-release.yml`, `android-version-bump.yml` | not there | `minor-blocks` (the formula) and empty by default; `build-number` gives every build the next build number of its major | as before |
 | permissions of the `plan` jobs of `android-qa.yml` and `android-release.yml` | `contents: read` | `contents: write`, to reserve a build number; with the formula nothing is written | Nothing changes: the calling files grant `contents: write` already, for the pre-release and the GitHub Release. A calling file that grants only `contents: read` would not start, and could not publish before either. |
-| outputs of `release-version` | | `build-number` with `build-number`; `since-code` of `changes` with `version-code` | as before: neither is written with the formula |
+| outputs of `release-version` | | `build-number`, written with `build-number` only; `since-code` of `changes`, written whenever `version-code` is given | `since-code` reaches the `publish` job of `android-qa.yml`, which reads it with `build-number` only |
 
 - The scheme is chosen per calling repository, in its three calling files at once ([Switching a calling repository](#switching-a-calling-repository)). Turning it on is not undone.
 - The formula stays the default within `android-ci/v1`. Making build numbers the default, and removing the formula with `sequence-offset` and its limits, is for `android-ci/v2`, after the calling apps have switched.
