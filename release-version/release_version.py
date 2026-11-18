@@ -994,9 +994,13 @@ def write_outputs(env: Mapping[str, str], outputs: Mapping[str, str]) -> None:
                 output.write(f"{name}={value}\n")
 
 
-def build_number_output(number: Optional[BuildNumber]) -> dict:
-    # Only in the build-number scheme: the outputs of the formula are as they were.
-    return {"build-number": str(number.number)} if number else {}
+def scheme_outputs(env: Mapping[str, str], number: Optional[BuildNumber]) -> dict:
+    """The scheme as the plan read it, and the build number when there is one.
+
+    The scheme is the word, whatever whitespace the input had: a job after
+    the plan compares this output, never the input.
+    """
+    return {"version-code-scheme": version_code_scheme(env), **({"build-number": str(number.number)} if number else {})}
 
 
 def run_next(env: Mapping[str, str], fetch: Fetch, call: build_numbers.Call = http_call) -> None:
@@ -1025,7 +1029,7 @@ def run_next(env: Mapping[str, str], fetch: Fetch, call: build_numbers.Call = ht
         "version-code": str(plan.version_code),
         "branch": plan.branch,
         "notice": plan.notice,
-        **build_number_output(plan.build_number),
+        **scheme_outputs(env, plan.build_number),
     })
 
 
@@ -1075,7 +1079,7 @@ def run_code(env: Mapping[str, str], call: build_numbers.Call = http_call) -> No
         code = reserved.code
         print_build_number(reserved)
     print(f"versionCode of {kind} {name}: {code}")
-    write_outputs(env, {"version": name, "version-code": str(code), **build_number_output(reserved)})
+    write_outputs(env, {"version": name, "version-code": str(code), **scheme_outputs(env, reserved)})
 
 
 def run_qa(env: Mapping[str, str], call: build_numbers.Call = http_call) -> None:
@@ -1100,7 +1104,7 @@ def run_qa(env: Mapping[str, str], call: build_numbers.Call = http_call) -> None
         "previous-tag": plan.previous_tag,
         "branch": plan.branch,
         "target-sha": plan.target_sha,
-        **build_number_output(plan.build_number),
+        **scheme_outputs(env, plan.build_number),
     })
 
 

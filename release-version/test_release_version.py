@@ -123,6 +123,8 @@ def test_a_repository_without_release_tags_counts_from_zero(repo, tmp_path, bump
         # Only a prerelease has one before it, and only a plan with a consequence has a notice.
         "previous-prerelease-tag": "",
         "notice": "",
+        # The scheme as the step read it: the formula when none is given.
+        "version-code-scheme": "minor-blocks",
     }
 
 
@@ -733,7 +735,8 @@ def test_a_version_the_formula_cannot_hold_is_refused(repo, tmp_path, capsys):
 )
 def test_code(tmp_path, inputs, outputs):
     code, out = run(tmp_path, operation="code", **{"kind": "release", **inputs})
-    assert (code, out) == (0, outputs)
+    # The scheme as the step read it, for the jobs after it: the formula when none is given.
+    assert (code, out) == (0, {**outputs, "version-code-scheme": "minor-blocks"})
 
 
 @pytest.mark.parametrize(
@@ -789,6 +792,7 @@ def test_a_preview_is_the_next_version_with_a_number(repo, tmp_path, capsys):
         "version-code": "200049001",
         "branch": "develop",
         "notice": "",
+        "version-code-scheme": "minor-blocks",
     }
     assert "Next prerelease: v2.0.0-preview.1 (versionCode 200049001)" in capsys.readouterr().out
 
@@ -965,6 +969,7 @@ def test_a_qa_build_leads_up_to_the_patch_after_the_last_release(repo, tmp_path,
         "previous-tag": "v1.13.0",
         "branch": "develop",
         "target-sha": target,
+        "version-code-scheme": "minor-blocks",
     }
     log = capsys.readouterr().out
     assert "Version: 1.13.1 (the patch after v1.13.0)" in log
@@ -1029,6 +1034,7 @@ def test_each_line_builds_its_own_version_and_rolling_tag(lines, tmp_path):
         "previous-tag": "v1.13.1",
         "branch": "release/1.x",
         "target-sha": lines["h2"],
+        "version-code-scheme": "minor-blocks",
     }
 
 
@@ -1186,6 +1192,7 @@ def test_a_label_build_is_numbered_right_after_the_last_release_of_its_line(line
         "previous-tag": "v2.0.0",
         "branch": "develop",
         "target-sha": lines["c"],
+        "version-code-scheme": "minor-blocks",
     }
     log = capsys.readouterr().out
     assert "Version: 2.0.1 (label build 1 after v2.0.0)" in log

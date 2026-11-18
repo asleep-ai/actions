@@ -207,6 +207,13 @@ outputs:
       number in version-code: reserved for qa and code, looked up for next.
       Empty with the formula.
     value: ${{ steps.version.outputs.build-number }}
+  version-code-scheme:
+    description: >-
+      For next, code and qa. The scheme the versionCode was computed with,
+      minor-blocks or build-number, as the step read version-code-scheme:
+      without the whitespace around the word, and minor-blocks for an empty
+      one. A later step or job compares this, not the input.
+    value: ${{ steps.version.outputs.version-code-scheme }}
   version-name:
     description: >-
       For qa. The versionName of the build: <version>-qa.<number>, or

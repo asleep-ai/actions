@@ -655,14 +655,31 @@ def test_the_version_bump_refuses_what_the_release_would_refuse(repo, tmp_path, 
 
 
 def test_the_formula_asks_github_nothing_and_writes_no_build_number(lines, repo, tmp_path):
-    for scheme in ("", "minor-blocks"):
+    for scheme in ("", "minor-blocks", " minor-blocks\n"):
         code, out = qa(tmp_path, no_api, lines["c"], version_code_scheme=scheme)
-        assert (code, out["version-code"]) == (0, "200000057")
+        assert (code, out["version-code"], out["version-code-scheme"]) == (0, "200000057", "minor-blocks")
         assert "build-number" not in out
         git(repo, "tag", "-f", "v2.0.1", lines["c"])
         code, out = release(tmp_path, no_api, "v2.0.1", lines["c"], version_code_scheme=scheme)
-        assert (code, out) == (0, {"version": "2.0.1", "version-code": "200050100"})
+        assert (code, out) == (0, {"version": "2.0.1", "version-code": "200050100", "version-code-scheme": "minor-blocks"})
         git(repo, "tag", "-d", "v2.0.1")
+
+
+@pytest.mark.parametrize("scheme", ["build-number", " build-number ", "build-number\n", "\tbuild-number\r\n"])
+def test_the_scheme_is_given_on_as_the_word_the_plan_read(lines, repo, tmp_path, scheme):
+    # The jobs after the plan compare this output, never the input: an input with whitespace
+    # around the word is the build-number scheme for the plan, and has to be for them as well.
+    gh = FakeGitHub()
+    code, out = qa(tmp_path, gh, lines["c"], version_code_scheme=scheme)
+    assert (code, out["version-code-scheme"], out["version-code"], out["build-number"]) == (0, "build-number", "200000001", "1")
+    git(repo, "tag", "v2.0.1", lines["c"])
+    code, out = release(tmp_path, gh, "v2.0.1", lines["c"], version_code_scheme=scheme, run_id="7002")
+    assert (code, out["version-code-scheme"], out["version-code"]) == (0, "build-number", "200000002")
+    code, out = run(tmp_path, gh, operation="next", sha=commit(repo, "More (#9)"), version_code_scheme=scheme)
+    assert (code, out["version-code-scheme"], out["version-code"]) == (0, "build-number", "200000003")
+    # The word itself, with anything else inside it, is no scheme.
+    code, out = qa(tmp_path, gh, lines["c"], version_code_scheme="build- number")
+    assert (code, out) == (1, {})
 
 
 @pytest.mark.parametrize("operation", ["qa", "code", "next"])

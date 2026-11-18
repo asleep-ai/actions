@@ -91,6 +91,7 @@ Inputs reach the script as environment variables, never through shell interpolat
 | `prs` | `next`, `changes` | Markdown list of what the commit adds, oldest first. |
 | `version-code` | `next`, `code`, `qa` | The Android versionCode of the version or build. With `build-number`: for `qa` and `code`, the code of the number reserved for the build; for `next`, the code the release would get if it were built now. |
 | `build-number` | `next`, `code`, `qa` with `build-number` | The build number in `version-code`: reserved for `qa` and `code`, looked up for `next`. Not written with the formula. |
+| `version-code-scheme` | `next`, `code`, `qa` | The scheme the versionCode was computed with, `minor-blocks` or `build-number`: the input without the whitespace around it, `minor-blocks` for an empty one. A later step or job compares this output, never the input. |
 | `version-name` | `qa` | The versionName of the build: `<version>-qa.<n>`, or `<version>-<label>.<k>` for a label build. |
 | `kind` | `qa` | `qa`, or `label` for a label build. |
 | `number` | `qa` | The number in the version name: `qa-sequence` plus `qa-sequence-offset`, or the `k` of a label build. |
