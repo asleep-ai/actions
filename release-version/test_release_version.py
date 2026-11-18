@@ -1557,4 +1557,6 @@ def test_the_action_passes_every_input_to_the_script():
     action = (Path(__file__).parent / "action.yml").read_text()
     read = set(re.findall(r'env\.get\("([A-Z_]+)"', (Path(__file__).parent / "release_version.py").read_text()))
     passed = set(re.findall(r"^        ([A-Z_]+): \$\{\{ inputs\.", action, re.MULTILINE))
-    assert passed == read - {"GITHUB_REPOSITORY", "GITHUB_API_URL", "GITHUB_OUTPUT"}
+    # What the runner sets for every step: the repository, the API, the output file, and the run a
+    # build number is reserved for.
+    assert passed == read - {"GITHUB_REPOSITORY", "GITHUB_API_URL", "GITHUB_OUTPUT", "GITHUB_RUN_ID"}

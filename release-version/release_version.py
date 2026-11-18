@@ -67,6 +67,13 @@ changes
       at the last release the commit contains. With version-code, also
       whether another rolling tag holds a build of that versionCode.
 
+version-code-scheme says which versionCode a build gets. minor-blocks, the
+default, is the formula of version_code.py, computed from the version and the
+numbers above. build-number gives every build the next build number of its
+major instead (build_numbers.py): qa and code reserve it in the repository,
+and next says which number the release would get now, without reserving it.
+The version names are the same in both.
+
 Anything that cannot be decided fails the step: a release is not planned on a
 guess.
 """
@@ -83,12 +90,20 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Callable, Mapping, Optional
 
+import build_numbers
+from build_numbers import BuildNumber, BuildNumberError, Shipped
 from version_code import MAX_LABEL as MAX_LABEL_BUILDS
-from version_code import VersionCodeError, label_code, preview_code, qa_code, release_code
+from version_code import VersionCodeError, check_major, label_code, preview_code, qa_code, release_code
 
 BUMPS = ("patch", "minor", "major")
+# How a build gets its versionCode: the formula of version_code.py, whose codes follow from the
+# version, or the next build number of the major (build_numbers.py). The first is the default.
+MINOR_BLOCKS = "minor-blocks"
+BUILD_NUMBER = "build-number"
+SCHEMES = (MINOR_BLOCKS, BUILD_NUMBER)
 KINDS = ("release", "preview", "qa")
 # The kinds of prerelease a version can be tagged as before it is released. Each needs a range of
 # versionCodes in version_code.py; preview is the only one that has one.
@@ -141,6 +156,7 @@ class Plan:
     branch: str  # the branch of the release line; empty when no source branch was given
     previous_prerelease_tag: str = ""  # the prerelease of the same version before this one, when there is one
     notice: str = ""  # something the person who releases should read; not a refusal
+    build_number: Optional[BuildNumber] = None  # build-number: the number the release would get now
 
 
 @dataclass(frozen=True)
@@ -157,6 +173,7 @@ class QaPlan:
     branch: str
     target_sha: str
     why: str  # where the version comes from, for the log
+    build_number: Optional[BuildNumber] = None  # build-number: the number reserved for the build
 
 
 @dataclass(frozen=True)
@@ -327,6 +344,90 @@ def http_get(url: str, token: str) -> bytes:
         raise Failure(f"cannot reach {url}: {str(exc) or type(exc).__name__}") from None
 
 
+def http_call(method: str, url: str, token: str, body: Optional[dict]) -> tuple:
+    """One request of build_numbers: the status, the headers and the body, whatever the status.
+
+    The caller decides what a status means: a ref that exists already is an
+    answer, not a failure.
+    """
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "asleep-ai-actions-release-version",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with _OPENER.open(request, timeout=20) as response:
+            return response.status, {name.lower(): value for name, value in response.headers.items()}, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, {name.lower(): value for name, value in (exc.headers or {}).items()}, exc.read(2000)
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        raise Failure(f"cannot reach {url}: {str(exc) or type(exc).__name__}") from None
+
+
+def version_code_scheme(env: Mapping[str, str]) -> str:
+    # Empty is the default, so that a calling file can pass an input of its own that is empty.
+    scheme = env.get("VERSION_CODE_SCHEME", "").strip() or MINOR_BLOCKS
+    if scheme not in SCHEMES:
+        raise Failure(f"version-code-scheme must be one of {', '.join(SCHEMES)}, got {scheme!r}")
+    return scheme
+
+
+def checked_major(major: int) -> None:
+    """Refuse a build of a major that has no versionCodes in the build-number scheme."""
+    try:
+        check_major(major)
+    except VersionCodeError as exc:
+        raise Failure(f"the build is of major {major}, and {exc}. Nothing is built") from None
+
+
+def build_number(env: Mapping[str, str], call: build_numbers.Call, major: int, target: str, keep: bool) -> BuildNumber:
+    """The build number of major `major` for a build of `target`: reserved, or with keep false only looked at.
+
+    The codes the rolling tags name count as out next to the release assets:
+    a QA build is published as the asset of a rolling pre-release, and its
+    tag says which code it has whatever the file is called.
+    """
+    repository = env.get("GITHUB_REPOSITORY", "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repository):
+        raise Failure("GITHUB_REPOSITORY is not set to owner/name")
+    api = build_numbers.Repository(
+        env.get("GITHUB_API_URL") or "https://api.github.com", repository, env.get("TOKEN", "").strip(), call
+    )
+    seen = [Shipped(code, f"the build {name} that {tag} holds") for tag, name, code in rolling_builds()]
+    try:
+        floor = build_numbers.parse_floor(env.get("VERSION_CODE_FLOOR", ""))
+        if not keep:
+            return build_numbers.look(api, major, seen, floor)
+        # What stands for the run in the object of the reservation: a run that is run again creates
+        # the same object and finds its number. Without an id, nothing is found again.
+        run = env.get("GITHUB_RUN_ID", "").strip()
+        marker = f"The build number of run {run} of {repository}" if run else f"A build of {repository} ({secrets.token_hex(8)})"
+        seconds = int(git("show", "-s", "--format=%ct", target).stdout.strip())
+        date = datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return build_numbers.reserve(api, major, target, marker, date, seen, floor)
+    except BuildNumberError as exc:
+        raise Failure(str(exc)) from None
+
+
+def print_build_number(number: BuildNumber) -> None:
+    if number.kept:
+        print(f"Build number {number.number} of major {number.major} ({number.ref}): {number.why}.")
+    elif number.ref:
+        print(f"Build number {number.number} of major {number.major}, reserved as {number.ref}: {number.why}.")
+    else:
+        print(
+            f"Build number {number.number} of major {number.major} if the build were planned now: {number.why}. "
+            "Nothing is reserved: the build reserves its own."
+        )
+
+
 def merge_commit_of(number: str, env: Mapping[str, str], fetch: Fetch) -> str:
     """The commit a merged pull request left on its base branch."""
     if not re.fullmatch(r"[1-9][0-9]*", number):
@@ -407,7 +508,7 @@ def pull_requests(previous: Optional[str], target: str) -> str:
     return "\n".join(entries)
 
 
-def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
+def plan_next(env: Mapping[str, str], fetch: Fetch, call: build_numbers.Call = http_call) -> Plan:
     pr = env.get("PR", "").strip().lstrip("#")
     sha = env.get("SHA", "").strip()
     bump = env.get("BUMP", "").strip()
@@ -425,6 +526,7 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
         raise Failure(f"prerelease must be empty or one of {', '.join(PRERELEASES)}, got {prerelease!r}")
     if not TAG_PREFIX.fullmatch(prefix):
         raise Failure(f"tag-prefix may hold only letters, digits and . _ / -, and not start with -, got {prefix!r}")
+    scheme = version_code_scheme(env)
 
     if git("rev-parse", "--is-shallow-repository").stdout.strip() == "true":
         raise Failure("the checkout is shallow, so tags and history are incomplete; check out with fetch-depth: 0")
@@ -469,10 +571,16 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
             f"install over the release that is out. Choose bump minor or major for the {prerelease}. To try a "
             "fix on a device before the patch is released, make a label build (the QA workflow, input label)"
         )
-    try:
-        code = release_code(*version)
-    except VersionCodeError as exc:
-        raise Failure(str(exc)) from None
+    # The formula holds a version only within its ranges. A build number holds any version of a
+    # major that has codes; its number is looked up once the plan has passed every rule.
+    code = 0
+    if scheme == MINOR_BLOCKS:
+        try:
+            code = release_code(*version)
+        except VersionCodeError as exc:
+            raise Failure(str(exc)) from None
+    else:
+        checked_major(version[0])
 
     # The line of the next version is its major. Its last release, wherever in the repository it is
     # tagged, has to be the release this commit builds on; otherwise the version would repeat one of
@@ -522,15 +630,19 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
                     f"{format_version(version)}. {tag} installs over that {kind}, with code that lacks what the "
                     f"{kind} had. Release a commit that contains {last_tag}, unless leaving it out is meant"
                 )
+        # Not reserved: the release workflow reserves the number when it builds the tag. What the
+        # plan shows is the number it would get now, and the plan is refused where the build would be.
+        looked = build_number(env, call, version[0], target, keep=False) if scheme == BUILD_NUMBER else None
         return Plan(
             version=format_version(version),
             tag=tag,
             previous_tag=previous_tag,
             target_sha=target,
             prs=pull_requests(previous_commit, target),
-            version_code=code,
+            version_code=looked.code if looked else code,
             branch=branch,
             notice=notice,
+            build_number=looked,
         )
 
     # The version passed every rule of a release. Its prerelease is numbered after the ones of the
@@ -538,10 +650,11 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
     existing = prerelease_numbers(prefix, version, prerelease)
     number = max(existing, default=0) + 1
     name = f"{format_version(version)}-{prerelease}.{number}"
-    try:
-        code = preview_code(version[0], version[1], number)
-    except VersionCodeError as exc:
-        raise Failure(str(exc)) from None
+    if scheme == MINOR_BLOCKS:
+        try:
+            code = preview_code(version[0], version[1], number)
+        except VersionCodeError as exc:
+            raise Failure(str(exc)) from None
     since = previous_commit
     last_tag = ""
     if existing:
@@ -557,15 +670,17 @@ def plan_next(env: Mapping[str, str], fetch: Fetch) -> Plan:
                 f"{format_version(version)}. A {prerelease} builds on the one before it: choose a commit that contains it"
             )
         since = last_commit
+    looked = build_number(env, call, version[0], target, keep=False) if scheme == BUILD_NUMBER else None
     return Plan(
         version=name,
         tag=prefix + name,
         previous_tag=previous_tag,
         target_sha=target,
         prs=pull_requests(since, target),
-        version_code=code,
+        version_code=looked.code if looked else code,
         branch=branch,
         previous_prerelease_tag=last_tag,
+        build_number=looked,
     )
 
 
@@ -670,7 +785,7 @@ def qa_base(
 
 
 def rolling_builds() -> list:
-    """The builds the rolling pre-releases hold, as (tag, versionCode).
+    """The builds the rolling pre-releases hold, as (tag, version name, versionCode).
 
     A rolling pre-release holds one build, and its tag says which: the publish
     job writes "<version name> (<versionCode>)" into the annotated tag it moves.
@@ -682,19 +797,31 @@ def rolling_builds() -> list:
         tag, kind, subject = (line.split("\x1f") + ["", ""])[:3]
         match = ROLLING_MESSAGE.fullmatch(subject.strip()) if kind == "tag" else None
         if match:
-            builds.append((tag, int(match["code"])))
+            builds.append((tag, match["name"], int(match["code"])))
     return builds
 
 
-def label_numbers(base: tuple) -> list:
+def label_numbers(base: tuple, scheme: str = MINOR_BLOCKS) -> list:
     """The numbers of the label builds published after the release `base`.
 
-    They are the rolling tags whose versionCode is in the ninety-nine codes
-    after that release's, whatever their label and branch. A build that was
-    planned and never published took no number.
+    They are the rolling tags of the label builds after that release, whatever
+    their label and branch. A build that was planned and never published took
+    no number. In the formula these are the tags whose versionCode is in the
+    ninety-nine codes after that release's. A build number says nothing about
+    the release, so in that scheme they are the tags whose version name is a
+    label build's of the patch after it, <next patch>-<label>.<k>: the name of
+    a label build made under the formula as well.
     """
-    low = release_code(*base)
-    return [code - low for _, code in rolling_builds() if low < code <= low + MAX_LABEL_BUILDS]
+    if scheme == MINOR_BLOCKS:
+        low = release_code(*base)
+        return [code - low for _, _, code in rolling_builds() if low < code <= low + MAX_LABEL_BUILDS]
+    name = re.compile(rf"{re.escape(format_version(bump_version(base, 'patch')))}-(?P<label>[a-z0-9-]+)\.(?P<number>[1-9][0-9]*)")
+    numbers = []
+    for _, built, _ in rolling_builds():
+        match = name.fullmatch(built)
+        if match and LABEL.fullmatch(match["label"]) and match["label"] not in RESERVED_LABELS:
+            numbers.append(int(match["number"]))
+    return numbers
 
 
 def changes_since(target: str, since_tag: str, prefix: str) -> Changes:
@@ -723,7 +850,7 @@ def whole_number(text: str, name: str, signed: bool = False) -> int:
     return int(text)
 
 
-def plan_qa(env: Mapping[str, str]) -> QaPlan:
+def plan_qa(env: Mapping[str, str], call: build_numbers.Call = http_call) -> QaPlan:
     ref = env.get("REF", "").strip()
     sha = env.get("SHA", "").strip()
     prefix = env.get("TAG_PREFIX", "")
@@ -736,6 +863,7 @@ def plan_qa(env: Mapping[str, str]) -> QaPlan:
         raise Failure(f"tag-prefix may hold only letters, digits and . _ / -, and not start with -, got {prefix!r}")
     if not BRANCH.fullmatch(source_branch):
         raise Failure(f"source-branch is not a branch name: {source_branch!r}")
+    scheme = version_code_scheme(env)
 
     # Only what was merged is built: the source branch and the maintenance branches.
     branch = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ""
@@ -801,15 +929,16 @@ def plan_qa(env: Mapping[str, str]) -> QaPlan:
                     f"not contain it: its last release is {released}. A label build is made after the last "
                     "release of its line. Start the run on the branch as it is now"
                 )
-            number = max(label_numbers(own), default=0) + 1
-            if number > MAX_LABEL_BUILDS:
+            number = max(label_numbers(own, scheme), default=0) + 1
+            # A build number has no room to run out of after a release.
+            if scheme == MINOR_BLOCKS and number > MAX_LABEL_BUILDS:
                 raise Failure(
                     f"{MAX_LABEL_BUILDS} label builds were published after {released}, and the versionCode after "
                     f"them is the one of {prefix}{format_version(version)}. Release {format_version(version)}: "
                     "the label builds after it are counted from 1 again"
                 )
             kind = "label"
-            code = label_code(*own, number)
+            code = label_code(*own, number) if scheme == MINOR_BLOCKS else 0
             name = f"{format_version(version)}-{label}.{number}"
             release_tag = f"qa-{line}-{label}"
             why = f"label build {number} after {released}"
@@ -817,7 +946,13 @@ def plan_qa(env: Mapping[str, str]) -> QaPlan:
             number = whole_number(env.get("QA_SEQUENCE", "").strip(), "qa-sequence")
             number += whole_number(env.get("QA_SEQUENCE_OFFSET", "").strip() or "0", "qa-sequence-offset", signed=True)
             kind = "qa"
-            code = qa_code(version[0], version[1], number)
+            if scheme == MINOR_BLOCKS:
+                code = qa_code(version[0], version[1], number)
+            elif number < 1:
+                # The number is only a name here, and a name counts from 1.
+                raise Failure(f"qa-sequence plus qa-sequence-offset is {number}, and the number of a QA build is 1 or higher")
+            else:
+                code = 0
             name = f"{format_version(version)}-{QA_SUFFIX}.{number}"
             # A build of a version that was given is in another block of versionCodes than the
             # builds of the branch. It gets a pre-release of its own, so the rolling build of the
@@ -826,10 +961,12 @@ def plan_qa(env: Mapping[str, str]) -> QaPlan:
     except VersionCodeError as exc:
         raise Failure(str(exc)) from None
 
+    # Reserved last, once the plan has passed every rule: a run that is refused takes no number.
+    reserved = build_number(env, call, version[0], target, keep=True) if scheme == BUILD_NUMBER else None
     return QaPlan(
         version=format_version(version),
         version_name=name,
-        version_code=code,
+        version_code=reserved.code if reserved else code,
         kind=kind,
         number=number,
         line=line,
@@ -839,6 +976,7 @@ def plan_qa(env: Mapping[str, str]) -> QaPlan:
         branch=branch,
         target_sha=target,
         why=why,
+        build_number=reserved,
     )
 
 
@@ -856,8 +994,13 @@ def write_outputs(env: Mapping[str, str], outputs: Mapping[str, str]) -> None:
                 output.write(f"{name}={value}\n")
 
 
-def run_next(env: Mapping[str, str], fetch: Fetch) -> None:
-    plan = plan_next(env, fetch)
+def build_number_output(number: Optional[BuildNumber]) -> dict:
+    # Only in the build-number scheme: the outputs of the formula are as they were.
+    return {"build-number": str(number.number)} if number else {}
+
+
+def run_next(env: Mapping[str, str], fetch: Fetch, call: build_numbers.Call = http_call) -> None:
+    plan = plan_next(env, fetch, call)
     if env.get("VERSION", "").strip():
         print(f"version {plan.version} was given: bump ({env.get('BUMP', '').strip() or 'none'}) is ignored.")
     print(f"Last release the commit contains: {plan.previous_tag or 'none'}")
@@ -865,6 +1008,8 @@ def run_next(env: Mapping[str, str], fetch: Fetch) -> None:
         print(f"Prerelease before this one: {plan.previous_prerelease_tag}")
     kind = "prerelease" if env.get("PRERELEASE", "").strip() else "release"
     print(f"Next {kind}: {plan.tag} (versionCode {plan.version_code}) at {plan.target_sha}")
+    if plan.build_number:
+        print_build_number(plan.build_number)
     if plan.branch:
         print(f"Release line: {plan.branch}")
     if plan.notice:
@@ -880,15 +1025,17 @@ def run_next(env: Mapping[str, str], fetch: Fetch) -> None:
         "version-code": str(plan.version_code),
         "branch": plan.branch,
         "notice": plan.notice,
+        **build_number_output(plan.build_number),
     })
 
 
-def run_code(env: Mapping[str, str]) -> None:
+def run_code(env: Mapping[str, str], call: build_numbers.Call = http_call) -> None:
     text = env.get("VERSION", "").strip()
     prefix = env.get("TAG_PREFIX", "")
     kind = env.get("KIND", "").strip()
     if kind not in KINDS:
         raise Failure(f"kind must be one of {', '.join(KINDS)}, got {kind!r}")
+    scheme = version_code_scheme(env)
     # The version may be given as its tag.
     if prefix and text.startswith(prefix):
         text = text[len(prefix):]
@@ -905,27 +1052,40 @@ def run_code(env: Mapping[str, str]) -> None:
                     f"major version: X.Y.0-{match['kind']}.N"
                 )
             name = text
-            code = preview_code(version[0], version[1], int(match["number"]))
+            if scheme == MINOR_BLOCKS:
+                code = preview_code(version[0], version[1], int(match["number"]))
         else:
             version = parse_version(text)
             name = format_version(version)
-            if kind == "release":
+            if scheme == MINOR_BLOCKS and kind == "release":
                 code = release_code(*version)
-            else:
+            elif scheme == MINOR_BLOCKS:
                 sequence = whole_number(env.get("QA_SEQUENCE", "").strip(), "qa-sequence")
                 code = qa_code(version[0], version[1], sequence)
     except VersionCodeError as exc:
         raise Failure(str(exc)) from None
+    reserved = None
+    if scheme == BUILD_NUMBER:
+        # The number of a build, whatever its kind, of the commit that is built.
+        checked_major(version[0])
+        sha = env.get("SHA", "").strip()
+        if not sha:
+            raise Failure("sha is the commit that is built, and the build-number scheme needs it to reserve a number")
+        reserved = build_number(env, call, version[0], named_commit(sha), keep=True)
+        code = reserved.code
+        print_build_number(reserved)
     print(f"versionCode of {kind} {name}: {code}")
-    write_outputs(env, {"version": name, "version-code": str(code)})
+    write_outputs(env, {"version": name, "version-code": str(code), **build_number_output(reserved)})
 
 
-def run_qa(env: Mapping[str, str]) -> None:
-    plan = plan_qa(env)
+def run_qa(env: Mapping[str, str], call: build_numbers.Call = http_call) -> None:
+    plan = plan_qa(env, call)
     print(f"Last release the commit contains: {plan.previous_tag or 'none'}")
     print(f"QA build of {plan.branch} at {plan.target_sha}")
     print(f"Version: {plan.version} ({plan.why})")
     what = "label build" if plan.kind == "label" else "QA build"
+    if plan.build_number:
+        print_build_number(plan.build_number)
     print(f"Version name: {plan.version_name} (versionCode {plan.version_code}, {what} {plan.number})")
     print(f"Published as: {plan.release_tag}")
     write_outputs(env, {
@@ -940,6 +1100,7 @@ def run_qa(env: Mapping[str, str]) -> None:
         "previous-tag": plan.previous_tag,
         "branch": plan.branch,
         "target-sha": plan.target_sha,
+        **build_number_output(plan.build_number),
     })
 
 
@@ -966,14 +1127,19 @@ def run_changes(env: Mapping[str, str]) -> None:
     # is no second build, but two runs of one label on two commits were planned with one number,
     # and the one that publishes second finds its own tag holding the code for another commit.
     taken_by = ""
+    given = {}
     given_code = env.get("VERSION_CODE", "").strip()
     if given_code:
         code = whole_number(given_code, "version-code")
+        builds = rolling_builds()
         taken_by = next(
-            (tag for tag, held in rolling_builds() if held == code and (tag != since_tag or not changes.unchanged)), ""
+            (tag for tag, _, held in builds if held == code and (tag != since_tag or not changes.unchanged)), ""
         )
         if taken_by:
             print(f"{taken_by} holds a build of the versionCode {code}.")
+        # The code of the build the since tag holds now. In the build-number scheme a build is not
+        # published over one with a higher code: the caller compares.
+        given["since-code"] = next((str(held) for tag, _, held in builds if tag == since_tag), "")
     if changes.stale:
         print(f"{since_tag} is at {changes.since[:7]}, a later commit that contains {target[:7]}.")
     elif changes.unchanged:
@@ -989,21 +1155,22 @@ def run_changes(env: Mapping[str, str]) -> None:
         "stale": "true" if changes.stale else "false",
         "unchanged": "true" if changes.unchanged else "false",
         "code-taken-by": taken_by,
+        **given,
     })
 
 
 OPERATIONS = ("next", "code", "qa", "changes")
 
 
-def main(env: Mapping[str, str] = os.environ, fetch: Fetch = http_get) -> int:
+def main(env: Mapping[str, str] = os.environ, fetch: Fetch = http_get, call: build_numbers.Call = http_call) -> int:
     operation = env.get("OPERATION", "").strip()
     try:
         if operation == "next":
-            run_next(env, fetch)
+            run_next(env, fetch, call)
         elif operation == "code":
-            run_code(env)
+            run_code(env, call)
         elif operation == "qa":
-            run_qa(env)
+            run_qa(env, call)
         elif operation == "changes":
             run_changes(env)
         else:
