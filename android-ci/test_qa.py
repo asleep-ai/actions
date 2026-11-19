@@ -84,7 +84,8 @@ def test_the_plan_is_the_qa_operation_of_release_version_for_the_ref_of_the_run(
         "version": "${{ inputs.version }}",
         "next-version": "${{ inputs.next-version }}",
         "label": "${{ inputs.label }}",
-        # A later run is a higher versionCode; a run that is started again keeps its number.
+        # A later run is a higher versionCode; a run that is started again keeps its number. Read
+        # with the formula only: build-number counts the QA builds of each version in this step.
         "qa-sequence": "${{ github.run_number }}",
         "qa-sequence-offset": "${{ inputs.sequence-offset }}",
         # Or, with build-number, the next build number of the major, reserved by this step.
@@ -1908,7 +1909,8 @@ def test_a_scheme_with_whitespace_holds_the_build_to_build_numbers_up_to_publish
     }
     assert release_version.main(env, release_version.http_get, FakeGitHub()) == 0
     planned = parse_outputs(output.read_text())
-    assert (planned["version-code-scheme"], planned["version-name"], planned["version-code"]) == ("build-number", "2.0.1-qa.57", "200000001")
+    # With build numbers the name counts the QA builds of 2.0.1, not the run number (QA_SEQUENCE).
+    assert (planned["version-code-scheme"], planned["version-name"], planned["version-code"]) == ("build-number", "2.0.1-qa.1", "200000001")
     # The plan job's output, read as GitHub reads `a || 'minor-blocks'`.
     assert entry["jobs"]["plan"]["outputs"]["version-code-scheme"] == PLAN_SCHEME
     handed_on = planned.get("version-code-scheme") or "minor-blocks"
@@ -1927,7 +1929,7 @@ def test_a_scheme_with_whitespace_holds_the_build_to_build_numbers_up_to_publish
     )
     if outcome == "refused":
         assert result.returncode == 1
-        assert "::error title=A higher versionCode is published::2.0.1-qa.57 has the versionCode 200000001" in result.stdout
+        assert "::error title=A higher versionCode is published::2.0.1-qa.1 has the versionCode 200000001" in result.stdout
         assert calls == [] and state["tag"] == BEFORE_TAG
     else:
         assert result.returncode == 0, result.stdout + result.stderr

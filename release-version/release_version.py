@@ -47,7 +47,9 @@ qa    Plan a QA build of a branch head: its version name, its versionCode and
         release has a maintenance branch, and on a maintenance branch without
         a release of its major, <major>.0.0. next-version names a later
         version the branch is heading for; it is used while it is higher than
-        the last release. The number is qa-sequence plus qa-sequence-offset.
+        the last release. The number is qa-sequence plus qa-sequence-offset;
+        with build-number it counts the QA builds of the version instead, from
+        1 and of each app apart (build_numbers.reserve_qa).
       - version names the version of this one build: the next minor or the
         next major version, whose QA builds install over the releases that
         are out, and a later one than the builds of the branch are of without
@@ -60,7 +62,8 @@ qa    Plan a QA build of a branch head: its version name, its versionCode and
         release. It installs over the release, and the next patch release
         installs over it. A line without a release has no label builds.
       - asset-pattern names the APKs of one app, for a pre-release that holds
-        a build of several apps; it is checked here and read by changes.
+        a build of several apps; it is checked here and read by changes, and
+        with build-number the app's QA builds are numbered apart.
 
 changes
       What a commit adds to the commit a tag names (the previous build of a
@@ -76,7 +79,8 @@ default, is the formula of version_code.py, computed from the version and the
 numbers above. build-number gives every build the next build number of its
 major instead (build_numbers.py): qa and code reserve it in the repository,
 and next says which number the release would get now, without reserving it.
-The version names are the same in both.
+The version names are of the same form in both; only the number of a QA build
+is counted another way.
 
 Anything that cannot be decided fails the step: a release is not planned on a
 guess.
@@ -99,7 +103,7 @@ from datetime import datetime, timezone
 from typing import Callable, Mapping, Optional
 
 import build_numbers
-from build_numbers import BuildNumber, BuildNumberError, Shipped
+from build_numbers import BuildNumber, BuildNumberError, QaNumber, Shipped
 from version_code import MAX_LABEL as MAX_LABEL_BUILDS
 from version_code import VersionCodeError, check_major, label_code, preview_code, qa_code, release_code
 
@@ -174,7 +178,7 @@ class QaPlan:
     version_name: str  # <version>-qa.<number>, or <version>-<label>.<number> for a label build
     version_code: int
     kind: str  # qa or label
-    number: int  # of a QA build, the sequence number; of a label build, its place after the release
+    number: int  # of a QA build, the sequence number or its QA number; of a label build, its place after the release
     line: str  # the branch as it appears in names: develop, release-1.x
     major: str  # the major version of a maintenance branch; empty on the source branch
     release_tag: str  # the tag of the rolling pre-release the build is published as
@@ -183,6 +187,7 @@ class QaPlan:
     target_sha: str
     why: str  # where the version comes from, for the log
     build_number: Optional[BuildNumber] = None  # build-number: the number reserved for the build
+    qa_number: Optional[QaNumber] = None  # build-number: the number reserved for the name of a QA build
 
 
 @dataclass(frozen=True)
@@ -425,19 +430,65 @@ def build_number(
     the plan is refused with that reason.
     """
     api = repository_api(env, call)
-    repository = env.get("GITHUB_REPOSITORY", "").strip()
     seen = [Shipped(code, f"the build {name} that {tag} holds") for tag, name, code in rolling_builds()]
     try:
         floor = build_numbers.parse_floor(env.get("VERSION_CODE_FLOOR", ""))
         if not keep:
             return build_numbers.look(api, major, seen, floor)
-        # What stands for the run in the object of the reservation: a run that is run again creates
-        # the same object and finds its number. Without an id, nothing is found again.
-        run = env.get("GITHUB_RUN_ID", "").strip()
-        marker = f"The build number of run {run} of {repository}" if run else f"A build of {repository} ({secrets.token_hex(8)})"
-        seconds = int(git("show", "-s", "--format=%ct", target).stdout.strip())
-        date = datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        marker, date = run_marker(env, target)
         return build_numbers.reserve(api, major, target, marker, date, seen, floor, kept_only)
+    except BuildNumberError as exc:
+        raise Failure(str(exc)) from None
+
+
+def run_marker(env: Mapping[str, str], target: str) -> tuple:
+    """What stands for the run in the object of a reservation, and the time the object carries.
+
+    A run that is run again creates the same object and finds its numbers.
+    Without an id, nothing is found again.
+    """
+    repository = env.get("GITHUB_REPOSITORY", "").strip()
+    run = env.get("GITHUB_RUN_ID", "").strip()
+    marker = f"The build number of run {run} of {repository}" if run else f"A build of {repository} ({secrets.token_hex(8)})"
+    seconds = int(git("show", "-s", "--format=%ct", target).stdout.strip())
+    return marker, datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def qa_numbers_out(version: tuple, pattern: str) -> list:
+    """(k, where) of each QA build <version>-qa.<k> that the rolling tags hold.
+
+    With `pattern`, the builds of that app: its lines, and the one build of a
+    tag from before the pattern, which may be this app's. Without it, every
+    build of every tag: the version has one counter.
+    """
+    name = re.compile(rf"{re.escape(format_version(version))}-{QA_SUFFIX}\.(?P<number>[1-9][0-9]*)")
+    found = []
+    for tag, held in rolling_tags().items():
+        if not held.builds:
+            builds = [held.name]
+        elif pattern:
+            builds = [built for app, built, _, _ in held.builds if app == pattern]
+        else:
+            builds = [held.name, *(built for _, built, _, _ in held.builds)]
+        for built in builds:
+            match = name.fullmatch(built)
+            if match:
+                found.append((int(match["number"]), f"the build {built} that {tag} holds"))
+    return found
+
+
+def qa_number(env: Mapping[str, str], call: build_numbers.Call, version: tuple, target: str, pattern: str) -> QaNumber:
+    """N of the QA build <version>-qa.<N> with build numbers, reserved for this run.
+
+    It counts the QA builds of the version from 1, those of the app of
+    asset-pattern apart, above the ones that are out. qa-sequence is not read:
+    the run number goes on across versions, so a version's first build would
+    not be 1.
+    """
+    api = repository_api(env, call)
+    marker, date = run_marker(env, target)
+    try:
+        return build_numbers.reserve_qa(api, format_version(version), pattern, target, marker, date, qa_numbers_out(version, pattern))
     except BuildNumberError as exc:
         raise Failure(str(exc)) from None
 
@@ -543,6 +594,14 @@ def formula_guard(env: Mapping[str, str], call: build_numbers.Call, major: int) 
             f"commit that is built: pass version-code-scheme: {BUILD_NUMBER} in qa.yml, release.yml and "
             "version-bump.yml of every branch that is built, and do not release a commit from before the switch"
         )
+
+
+def print_qa_number(number: QaNumber) -> None:
+    of = f"{number.version} of {number.pattern}" if number.pattern else number.version
+    if number.kept:
+        print(f"QA number {number.number} of {of} ({number.ref}): {number.why}.")
+    else:
+        print(f"QA number {number.number} of {of}, reserved as {number.ref}: {number.why}.")
 
 
 def print_build_number(number: BuildNumber) -> None:
@@ -1024,7 +1083,7 @@ def plan_qa(env: Mapping[str, str], call: build_numbers.Call = http_call) -> QaP
     if not BRANCH.fullmatch(source_branch):
         raise Failure(f"source-branch is not a branch name: {source_branch!r}")
     scheme = version_code_scheme(env)
-    checked_asset_pattern(env)
+    pattern = checked_asset_pattern(env)
 
     # Only what was merged is built: the source branch and the maintenance branches.
     branch = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ""
@@ -1104,17 +1163,21 @@ def plan_qa(env: Mapping[str, str], call: build_numbers.Call = http_call) -> QaP
             release_tag = f"qa-{line}-{label}"
             why = f"label build {number} after {released}"
         else:
-            number = whole_number(env.get("QA_SEQUENCE", "").strip(), "qa-sequence")
-            number += whole_number(env.get("QA_SEQUENCE_OFFSET", "").strip() or "0", "qa-sequence-offset", signed=True)
             kind = "qa"
             if scheme == MINOR_BLOCKS:
+                number = whole_number(env.get("QA_SEQUENCE", "").strip(), "qa-sequence")
+                number += whole_number(env.get("QA_SEQUENCE_OFFSET", "").strip() or "0", "qa-sequence-offset", signed=True)
                 code = qa_code(version[0], version[1], number)
-            elif number < 1:
-                # The number is only a name here, and a name counts from 1.
-                raise Failure(f"qa-sequence plus qa-sequence-offset is {number}, and the number of a QA build is 1 or higher")
             else:
-                code = 0
-            name = f"{format_version(version)}-{QA_SUFFIX}.{number}"
+                # Reserved below, once the plan has passed every rule.
+                number, code = 0, 0
+                offset = env.get("QA_SEQUENCE_OFFSET", "").strip()
+                if offset and not re.fullmatch(r"-?0+", offset):
+                    print(
+                        f"::warning title=release-version::qa-sequence-offset is {escape(offset)}, and version-code-scheme "
+                        f"is {BUILD_NUMBER}: the number of a QA build counts the QA builds of its version, and neither "
+                        "qa-sequence nor the offset is read. Take sequence-offset out of the calling file"
+                    )
             # A build of a version that was given is in another block of versionCodes than the
             # builds of the branch. It gets a pre-release of its own, so the rolling build of the
             # branch stays one that every device with an earlier one can take.
@@ -1124,6 +1187,12 @@ def plan_qa(env: Mapping[str, str], call: build_numbers.Call = http_call) -> QaP
 
     # Reserved last, once the plan has passed every rule: a run that is refused takes no number.
     reserved = build_number(env, call, version[0], target, keep=True) if scheme == BUILD_NUMBER else None
+    # After the build number, which may still refuse the build: a refused build leaves no gap in the names.
+    counted = qa_number(env, call, version, target, pattern) if reserved and kind == "qa" else None
+    if counted:
+        number = counted.number
+    if kind == "qa":
+        name = f"{format_version(version)}-{QA_SUFFIX}.{number}"
     if scheme == MINOR_BLOCKS:
         formula_guard(env, call, version[0])
     return QaPlan(
@@ -1140,6 +1209,7 @@ def plan_qa(env: Mapping[str, str], call: build_numbers.Call = http_call) -> QaP
         target_sha=target,
         why=why,
         build_number=reserved,
+        qa_number=counted,
     )
 
 
@@ -1276,6 +1346,8 @@ def run_qa(env: Mapping[str, str], call: build_numbers.Call = http_call) -> None
     what = "label build" if plan.kind == "label" else "QA build"
     if plan.build_number:
         print_build_number(plan.build_number)
+    if plan.qa_number:
+        print_qa_number(plan.qa_number)
     print(f"Version name: {plan.version_name} (versionCode {plan.version_code}, {what} {plan.number})")
     pattern = env.get("ASSET_PATTERN", "")
     apart = f", the APKs that {pattern} matches next to the builds of the other apps" if pattern else ""

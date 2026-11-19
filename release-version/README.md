@@ -9,7 +9,7 @@ Composite action for repositories whose versions are git tags. One input, `opera
 | `qa` | Plans a QA build of a branch head, or a label build (a named test build made after a release): the version it leads up to, its version name and versionCode, and the tag of the rolling pre-release it is published as. |
 | `changes` | Lists what a commit adds to the commit a tag names, such as the QA build before it. |
 
-The action reads and computes, with one exception. It creates no release tag, moves no rolling tag and pushes nothing: [`android-version-bump.yml`](../android-ci/README.md#android-version-bumpyml) and [`android-qa.yml`](../android-ci/README.md#android-qayml) are the workflows that do, with this action's outputs. The exception is a build number: with `version-code-scheme: build-number`, `qa` and `code` reserve one through the GitHub API, as a tag object (no tag ref) and the ref `refs/build-numbers/<major>/<n>` that names it ([Build numbers](#build-numbers)).
+The action reads and computes, with one exception. It creates no release tag, moves no rolling tag and pushes nothing: [`android-version-bump.yml`](../android-ci/README.md#android-version-bumpyml) and [`android-qa.yml`](../android-ci/README.md#android-qayml) are the workflows that do, with this action's outputs. The exception is a build number: with `version-code-scheme: build-number`, `qa` and `code` reserve one through the GitHub API, as a tag object (no tag ref) and the ref `refs/build-numbers/<major>/<n>` that names it ([Build numbers](#build-numbers)), and `qa` the number in the name of a QA build the same way, as `refs/qa-numbers/<version>/<N>` ([QA numbers](#qa-numbers)).
 
 ## Usage
 
@@ -62,19 +62,19 @@ The `release-version/v1` tag does not exist until the first release; pin a full 
 | `prerelease` | `next` | `''` | Optional. Empty plans the release. `preview` plans a preview of the same version, which has to be a new minor or major version (`X.Y.0`). See [A preview](#a-preview). |
 | `source-branch` | `next`, `qa` | `''` | For `next`, optional: the branch releases are normally cut from. When given, the commit has to be on the branch of its release line. See [Release lines](#release-lines). For `qa`, required. |
 | `tag-prefix` | all | `v` | What a release tag starts with, before `X.Y.Z`. Letters, digits and `. _ / -`, not starting with `-`; may be empty. |
-| `token` | `next` with `pr`; `next`, `code`, `qa` | `github.token` | Token that can read the pull request (`pull-requests: read`). Also the token that reads the build numbers of the major (`contents: read`; with the formula once, to [refuse a major that has them](#the-formula-next-to-build-numbers)), and with `version-code-scheme: build-number` reads the releases (`contents: read`, for `next`) and reserves a build number (`contents: write`, for `qa` and `code`). |
+| `token` | `next` with `pr`; `next`, `code`, `qa` | `github.token` | Token that can read the pull request (`pull-requests: read`). Also the token that reads the build numbers of the major (`contents: read`; with the formula once, to [refuse a major that has them](#the-formula-next-to-build-numbers)), and with `version-code-scheme: build-number` reads the releases (`contents: read`, for `next`) and reserves a build number (`contents: write`, for `qa` and `code`) and the number in the name of a QA build (`qa`). |
 | `version` | `code`, `next`, `qa` | `''` | For `code`: the version, as `X.Y.Z` or as its tag; with `kind: preview`, as `X.Y.0-preview.N`. For `next`, optional: the exact version to release instead of a bump. See [An exact version](#an-exact-version). For `qa`, optional: the version of this one build, the next minor or the next major version and later than the version the build has without it; not with `label`. See [qa](#qa). |
 | `kind` | `code` | `release` | `release`, `preview`, or `qa` for a QA build of the minor version of `version`. |
-| `qa-sequence` | `code` with `qa`, `qa` | `''` | Number of the QA build, 1 or higher. A later build has a higher number. Not read for a label build. |
-| `qa-sequence-offset` | `qa` | `''` | Optional whole number added to `qa-sequence`; may be negative. |
+| `qa-sequence` | `code` with `qa`, `qa` | `''` | Number of the QA build, 1 or higher. A later build has a higher number. Not read for a label build, nor with `build-number`: `qa` then counts the QA builds of each version itself ([QA numbers](#qa-numbers)). |
+| `qa-sequence-offset` | `qa` | `''` | Optional whole number added to `qa-sequence`; may be negative. Not read with `build-number`, and a warning says so unless it is 0. |
 | `ref` | `qa` | `''` | The full ref the build was started for, `refs/heads/<branch>`. |
 | `next-version` | `qa` | `''` | Optional. The version the branch is heading for, used while it is higher than the last release, no higher than the next major version after it, and not released. |
 | `label` | `qa` | `''` | Optional. Makes the build a label build: a named test build numbered right after the last release of its line. |
 | `since` | `changes` | `''` | Name of the tag that marks the earlier build. It need not exist. |
 | `version-code` | `changes` | `''` | Optional. The versionCode of the build that is about to be published as the `since` tag; `code-taken-by` then says whether a rolling tag holds it already, and `since-code` which versionCode the build of the `since` tag has. |
 | `release-exists` | `code` with `build-number` | `''` | Optional. `true` when the tag has a GitHub Release already: the build then keeps the number an earlier attempt of the same run reserved, and is refused when there is none ([Reserving](#reserving)). `false` or empty: a build that has not been released. The formula does not read it. |
-| `asset-pattern` | `code` with `build-number` and `release-exists: true`; `qa`, `changes` | `''` | Optional. For a repository that builds several apps (applicationIds) into one GitHub Release, one app per run: the file name pattern of the APKs the build makes (`*`, `?`, `[…]`, compared case by case). The tag then counts as released for this build only when an asset of its release matches, and a release without one gets the app's first build, unless a later release or preview of the major holds the app ([Several apps in one release](#several-apps-in-one-release)). The formula does not read it. For `qa` and `changes`, the same pattern for a rolling pre-release with a build per app: `qa` refuses one with other characters than letters, digits, `. _ -` and `* ? [ ] !`, and `changes` reads the build before from that app's line ([changes](#changes)). |
-| `version-code-scheme` | `next`, `code`, `qa` | `minor-blocks` | How a build gets its versionCode. `minor-blocks`, the default (empty is the same): [the formula](#code), from the version. `build-number`: the next [build number](#build-numbers) of the major, which `qa` and `code` reserve and `next` only looks up. The version names are the same in both. |
+| `asset-pattern` | `code` with `build-number` and `release-exists: true`; `qa`, `changes` | `''` | Optional. For a repository that builds several apps (applicationIds) into one GitHub Release, one app per run: the file name pattern of the APKs the build makes (`*`, `?`, `[…]`, compared case by case). The tag then counts as released for this build only when an asset of its release matches, and a release without one gets the app's first build, unless a later release or preview of the major holds the app ([Several apps in one release](#several-apps-in-one-release)). The formula does not read it. For `qa` and `changes`, the same pattern for a rolling pre-release with a build per app: `qa` refuses one with other characters than letters, digits, `. _ -` and `* ? [ ] !`, and with `build-number` numbers the app's QA builds apart ([QA numbers](#qa-numbers)); `changes` reads the build before from that app's line ([changes](#changes)). |
+| `version-code-scheme` | `next`, `code`, `qa` | `minor-blocks` | How a build gets its versionCode. `minor-blocks`, the default (empty is the same): [the formula](#code), from the version. `build-number`: the next [build number](#build-numbers) of the major, which `qa` and `code` reserve and `next` only looks up. The version names have the same form in both; with `build-number`, the `N` of a QA build counts the QA builds of its version ([QA numbers](#qa-numbers)). |
 | `version-code-floor` | `next`, `code`, `qa` with `build-number` | `''` | Optional. The highest versionCode of the app that is out where the repository's releases do not show it. Every build of its major is numbered above it. A build of a lower major is refused while that major has no build, and passed over with a notice once it has ([Where a major starts](#where-a-major-starts)). With `minor-blocks` it is not read, and a warning says so. |
 
 Inputs reach the script as environment variables, never through shell interpolation.
@@ -96,7 +96,7 @@ Inputs reach the script as environment variables, never through shell interpolat
 | `version-code-scheme` | `next`, `code`, `qa` | The scheme the versionCode was computed with, `minor-blocks` or `build-number`: the input without the whitespace around it, `minor-blocks` for an empty one. A later step or job compares this output, never the input. |
 | `version-name` | `qa` | The versionName of the build: `<version>-qa.<n>`, or `<version>-<label>.<k>` for a label build. |
 | `kind` | `qa` | `qa`, or `label` for a label build. |
-| `number` | `qa` | The number in the version name: `qa-sequence` plus `qa-sequence-offset`, or the `k` of a label build. |
+| `number` | `qa` | The number in the version name: `qa-sequence` plus `qa-sequence-offset`, with `build-number` the [QA number](#qa-numbers) reserved for the build, or the `k` of a label build. |
 | `line` | `qa` | The branch as it appears in names, slashes as hyphens. |
 | `major` | `qa` | The major version of the maintenance branch the build is of. Empty on the source branch. |
 | `release-tag` | `qa` | The tag of the rolling pre-release: `qa-<line>`, `qa-<line>-<label>` for a label build, `qa-<line>-<version>` when `version` was given. |
@@ -247,7 +247,7 @@ Plans a QA build for [`android-qa.yml`](../android-ci/README.md#android-qayml), 
   - before the first release, none passes: the branch builds the version it is heading for (`next-version`, or `0.0.1`), and anything above it is refused as well;
   - it is not tagged, and it is a version of the branch's line.
   The build is then published apart from the rolling build of the branch: `release-tag` ends in the version.
-- **The number** of a QA build is `qa-sequence` plus `qa-sequence-offset`, 1 to 48999. With `build-number` it is only part of the name, 1 or higher, and the versionCode is a [build number](#build-numbers); a label build is then counted from the version names of the rolling tags, without the limit of 99.
+- **The number** of a QA build is `qa-sequence` plus `qa-sequence-offset`, 1 to 48999. With `build-number` the versionCode is a [build number](#build-numbers), and the number is only part of the name: it counts the QA builds of the version from 1, of each app apart with `asset-pattern`, and is reserved like the build number ([QA numbers](#qa-numbers)); `qa-sequence` and `qa-sequence-offset` are not read. A label build is then counted from the version names of the rolling tags, without the limit of 99.
 - **A label build.** With `label`, the build is a named test build made after the last release of its line:
   - the version is the patch after that release, and `version-name` is `<version>-<label>.<k>`;
   - `version-code` is the release's code plus `k`: above the release, below its next patch;
@@ -256,7 +256,7 @@ Plans a QA build for [`android-qa.yml`](../android-ci/README.md#android-qayml), 
   - a `label` is lowercase letters, digits and single hyphens, at most 40 characters, and not the name of the line or of another kind of build (`qa`, `preview`, `release`).
 - **The outputs**: `version-name` is `<version>-qa.<n>`, or `<version>-<label>.<k>`; `kind` is `qa` or `label`, and `number` the `n` or `k`; `release-tag` is `qa-<line>`, `qa-<line>-<label>` for a label build, or `qa-<line>-<version>` when `version` was given; `major` is the major version of a maintenance branch, and empty on the source branch.
 - **An older commit is planned like any other.** Whether its build replaces what is published is the caller's decision, from the `stale` output of [`changes`](#changes).
-- **`asset-pattern`** is checked and named in the log, and changes nothing of the plan: the caller writes it into a line of the tag's message and into the name of a job, so whitespace and other characters than letters, digits, `. _ -` and `* ? [ ] !` are refused.
+- **`asset-pattern`** is checked and named in the log: the caller writes it into a line of the tag's message and into the name of a job, so whitespace and other characters than letters, digits, `. _ -` and `* ? [ ] !` are refused. With `build-number` it chooses the app's count of [QA numbers](#qa-numbers); it changes nothing else of the plan.
 
 ## changes
 
@@ -277,14 +277,14 @@ Lists what the commit `sha` adds to the commit the tag `since` names, in the for
 versionCode = X × 100000000 + n        n: the build number of the major version X, 1 to 99999999
 ```
 
-`n` counts the builds of major `X`, of every kind, in the order they are planned: QA builds, label builds, previews and releases draw from one counter. Every build installs over every build of its major planned before it; a QA build planned after the release `2.0.0` is above it, whatever the formula gave `2.0.0`. The version names, and every rule of `next` and `qa` about versions, are the same as with the formula. What changes:
+`n` counts the builds of major `X`, of every kind, in the order they are planned: QA builds, label builds, previews and releases draw from one counter. Every build installs over every build of its major planned before it; a QA build planned after the release `2.0.0` is above it, whatever the formula gave `2.0.0`. The version names have the same form, and every rule of `next` and `qa` about versions is the same as with the formula; only the `N` of a QA build is counted another way ([QA numbers](#qa-numbers)). What changes:
 
 | | formula (`minor-blocks`) | `build-number` |
 |---|---|---|
 | `version-code` of `qa` and `code` | from the version and the number | the build number reserved for the build |
 | `version-code` of `next` | the release's or preview's | the code the release would get now; nothing reserved |
 | limits | the ranges of [code](#code) | `X` 0 to 20; `n` up to 99999999 |
-| the number `N` of a QA build | 1 to 48999, part of the code | 1 or higher, part of the name only |
+| the number `N` of a QA build | `qa-sequence` plus `qa-sequence-offset`, 1 to 48999, part of the code | part of the name only: the QA builds of its version counted from 1, of each app apart ([QA numbers](#qa-numbers)) |
 | label builds after a release | at most 99, counted from the codes of the rolling tags | no limit, counted from the version names of the rolling tags (`<next patch>-<label>.<k>`) |
 | previews of a version | at most 999 | no limit |
 
@@ -296,6 +296,8 @@ versionCode = X × 100000000 + n        n: the build number of the major version
 2. It lists `refs/build-numbers/<X>/`. When one of the refs names that object, an earlier attempt of the run reserved it: the run keeps that number, and nothing is written. That holds for a plan that reserved and then failed, as for a run whose plan passed and whose build failed.
 3. With `release-exists: true` (`code` of a tag whose GitHub Release exists), a run that found no number of its own is refused here, before it reserves: a new run of a released tag would take a number above every build since, later releases included, and a device that took it would refuse those. The release is built again by running its own run again. With `asset-pattern`, that is a release that holds an APK of the app, and a release without one is refused only for a later version ([below](#several-apps-in-one-release)).
 4. Otherwise it takes the next number ([below](#where-a-major-starts)), checks [the safety rule](#the-safety-rule), and creates `refs/build-numbers/<X>/<n>` naming the object. GitHub creates a ref only when it does not exist: when another build took `n` in between, the step tries `n + 1`, up to 100 times. Any other refusal (a ruleset, the token's permission) fails the step at once, with what to do.
+
+`qa` then reserves the number in the name of a QA build with the same object ([QA numbers](#qa-numbers)).
 
 The token needs `contents: write` for that, `contents: read` to look (`next`). Every other run, the same commit's included, gets a new number. A number whose build never happens is a gap, which costs nothing. The object stands for the run, not for the call: a workflow that runs the step twice in one run for one commit gets one number for both when the calls follow each other, and two when they run at once. Call it once per run.
 
@@ -338,6 +340,18 @@ The scheme is an input, and every calling file passes its own: a branch that did
 
 A `version-code-floor` given with `minor-blocks` is not read, and a warning says so.
 
+### QA numbers
+
+With `build-number` the versionCode does not need the `N` of `<version>-qa.<N>`, so `N` is only a name, and `qa` counts it per version: the first QA build of `1.14.0` is `1.14.0-qa.1`, the next `1.14.0-qa.2`, whatever the run number. The run number goes on across versions, and gave the first QA build of `1.14.0` the name `1.14.0-qa.12`. `qa-sequence` and `qa-sequence-offset` are not read; a non-zero offset gets a warning. The formula reads both as before: its `N` is part of the code.
+
+- **One count per version**, for the rolling builds of the branch and the builds of a `version` given for one run alike: `qa-develop-1.14.0`, and `qa-develop` once the branch builds `1.14.0` itself, go on from one count. The builds after the release `v1.13.1` are of `1.13.2`, which starts at 1. Label builds are counted as before ([qa](#qa)).
+- **One count per app with `asset-pattern`**: SleepHub's builds of `1.13.1` are `1.13.1-qa.1`, `1.13.1-qa.2`, …, and SweetSleep's first is `1.13.1-qa.1` as well; each app's line of the rolling tag names its own. The build numbers stay one counter for all apps.
+- **Reserved as the build number is**, right after it, once the plan has passed every rule: the step creates `refs/qa-numbers/<version>/<N>`, or `refs/qa-numbers/<version>/app-<key>/<N>` with `asset-pattern`, naming the tag object of the run that its build number names. GitHub creates a ref only once, so two plans at the same moment (pushes in a row, whose runs are cancelled only after they planned) get two numbers, not one name twice. A run that is run again finds its ref and keeps its name. A build that the build number refuses takes no name.
+- **Where a version starts**: one above the highest of its refs and of the QA builds `<version>-qa.<k>` of it that the rolling tags (`qa-*`) hold: with `asset-pattern` the app's lines and the one build of a tag from before the pattern, which may be the app's; without it, every build. Without either, at 1. So the first build after the switch goes on above the names the run number gave (`1.14.0-qa.13` after `1.14.0-qa.12`), and a name is never given twice.
+- **`<key>`** is the pattern with every byte but a letter, a digit and `_` written as `-` and two hex digits: `SleepHub_*.apk` is `app-SleepHub_-2a-2eapk`. A pattern holds characters git refuses in a ref (`*`, `?`, `[`, `..`, a leading `.`) and that a URL quotes. The key has none, stays readable in `git ls-remote origin 'refs/qa-numbers/*'`, and no two patterns share one; `app-` keeps it apart from a number of the version's own count.
+- **The names of the published builds can have gaps**, as the versionCodes do: a number whose build is cancelled (by the run of the next push) or fails is not used again. Two plans at the same moment can also take their names in another order than their build numbers. What is published over what is decided by the versionCode ([changes](#changes)), never by the name.
+- The refs grow by one per QA build. A plan reads those of its version only, so the refs of a released version are not read again and can be deleted.
+
 ### A new repository
 
 A repository that uses `build-number` from its first build has no versionCode out, and starts at `X × 100000000 + 1`. `X` is the major of the version name: `0` before any release (`0.0.1-qa.N`, versionCodes `1`, `2`, …), `1` with `next-version: 1.0.0` (`100000001`). A repository that takes over an app released elsewhere passes that app's highest versionCode as `version-code-floor`, or starts at a higher major. How a calling repository switches is in [android-ci](../android-ci/README.md#build-numbers).
@@ -355,4 +369,4 @@ A repository that uses `build-number` from its first build has no versionCode ou
 uv run --with pytest python -m pytest release-version -q
 ```
 
-The tests run the script against throwaway git repositories and a stand-in for the pull request API. [`test_build_numbers.py`](./test_build_numbers.py) runs the build numbers against a stand-in for the GitHub API that keeps refs, tag objects and releases in memory and creates a ref only once: builds that reserve at once, a new repository, the floor, major 0 and major 21, and a QA build after a release. Whether GitHub itself creates refs under `refs/build-numbers/` for the job token and answers for the same tag object in a run that is run again is seen only in a calling repository.
+The tests run the script against throwaway git repositories and a stand-in for the pull request API. [`test_build_numbers.py`](./test_build_numbers.py) runs the build numbers against a stand-in for the GitHub API that keeps refs, tag objects and releases in memory and creates a ref only once: builds that reserve at once, a new repository, the floor, major 0 and major 21, a QA build after a release, and the QA numbers of each version and app. Whether GitHub itself creates refs under `refs/build-numbers/` and `refs/qa-numbers/` for the job token and answers for the same tag object in a run that is run again is seen only in a calling repository.
