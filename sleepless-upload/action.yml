@@ -1,0 +1,167 @@
+name: sleepless-upload
+description: >-
+  Upload a build (an APK or an ipa) to Sleepless (GADS), the QA team's
+  regression system: a token from POST /oauth/token, then the file with
+  POST /apps.
+
+# The connection is read from the environment of the step, as the caller sets
+# it from the organization's values:
+#   GADS_URL, GADS_CLIENT_ID, GADS_TENANT   organization variables
+#   GADS_CLIENT_SECRET                      organization secret
+inputs:
+  file:
+    description: Path of the file to upload, an .apk or an .ipa.
+    required: true
+  description:
+    description: >-
+      What the Sleepless dashboard shows for the build, such as
+      "HeySleep 2.0.1-qa.57 (200000123)". " · <ref> <commit>" is added from
+      ref and sha.
+    required: true
+  ref:
+    description: >-
+      The branch or tag added to the description. Empty adds none.
+    required: false
+    default: ${{ github.ref_name }}
+  sha:
+    description: >-
+      The commit added to the description, as its first seven characters.
+      Empty adds none.
+    required: false
+    default: ${{ github.sha }}
+  max-time:
+    description: >-
+      Seconds one upload attempt may take, from the first byte sent to the
+      answer: curl's --max-time. A failed attempt is made again only while
+      this much time has not passed since the first one began, so the upload
+      takes at most about twice as long.
+    required: false
+    default: '900'
+
+outputs:
+  http-code:
+    description: The HTTP status Sleepless answered the upload with, 000 for none.
+    value: ${{ steps.upload.outputs.http-code }}
+
+runs:
+  using: composite
+  steps:
+    - name: Upload to Sleepless
+      id: upload
+      shell: bash
+      env:
+        FILE: ${{ inputs.file }}
+        DESC: ${{ inputs.description }}
+        REF: ${{ inputs.ref }}
+        SHA: ${{ inputs.sha }}
+        MAX_TIME: ${{ inputs.max-time }}
+      run: |
+        set -euo pipefail
+        # Every file and directory the step makes is the runner's user's alone:
+        # the secret, the token, and the answers curl writes (the answer to
+        # the token request holds the token). No other user of the host reads
+        # them, whatever umask the runner has.
+        umask 077
+        missing=""
+        for name in GADS_URL GADS_CLIENT_ID GADS_CLIENT_SECRET GADS_TENANT; do
+          if [[ -z "${!name:-}" ]]; then
+            missing="${missing:+$missing, }$name"
+          fi
+        done
+        if [[ -n "$missing" ]]; then
+          echo "::error title=Sleepless settings missing::Empty: $missing. GADS_URL, GADS_CLIENT_ID and GADS_TENANT are organization variables and GADS_CLIENT_SECRET an organization secret; the step that uses this action passes them as environment variables."
+          exit 1
+        fi
+        if [[ -z "$FILE" || ! -f "$FILE" ]]; then
+          echo "::error title=No file to upload::The file to upload does not exist: ${FILE:-the input file is empty}."
+          exit 1
+        fi
+        if [[ ! "$MAX_TIME" =~ ^[1-9][0-9]{0,4}$ ]]; then
+          echo "::error title=Invalid input::max-time is '$MAX_TIME'. It is a whole number of seconds."
+          exit 1
+        fi
+
+        work="$RUNNER_TEMP/sleepless-upload"
+        mkdir -p "$work"
+        # Also when an earlier step or job left the directory with other modes.
+        chmod 700 "$work"
+        url="${GADS_URL%/}"
+        auth="$work/auth.json"
+        answer="$work/token.json"
+        header="$work/header"
+        response="$work/response"
+        # The secret, the token and the answers are files of the runner's user
+        # only, and gone when the step ends, however it ends. Neither value is
+        # ever on a command line.
+        trap 'rm -f "$auth" "$answer" "$header" "$response"' EXIT
+
+        python3 -I -c 'import json, os; print(json.dumps({k: os.environ["GADS_" + k.upper()] for k in ("client_id", "client_secret", "tenant")}))' > "$auth"
+        if code=$(curl -sS --max-time 30 --retry 2 --retry-connrefused \
+          -o "$answer" -w '%{http_code}' \
+          -X POST -H 'Content-Type: application/json' --data @"$auth" "$url/oauth/token"); then
+          status=0
+        else
+          status=$?
+        fi
+        if [[ "$code" != 2?? ]]; then
+          if [[ "$code" == 000 || -z "$code" ]]; then
+            echo "::error title=Sleepless token request failed::No answer from GADS_URL (curl exit $status). The upload runs on a runner inside the office network."
+          else
+            echo "::error title=Sleepless token request failed::HTTP $code. Check GADS_CLIENT_ID, GADS_CLIENT_SECRET and GADS_TENANT."
+            head -c 500 "$answer" 2>/dev/null || true
+            echo
+          fi
+          exit 1
+        fi
+        token=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("access_token") or "")' "$answer" 2>/dev/null) || token=""
+        rm -f "$answer"
+        if [[ -z "$token" ]]; then
+          echo "::error title=Sleepless token request failed::The answer (HTTP $code) has no access_token."
+          exit 1
+        fi
+        echo "::add-mask::$token"
+        printf 'Authorization: Bearer %s\n' "$token" > "$header"
+        token=""
+
+        # " · <ref> <commit>", from what is given.
+        place="$REF${SHA:+${REF:+ }${SHA:0:7}}"
+        description="$DESC${place:+ · $place}"
+        # -F reads options after a ; and a , of a file name, unless the name
+        # is quoted; --form-string sends the description as it is, also when
+        # it starts with @ or <, which -F would read as a file.
+        quoted=${FILE//\\/\\\\}
+        quoted=${quoted//\"/\\\"}
+        if code=$(curl -sS --max-time "$MAX_TIME" --retry 2 --retry-connrefused --retry-max-time "$MAX_TIME" \
+          -o "$response" -w '%{http_code}' \
+          -X POST -H @"$header" -F "file=@\"$quoted\"" --form-string "description=$description" "$url/apps"); then
+          status=0
+        else
+          status=$?
+        fi
+        echo "http-code=${code:-000}" >> "$GITHUB_OUTPUT"
+        if [[ -s "$response" ]]; then
+          head -c 2000 "$response"
+          echo
+        fi
+        size=$(wc -c < "$FILE" | tr -d ' ')
+        case "$code" in
+          2??)
+            echo "Uploaded $(basename "$FILE") ($size bytes) to Sleepless (HTTP $code): $description"
+            ;;
+          000|'')
+            if [[ "$status" == 28 ]]; then
+              echo "::error title=Sleepless upload failed::No answer within max-time ($MAX_TIME seconds) for $(basename "$FILE"), $size bytes. Raise max-time when the network to GADS_URL is that slow."
+            else
+              echo "::error title=Sleepless upload failed::No answer from GADS_URL (curl exit $status)."
+            fi
+            exit 1
+            ;;
+          413)
+            echo "::error title=Sleepless upload failed::HTTP 413: Sleepless refuses a file of $size bytes. Its size limit is the QA team's setting."
+            exit 1
+            ;;
+          *)
+            echo "::error title=Sleepless upload failed::HTTP $code for $(basename "$FILE"), $size bytes."
+            exit 1
+            ;;
+        esac

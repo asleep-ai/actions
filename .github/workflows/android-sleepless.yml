@@ -1,0 +1,978 @@
+name: Android Sleepless upload
+
+# Reusable upload of an APK of the calling repository's GitHub Releases to
+# Sleepless (GADS), the QA team's regression system: the APK of the rolling
+# pre-release of a QA build (qa-develop), of a label build, of a preview or of
+# a release, named by its tag. Sleepless installs the build on its devices,
+# runs the regression and reports; this workflow ends with the upload.
+#
+# Which builds go up. Sleepless switches to a build only when it is higher
+# than the one it has of the same app, and a higher one stops the regression
+# that runs. So an APK is uploaded only when its versionCode is above every
+# versionCode uploaded before for its package, the applicationId read from
+# the APK. Each upload is recorded as the ref
+# refs/sleepless/<package>/<versionCode>, created through the API once the
+# upload has succeeded; GitHub creates a ref only when it does not exist, as
+# for the build numbers of release-version.
+#
+# Where. GADS_URL is in the office network, which no GitHub-hosted runner
+# reaches. The upload job runs on the self-hosted labels (runner-labels) and
+# on nothing else. The plan, on a GitHub-hosted runner, asks pick-runner
+# whether a runner with those labels is online; when none is, the upload is
+# skipped with a warning, and the run does not fail. There is no
+# GitHub-hosted fallback.
+#
+# The run is a run of its own, which the calling repository starts (on a
+# schedule, after its release workflow, by hand), so an upload that fails is
+# no part of any check of a build or a release. It fails this run: nothing
+# was uploaded and nothing was recorded, and the next run tries again.
+#
+# The caller's contract, every input and the secrets are in
+# android-ci/README.md.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: >-
+          The tag of the GitHub Release whose APK is uploaded: the rolling
+          pre-release of a QA build (qa-develop), of a label build
+          (qa-develop-ble-test) or of a version (qa-develop-2.1.0), a preview
+          (v2.1.0-preview.1) or a release (v2.0.0).
+        required: true
+        type: string
+      app:
+        description: >-
+          The name of the app in the dashboard's description of the build:
+          "<app> <versionName> (<versionCode>) · <tag> <commit>".
+        required: true
+        type: string
+      asset:
+        description: >-
+          Which APK of the release is uploaded, as a file name pattern that
+          exactly one APK of it matches, such as HeySleep_brand_*.apk. Empty:
+          the release has to hold one APK.
+        required: false
+        type: string
+        default: ''
+      runner-labels:
+        description: >-
+          The runs-on labels of the upload job, as a JSON array of strings
+          that holds self-hosted: runners in the office network, which reach
+          GADS_URL. When none of them is online, nothing is uploaded. There is
+          no GitHub-hosted fallback.
+        required: false
+        type: string
+        default: '["self-hosted","threadripper"]'
+      upload-max-time:
+        description: >-
+          Seconds one upload attempt may take, from 60 to 1500: max-time of
+          sleepless-upload. An attempt is made again only within that time
+          from the first one, so the upload takes at most twice as long, and
+          two of 1500 seconds still fit in the 60 minutes of the upload job.
+        required: false
+        type: number
+        default: 900
+    # Passed by name. GADS_URL, GADS_CLIENT_ID and GADS_TENANT are variables,
+    # which a called workflow reads from the caller without being passed.
+    secrets:
+      GADS_CLIENT_SECRET:
+        description: >-
+          The organization secret of Sleepless's CI client. Given to the
+          upload step alone.
+        required: false
+      RUNNER_READ_TOKEN:
+        description: >-
+          Token with the organization permission "Self-hosted runners" (read),
+          for pick-runner. Without it the labels are used unchecked, and the
+          upload job waits for a runner that may be offline.
+        required: false
+    outputs:
+      uploaded:
+        description: true when the APK was uploaded in this run, else false.
+        value: ${{ jobs.upload.outputs.uploaded == 'true' }}
+      version-code:
+        description: The versionCode of the APK, read from it. Empty when the plan did not get that far.
+        value: ${{ jobs.plan.outputs.version-code }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Everything that can be decided without the office network, on a
+  # GitHub-hosted runner: the inputs and the settings, the APK of the release,
+  # what it is (package, versionName, versionCode, read from the APK itself,
+  # which is what Sleepless reads), whether it is newer than every upload of
+  # its package, and whether a runner that reaches GADS_URL is online.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # The release, its tag and the refs of the uploads.
+      contents: read
+    outputs:
+      asset-id: ${{ steps.find.outputs.asset-id }}
+      asset-name: ${{ steps.find.outputs.asset-name }}
+      commit: ${{ steps.find.outputs.commit }}
+      size: ${{ steps.download.outputs.size }}
+      sha256: ${{ steps.download.outputs.sha256 }}
+      package: ${{ steps.read.outputs.package }}
+      version-code: ${{ steps.read.outputs.version-code }}
+      version-name: ${{ steps.read.outputs.version-name }}
+      run: ${{ steps.where.outputs.run }}
+    steps:
+      # The settings are checked by whether they are empty: their values are
+      # for the upload step only, on the runner in the office network.
+      - name: Check the inputs and the settings
+        env:
+          TAG: ${{ inputs.tag }}
+          APP: ${{ inputs.app }}
+          LABELS: ${{ inputs.runner-labels }}
+          MAX_TIME: ${{ inputs.upload-max-time }}
+          GADS_URL_SET: ${{ vars.GADS_URL != '' }}
+          GADS_CLIENT_ID_SET: ${{ vars.GADS_CLIENT_ID != '' }}
+          GADS_TENANT_SET: ${{ vars.GADS_TENANT != '' }}
+          GADS_CLIENT_SECRET_SET: ${{ secrets.GADS_CLIENT_SECRET != '' }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error title=Invalid input::tag is '$TAG'. It is the tag of a GitHub Release of this repository, such as qa-develop or v2.0.0."
+            exit 1
+          fi
+          if [[ -z "${APP//[[:space:]]/}" || "$APP" == *$'\n'* || "${#APP}" -gt 60 ]]; then
+            echo "::error title=Invalid input::app is '$APP'. It is the name of the app in the dashboard, one line of at most 60 characters."
+            exit 1
+          fi
+          if [[ ! "$MAX_TIME" =~ ^[0-9]{1,4}$ ]] || (( 10#$MAX_TIME < 60 || 10#$MAX_TIME > 1500 )); then
+            echo "::error title=Invalid input::upload-max-time is $MAX_TIME. It is a whole number of seconds from 60 to 1500: two attempts have to fit in the 60 minutes of the upload job."
+            exit 1
+          fi
+          # A label of a GitHub-hosted runner would send the job where
+          # GADS_URL does not answer.
+          if ! python3 -I -c 'import json, os, sys; labels = json.loads(os.environ["LABELS"]); sys.exit(not (isinstance(labels, list) and labels and all(isinstance(label, str) and label.strip() == label != "" for label in labels) and "self-hosted" in [label.casefold() for label in labels]))' 2>/dev/null; then
+            echo "::error title=Invalid input::runner-labels is $LABELS. It is a JSON array of labels that holds self-hosted, such as [\"self-hosted\",\"threadripper\"]: the upload runs on a runner in the office network only."
+            exit 1
+          fi
+          missing=""
+          for name in GADS_URL GADS_CLIENT_ID GADS_TENANT GADS_CLIENT_SECRET; do
+            set_name="${name}_SET"
+            if [[ "${!set_name}" != true ]]; then
+              missing="${missing:+$missing, }$name"
+            fi
+          done
+          if [[ -n "$missing" ]]; then
+            echo "::error title=Sleepless settings missing::Empty: $missing. GADS_URL, GADS_CLIENT_ID and GADS_TENANT are organization variables the repository has to see, and GADS_CLIENT_SECRET an organization secret the calling file passes by name (secrets: GADS_CLIENT_SECRET)."
+            exit 1
+          fi
+          echo "tag $TAG, app $APP, runner labels $LABELS, upload-max-time $MAX_TIME seconds."
+
+      # The commit the tag names, and the APK of its release. A rolling tag
+      # of android-qa.yml is an annotated tag whose message names the build
+      # its pre-release holds, "<version name> (<versionCode>)": the step
+      # hands that code on, and the APK has to have it.
+      #
+      # While a QA build replaces the APK of a rolling pre-release, the
+      # release holds the old APK and the new one for a while. The new one
+      # is the APK whose name holds the version the tag names. When the names
+      # do not tell, the release is read again until the replacing is done,
+      # for two minutes at most. Several APKs of a release tag, or of one
+      # build, are an error at once: no replacing ends that.
+      #
+      # python3 -I: the script comes from standard input, and without -I
+      # Python would look for the modules it imports in the work folder first.
+      - name: Find the APK
+        id: find
+        env:
+          TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ASSET: ${{ inputs.asset }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'FIND'
+          import fnmatch
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ.get("TOKEN", "").strip()
+          tag = os.environ["TAG"]
+          pattern = os.environ.get("ASSET", "").strip()
+          # The names android-release-build.yml allows for the APKs of a release.
+          NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.apk")
+          # An APK that the publish job of android-qa.yml uploaded next to the one of the same
+          # name, for the moment before it takes that name: <name>.run-<run id>-<attempt>.apk.
+          STAGED = re.compile(r".+\.run-[0-9]+-[0-9]+\.apk")
+
+
+          def get(path):
+              request = urllib.request.Request(
+                  f"{api}/repos/{repository}/{path}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "asleep-ai-actions-android-ci",
+                  },
+              )
+              request.add_unredirected_header("Authorization", f"Bearer {token}")
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return 200, json.load(response)
+              except urllib.error.HTTPError as error:
+                  return error.code, None
+              except (OSError, ValueError) as error:
+                  sys.exit(f"::error::Cannot read {path} of {repository}: {error}")
+
+
+          def fail(message):
+              print(f"::error title=No APK to upload::{message}", flush=True)
+              sys.exit(1)
+
+
+          quoted = urllib.parse.quote(tag, safe="")
+          status, ref = get(f"git/ref/tags/{quoted}")
+          if status == 404:
+              fail(f"There is no tag {tag} in {repository}.")
+          if status != 200 or not isinstance(ref, dict):
+              fail(f"Cannot read the tag {tag}: HTTP {status}.")
+          target, message = ref.get("object") or {}, None
+          # An annotated tag names a tag object, which names the commit.
+          for _ in range(5):
+              if not isinstance(target, dict) or target.get("type") != "tag":
+                  break
+              status, annotated = get(f"git/tags/{target.get('sha')}")
+              if status != 200 or not isinstance(annotated, dict):
+                  fail(f"Cannot read the tag object of {tag}: HTTP {status}.")
+              if message is None:
+                  message = str(annotated.get("message") or "")
+              target = annotated.get("object") or {}
+          commit = target.get("sha") if isinstance(target, dict) else None
+          if not isinstance(target, dict) or target.get("type") != "commit" or not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+              fail(f"The tag {tag} does not name a commit.")
+          lines = (message or "").strip().splitlines()
+          named = re.fullmatch(r"(.+) \(([1-9][0-9]*)\)", lines[0].strip()) if lines else None
+          tag_name, tag_code = (named[1], named[2]) if named else ("", "")
+
+
+          def of_the_tag(name):
+              """Whether a file name names the build the rolling tag names, as <App>_<kind>_<versionName>_<versionCode>.apk
+              does: its versionCode or its version name as a part between _ and -, or the ends."""
+              stem = name[: -len(".apk")]
+              if tag_code in re.split(r"[_-]", stem):
+                  return True
+              return re.search(rf"(?:^|[_-]){re.escape(tag_name)}(?:[_-]|$)", stem) is not None
+
+
+          def choose(release, last):
+              """(the APK, None), (None, why there is none), or (None, None): read the release again."""
+              assets = [item for item in release.get("assets") or [] if isinstance(item, dict) and isinstance(item.get("name"), str)]
+              apks = [item for item in assets if item["name"].lower().endswith(".apk")]
+              uploaded = [item for item in apks if item.get("state", "uploaded") == "uploaded"]
+              names = ", ".join(item["name"] for item in uploaded) or "none"
+              matching = [item for item in apks if not pattern or fnmatch.fnmatchcase(item["name"], pattern)]
+              candidates = [item for item in matching if item in uploaded and not STAGED.fullmatch(item["name"])]
+              which = f" that match '{pattern}'" if pattern else ""
+
+              def several(found):
+                  return (
+                      f"The release {tag} holds {len(found)} APKs{which}: {', '.join(item['name'] for item in found)}. "
+                      "Name the one to upload with asset, a file name pattern that one of them matches."
+                  )
+
+              if tag_code:
+                  # The publish job of android-qa.yml moves the tag first, uploads the new APKs next to
+                  # the old ones and deletes the old ones last. The tag names the new build all along,
+                  # and so does the name of a new APK that holds its version.
+                  ours = [item for item in candidates if of_the_tag(item["name"])]
+                  if len(ours) == 1:
+                      others = [item["name"] for item in candidates if item is not ours[0]]
+                      if others:
+                          print(
+                              f"{tag} also holds {', '.join(others)}, of the build before: the QA build that moved the tag "
+                              f"to {tag_name} ({tag_code}) is replacing it. {ours[0]['name']} is of {tag_name}."
+                          )
+                      return ours[0], None
+                  if ours:
+                      # Several APKs of the one build: no replacing ends that.
+                      return None, several(ours)
+                  # The names do not tell. The APK is being replaced while one of them is still going
+                  # up, while a copy is about to take the name of the old one, or while there are several.
+                  if not last and (len(candidates) > 1 or any(item not in candidates for item in matching)):
+                      return None, None
+              if len(candidates) == 1:
+                  return candidates[0], None
+              if not candidates and pattern:
+                  return None, f"No APK of the release {tag} matches asset '{pattern}'. Its APKs: {names}."
+              if not candidates:
+                  return None, f"The release {tag} holds no APK. Its APKs: {names}."
+              return None, several(candidates)
+
+
+          # A replacing takes the publish job the upload of the new APKs and a few calls; for one APK
+          # of some hundred MB, from a GitHub-hosted runner, well within the two minutes this waits.
+          # A release that is still in between after that stays as it is until the publish job is run
+          # again: the choice is then made as for any release, and fails when there is no one APK.
+          READS = 9
+          pause = float(os.environ.get("RELEASE_POLL_SECONDS") or 15)
+          for read in range(1, READS + 1):
+              status, release = get(f"releases/tags/{quoted}")
+              if status == 404:
+                  fail(f"The tag {tag} has no published GitHub Release, so there is no APK to upload. A draft is not found by its tag.")
+              if status != 200 or not isinstance(release, dict):
+                  fail(f"Cannot read the release {tag}: HTTP {status}.")
+              asset, why = choose(release, read == READS)
+              if asset or why:
+                  break
+              print(
+                  f"The release {tag} is being replaced by {tag_name} ({tag_code}), the build its tag names: reading it "
+                  f"again in {pause:g} seconds ({read} of {READS - 1}).",
+                  flush=True,
+              )
+              time.sleep(pause)
+          if why:
+              fail(why)
+          if not NAME.fullmatch(asset["name"]):
+              fail(f"{asset['name']} of {tag} has a name of other characters than letters, digits and . _ -.")
+          if not isinstance(asset.get("id"), int) or not isinstance(asset.get("size"), int):
+              fail(f"The release {tag} lists {asset['name']} without an id and a size.")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"asset-id={asset['id']}\nasset-name={asset['name']}\ncommit={commit}\ntag-code={tag_code}\n")
+          named_code = f", whose tag names versionCode {tag_code}" if tag_code else ""
+          print(f"{tag} is {commit[:7]}{named_code}. The APK: {asset['name']}, {asset['size']} bytes (asset {asset['id']}).")
+          FIND
+
+      # The whole APK, read here and again on the runner that uploads it.
+      # GitHub answers the asset's address with the address of the file,
+      # elsewhere: the token is not sent there. A file that is gone by now was
+      # replaced by the publishing of a newer build, and nothing is uploaded.
+      # The job that uploads runs the same script, and checks that it got the
+      # same bytes: android-ci's tests fail when the copies differ.
+      - name: Download the APK
+        id: download
+        env:
+          TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ASSET_ID: ${{ steps.find.outputs.asset-id }}
+          ASSET_NAME: ${{ steps.find.outputs.asset-name }}
+          EXPECTED_SIZE: ''
+          EXPECTED_SHA256: ''
+        run: |
+          set -euo pipefail
+          python3 -I - <<'DOWNLOAD'
+          import hashlib
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ.get("TOKEN", "").strip()
+          tag = os.environ["TAG"]
+          asset_id, name = os.environ.get("ASSET_ID", ""), os.environ.get("ASSET_NAME", "")
+          expected_size, expected_sha256 = os.environ.get("EXPECTED_SIZE", ""), os.environ.get("EXPECTED_SHA256", "")
+
+
+          def output(**values):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  for key, value in values.items():
+                      out.write(f"{key}={value}\n")
+
+
+          if not re.fullmatch(r"[1-9][0-9]*", asset_id) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.apk", name):
+              sys.exit(f"::error title=The plan is incomplete::asset-id '{asset_id}', asset-name '{name}'.")
+          directory = os.path.join(os.environ["RUNNER_TEMP"], "android-sleepless")
+          os.makedirs(directory, exist_ok=True)
+          path = os.path.join(directory, name)
+          request = urllib.request.Request(
+              f"{api}/repos/{repository}/releases/assets/{asset_id}",
+              headers={
+                  "Accept": "application/octet-stream",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "asleep-ai-actions-android-ci",
+              },
+          )
+          # Not handed on to the address of the file.
+          request.add_unredirected_header("Authorization", f"Bearer {token}")
+          digest, size = hashlib.sha256(), 0
+          try:
+              with urllib.request.urlopen(request, timeout=60) as response, open(path, "wb") as out:
+                  while True:
+                      chunk = response.read(1 << 20)
+                      if not chunk:
+                          break
+                      out.write(chunk)
+                      digest.update(chunk)
+                      size += len(chunk)
+          except urllib.error.HTTPError as error:
+              if error.code == 404:
+                  print(
+                      f"::warning title=The APK is gone::{name} of {tag} is not there any more: a newer build was "
+                      f"published as {tag} while this run read it. Nothing is uploaded. Start the workflow again to "
+                      f"upload what {tag} holds now."
+                  )
+                  output(found="false")
+                  sys.exit(0)
+              sys.exit(f"::error::Cannot download {name} of {tag}: HTTP {error.code}.")
+          except OSError as error:
+              sys.exit(f"::error::Cannot download {name} of {tag}: {error}")
+          sha256 = digest.hexdigest()
+          if expected_size and (str(size) != expected_size or sha256 != expected_sha256):
+              sys.exit(
+                  f"::error title=Not the APK of the plan::{name} of {tag} is {size} bytes with sha256 {sha256}, and "
+                  f"the plan read {expected_size} bytes with sha256 {expected_sha256}. Nothing is uploaded."
+              )
+          print(f"Downloaded {name} of {tag}: {size} bytes, sha256 {sha256}.")
+          output(found="true", path=path, size=size, sha256=sha256)
+          DOWNLOAD
+
+      # What Sleepless reads from the file: the package, the versionCode and
+      # the versionName. aapt2 is the highest build-tools version of the
+      # runner's Android SDK, as for the check of the APKs of a build.
+      - name: Read the APK
+        id: read
+        if: ${{ steps.download.outputs.found == 'true' }}
+        env:
+          APK: ${{ steps.download.outputs.path }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'READ'
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          apk = os.environ["APK"]
+          sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
+          found = []
+          if sdk:
+              found = [path for path in Path(sdk, "build-tools").glob("*/aapt2") if path.is_file() and os.access(path, os.X_OK)]
+          if not found:
+              sys.exit("::error::aapt2 was not found under the build-tools of ANDROID_HOME or ANDROID_SDK_ROOT.")
+          aapt2 = max(found, key=lambda path: [int(part) for part in re.findall(r"[0-9]+", path.parent.name)])
+          badging = subprocess.run([str(aapt2), "dump", "badging", apk], capture_output=True, text=True, check=False)
+          line = next((line for line in badging.stdout.splitlines() if line.startswith("package: ")), "")
+          if badging.returncode != 0 or not line:
+              sys.exit(f"::error::{aapt2} cannot read {os.path.basename(apk)}: {badging.stderr.strip()[:300]}")
+
+
+          def attribute(key):
+              match = re.search(rf"\b{key}='([^']*)'", line)
+              return match[1] if match else ""
+
+
+          package, code, name = attribute("name"), attribute("versionCode"), attribute("versionName")
+          print(f"{os.path.basename(apk)}: package {package}, versionName {name}, versionCode {code} ({aapt2.parent.name}).")
+          if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+", package):
+              sys.exit(f"::error::{os.path.basename(apk)} has no package name aapt2 can read: '{package}'.")
+          if not re.fullmatch(r"[1-9][0-9]{0,9}", code):
+              sys.exit(f"::error::{os.path.basename(apk)} has no versionCode aapt2 can read: '{code}'.")
+          if not re.fullmatch(r"[!-~]([ -~]{0,98}[!-~])?", name):
+              sys.exit(f"::error::{os.path.basename(apk)} has a versionName the dashboard cannot show: '{name}'.")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"package={package}\nversion-code={code}\nversion-name={name}\n")
+          READ
+
+      # Whether the APK is newer than every APK of its package that was
+      # uploaded: Sleepless does not switch to the same build or a lower one.
+      # The uploads are the refs refs/sleepless/<package>/<versionCode>. The
+      # job that uploads asks again, with the same script, right before the
+      # upload: android-ci's tests fail when the copies differ.
+      - name: Compare with the uploads
+        id: uploads
+        if: ${{ steps.download.outputs.found == 'true' }}
+        env:
+          TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          PACKAGE: ${{ steps.read.outputs.package }}
+          VERSION_CODE: ${{ steps.read.outputs.version-code }}
+          TAG_CODE: ${{ steps.find.outputs.tag-code }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'UPLOADS'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ.get("TOKEN", "").strip()
+          tag = os.environ["TAG"]
+          package, code, tag_code = os.environ.get("PACKAGE", ""), os.environ.get("VERSION_CODE", ""), os.environ.get("TAG_CODE", "")
+          NEXT_PAGE = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
+
+
+          def output(upload, last=""):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write(f"upload={'true' if upload else 'false'}\nlast-code={last}\n")
+
+
+          if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+", package) or not re.fullmatch(r"[1-9][0-9]*", code):
+              sys.exit(f"::error title=The plan is incomplete::package '{package}', versionCode '{code}'.")
+          # The rolling tag was moved to a newer build after its APK was chosen, and that build's
+          # APK is not the one read: the pre-release is being replaced.
+          if tag_code and tag_code != code:
+              print(
+                  f"::warning title=The pre-release is being replaced::{tag} names the build {tag_code}, and the APK "
+                  f"read is {code}: a newer build is being published as {tag}. Nothing is uploaded. Start the "
+                  "workflow again once it is published."
+              )
+              output(False)
+              sys.exit(0)
+
+          prefix = f"refs/sleepless/{package}/"
+          url = f"{api}/repos/{repository}/git/matching-refs/sleepless/{package}/"
+          uploaded = []
+          while url:
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "asleep-ai-actions-android-ci",
+                  },
+              )
+              request.add_unredirected_header("Authorization", f"Bearer {token}")
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      document = json.load(response)
+                      link = response.headers.get("Link") or ""
+              except urllib.error.HTTPError as error:
+                  sys.exit(f"::error::Cannot list the uploads of {package} ({prefix}*): HTTP {error.code}.")
+              except (OSError, ValueError) as error:
+                  sys.exit(f"::error::Cannot list the uploads of {package} ({prefix}*): {error}")
+              if not isinstance(document, list):
+                  sys.exit(f"::error::Cannot list the uploads of {package} ({prefix}*): the answer is no list.")
+              for item in document:
+                  match = re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*)", str(item.get("ref", "")) if isinstance(item, dict) else "")
+                  if match:
+                      uploaded.append(int(match[1]))
+              following = NEXT_PAGE.search(link)
+              url = following[1] if following else ""
+              # The token goes with every page: only to the API it is for.
+              if url and not url.startswith(f"{api}/"):
+                  sys.exit(f"::error::The next page of the uploads of {package} is not on {api}: {url}")
+
+          last = max(uploaded, default=0)
+          if int(code) in uploaded:
+              print(
+                  f"::notice title=Uploaded already::{package} {code} ({tag}) was uploaded to Sleepless before "
+                  f"({prefix}{code}). Nothing is uploaded: Sleepless does not switch to a build it has."
+              )
+              output(False, last)
+          elif int(code) < last:
+              print(
+                  f"::notice title=Not newer than the last upload::{package} {code} ({tag}) is below {last}, the "
+                  f"last versionCode of {package} uploaded to Sleepless. Nothing is uploaded: Sleepless switches to "
+                  "a higher build only."
+              )
+              output(False, last)
+          else:
+              before = f"above {last}, the last upload of {package}" if last else f"the first upload of {package}"
+              print(f"{package} {code} ({tag}) is to be uploaded: {before}.")
+              output(True, last or "")
+          UPLOADS
+
+      - name: Pick the runner
+        id: pick
+        if: ${{ steps.uploads.outputs.upload == 'true' }}
+        uses: asleep-ai/actions/pick-runner@pick-runner/v1
+        with:
+          labels: ${{ inputs.runner-labels }}
+          token: ${{ secrets.RUNNER_READ_TOKEN }}
+          # Never used: without an online runner the upload is skipped.
+          fallback: ubuntu-latest
+
+      # pick-runner's warning for no online runner says that the run goes to
+      # the fallback. Here nothing does: the upload job is skipped, and this
+      # step says so. A check that could not be made (no token) leaves the
+      # labels, as pick-runner does everywhere, and the job waits for one of
+      # those runners.
+      - name: Decide where the upload runs
+        id: where
+        env:
+          TAG: ${{ inputs.tag }}
+          LABELS: ${{ inputs.runner-labels }}
+          FOUND: ${{ steps.download.outputs.found }}
+          UPLOAD: ${{ steps.uploads.outputs.upload }}
+          LAST_CODE: ${{ steps.uploads.outputs.last-code }}
+          SELF_HOSTED: ${{ steps.pick.outputs.self-hosted }}
+          ASSET_NAME: ${{ steps.find.outputs.asset-name }}
+          COMMIT: ${{ steps.find.outputs.commit }}
+          PACKAGE: ${{ steps.read.outputs.package }}
+          VERSION_NAME: ${{ steps.read.outputs.version-name }}
+          VERSION_CODE: ${{ steps.read.outputs.version-code }}
+        run: |
+          set -euo pipefail
+          run=false
+          if [[ "$FOUND" != true ]]; then
+            outcome="Not uploaded: the APK was replaced while this run read it."
+          elif [[ "$UPLOAD" != true && -z "$PACKAGE" ]]; then
+            outcome="Not uploaded."
+          elif [[ "$UPLOAD" != true && -n "$LAST_CODE" && "$LAST_CODE" != 0 ]]; then
+            outcome="Not uploaded: Sleepless has $LAST_CODE of $PACKAGE, and this build is not higher."
+          elif [[ "$UPLOAD" != true ]]; then
+            outcome="Not uploaded: the pre-release is being replaced by a newer build."
+          elif [[ "$SELF_HOSTED" == true ]]; then
+            run=true
+            outcome="To be uploaded by the job \`upload\`, on a runner with the labels \`$LABELS\`."
+          else
+            outcome="Not uploaded: no runner with the labels \`$LABELS\` is online."
+            echo "::warning title=Sleepless upload skipped::No runner with the labels $LABELS is online, and only such a runner reaches GADS_URL. $VERSION_NAME ($VERSION_CODE) of $TAG is not uploaded: the next run uploads it, or start this workflow again once a runner is back. pick-runner's warning names a GitHub-hosted runner; none is used."
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Sleepless upload of \`$TAG\`"
+            echo
+            if [[ -n "$PACKAGE" ]]; then
+              echo "| APK | package | version | commit | last upload |"
+              echo "|-----|---------|---------|--------|-------------|"
+              echo "| $ASSET_NAME | $PACKAGE | $VERSION_NAME ($VERSION_CODE) | \`${COMMIT:0:7}\` | ${LAST_CODE:-none} |"
+              echo
+            fi
+            echo "$outcome"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$outcome"
+
+  # On a runner in the office network, and nowhere else: the labels as they
+  # were given, never a fallback. It runs no code of the repository and checks
+  # nothing out. The secret is in the environment of the upload step alone.
+  upload:
+    needs: plan
+    if: ${{ needs.plan.outputs.run == 'true' }}
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
+    timeout-minutes: 60
+    permissions:
+      # The ref that records the upload.
+      contents: write
+    outputs:
+      uploaded: ${{ steps.upload.outcome == 'success' }}
+    steps:
+      - name: Download the APK
+        id: download
+        env:
+          TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ASSET_ID: ${{ needs.plan.outputs.asset-id }}
+          ASSET_NAME: ${{ needs.plan.outputs.asset-name }}
+          EXPECTED_SIZE: ${{ needs.plan.outputs.size }}
+          EXPECTED_SHA256: ${{ needs.plan.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'DOWNLOAD'
+          import hashlib
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ.get("TOKEN", "").strip()
+          tag = os.environ["TAG"]
+          asset_id, name = os.environ.get("ASSET_ID", ""), os.environ.get("ASSET_NAME", "")
+          expected_size, expected_sha256 = os.environ.get("EXPECTED_SIZE", ""), os.environ.get("EXPECTED_SHA256", "")
+
+
+          def output(**values):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  for key, value in values.items():
+                      out.write(f"{key}={value}\n")
+
+
+          if not re.fullmatch(r"[1-9][0-9]*", asset_id) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.apk", name):
+              sys.exit(f"::error title=The plan is incomplete::asset-id '{asset_id}', asset-name '{name}'.")
+          directory = os.path.join(os.environ["RUNNER_TEMP"], "android-sleepless")
+          os.makedirs(directory, exist_ok=True)
+          path = os.path.join(directory, name)
+          request = urllib.request.Request(
+              f"{api}/repos/{repository}/releases/assets/{asset_id}",
+              headers={
+                  "Accept": "application/octet-stream",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "asleep-ai-actions-android-ci",
+              },
+          )
+          # Not handed on to the address of the file.
+          request.add_unredirected_header("Authorization", f"Bearer {token}")
+          digest, size = hashlib.sha256(), 0
+          try:
+              with urllib.request.urlopen(request, timeout=60) as response, open(path, "wb") as out:
+                  while True:
+                      chunk = response.read(1 << 20)
+                      if not chunk:
+                          break
+                      out.write(chunk)
+                      digest.update(chunk)
+                      size += len(chunk)
+          except urllib.error.HTTPError as error:
+              if error.code == 404:
+                  print(
+                      f"::warning title=The APK is gone::{name} of {tag} is not there any more: a newer build was "
+                      f"published as {tag} while this run read it. Nothing is uploaded. Start the workflow again to "
+                      f"upload what {tag} holds now."
+                  )
+                  output(found="false")
+                  sys.exit(0)
+              sys.exit(f"::error::Cannot download {name} of {tag}: HTTP {error.code}.")
+          except OSError as error:
+              sys.exit(f"::error::Cannot download {name} of {tag}: {error}")
+          sha256 = digest.hexdigest()
+          if expected_size and (str(size) != expected_size or sha256 != expected_sha256):
+              sys.exit(
+                  f"::error title=Not the APK of the plan::{name} of {tag} is {size} bytes with sha256 {sha256}, and "
+                  f"the plan read {expected_size} bytes with sha256 {expected_sha256}. Nothing is uploaded."
+              )
+          print(f"Downloaded {name} of {tag}: {size} bytes, sha256 {sha256}.")
+          output(found="true", path=path, size=size, sha256=sha256)
+          DOWNLOAD
+
+      # Again, right before the upload: another run may have uploaded a build
+      # of the package since the plan asked. The rolling tag was checked by
+      # the plan, and the bytes are the plan's.
+      - name: Compare with the uploads
+        id: uploads
+        if: ${{ steps.download.outputs.found == 'true' }}
+        env:
+          TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          PACKAGE: ${{ needs.plan.outputs.package }}
+          VERSION_CODE: ${{ needs.plan.outputs.version-code }}
+          TAG_CODE: ''
+        run: |
+          set -euo pipefail
+          python3 -I - <<'UPLOADS'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ.get("TOKEN", "").strip()
+          tag = os.environ["TAG"]
+          package, code, tag_code = os.environ.get("PACKAGE", ""), os.environ.get("VERSION_CODE", ""), os.environ.get("TAG_CODE", "")
+          NEXT_PAGE = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
+
+
+          def output(upload, last=""):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write(f"upload={'true' if upload else 'false'}\nlast-code={last}\n")
+
+
+          if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+", package) or not re.fullmatch(r"[1-9][0-9]*", code):
+              sys.exit(f"::error title=The plan is incomplete::package '{package}', versionCode '{code}'.")
+          # The rolling tag was moved to a newer build after its APK was chosen, and that build's
+          # APK is not the one read: the pre-release is being replaced.
+          if tag_code and tag_code != code:
+              print(
+                  f"::warning title=The pre-release is being replaced::{tag} names the build {tag_code}, and the APK "
+                  f"read is {code}: a newer build is being published as {tag}. Nothing is uploaded. Start the "
+                  "workflow again once it is published."
+              )
+              output(False)
+              sys.exit(0)
+
+          prefix = f"refs/sleepless/{package}/"
+          url = f"{api}/repos/{repository}/git/matching-refs/sleepless/{package}/"
+          uploaded = []
+          while url:
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "asleep-ai-actions-android-ci",
+                  },
+              )
+              request.add_unredirected_header("Authorization", f"Bearer {token}")
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      document = json.load(response)
+                      link = response.headers.get("Link") or ""
+              except urllib.error.HTTPError as error:
+                  sys.exit(f"::error::Cannot list the uploads of {package} ({prefix}*): HTTP {error.code}.")
+              except (OSError, ValueError) as error:
+                  sys.exit(f"::error::Cannot list the uploads of {package} ({prefix}*): {error}")
+              if not isinstance(document, list):
+                  sys.exit(f"::error::Cannot list the uploads of {package} ({prefix}*): the answer is no list.")
+              for item in document:
+                  match = re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*)", str(item.get("ref", "")) if isinstance(item, dict) else "")
+                  if match:
+                      uploaded.append(int(match[1]))
+              following = NEXT_PAGE.search(link)
+              url = following[1] if following else ""
+              # The token goes with every page: only to the API it is for.
+              if url and not url.startswith(f"{api}/"):
+                  sys.exit(f"::error::The next page of the uploads of {package} is not on {api}: {url}")
+
+          last = max(uploaded, default=0)
+          if int(code) in uploaded:
+              print(
+                  f"::notice title=Uploaded already::{package} {code} ({tag}) was uploaded to Sleepless before "
+                  f"({prefix}{code}). Nothing is uploaded: Sleepless does not switch to a build it has."
+              )
+              output(False, last)
+          elif int(code) < last:
+              print(
+                  f"::notice title=Not newer than the last upload::{package} {code} ({tag}) is below {last}, the "
+                  f"last versionCode of {package} uploaded to Sleepless. Nothing is uploaded: Sleepless switches to "
+                  "a higher build only."
+              )
+              output(False, last)
+          else:
+              before = f"above {last}, the last upload of {package}" if last else f"the first upload of {package}"
+              print(f"{package} {code} ({tag}) is to be uploaded: {before}.")
+              output(True, last or "")
+          UPLOADS
+
+      # The description is the format of the medical apps' dashboard:
+      # "<app> <versionName> (<versionCode>) · <tag> <commit>".
+      - name: Upload to Sleepless
+        id: upload
+        if: ${{ steps.uploads.outputs.upload == 'true' }}
+        uses: asleep-ai/actions/sleepless-upload@android-ci/v1
+        with:
+          file: ${{ steps.download.outputs.path }}
+          description: ${{ format('{0} {1} ({2})', inputs.app, needs.plan.outputs.version-name, needs.plan.outputs.version-code) }}
+          ref: ${{ inputs.tag }}
+          sha: ${{ needs.plan.outputs.commit }}
+          max-time: ${{ inputs.upload-max-time }}
+        env:
+          GADS_URL: ${{ vars.GADS_URL }}
+          GADS_CLIENT_ID: ${{ vars.GADS_CLIENT_ID }}
+          GADS_CLIENT_SECRET: ${{ secrets.GADS_CLIENT_SECRET }}
+          GADS_TENANT: ${{ vars.GADS_TENANT }}
+
+      # refs/sleepless/<package>/<versionCode>, naming a tag object on the
+      # commit that says what was uploaded, by which run. Once the upload has
+      # succeeded: a build that did not go up is not recorded, and the next
+      # run uploads it. A ref that exists already was created by a run that
+      # uploaded the same build at the same time. When the ref cannot be
+      # created the job fails, and the next run uploads the build again,
+      # which Sleepless takes for the build it has.
+      - name: Record the upload
+        id: record
+        if: ${{ steps.upload.outcome == 'success' }}
+        env:
+          TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          APP: ${{ inputs.app }}
+          PACKAGE: ${{ needs.plan.outputs.package }}
+          VERSION_CODE: ${{ needs.plan.outputs.version-code }}
+          VERSION_NAME: ${{ needs.plan.outputs.version-name }}
+          ASSET_NAME: ${{ needs.plan.outputs.asset-name }}
+          COMMIT: ${{ needs.plan.outputs.commit }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'RECORD'
+          import datetime
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+
+          api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ.get("TOKEN", "").strip()
+          package, code = os.environ["PACKAGE"], os.environ["VERSION_CODE"]
+          ref = f"refs/sleepless/{package}/{code}"
+          TAGGER = {"name": "github-actions[bot]", "email": "41898282+github-actions[bot]@users.noreply.github.com"}
+
+
+          def call(path, body):
+              """POST to the repository's API: (status, answer). A server error or no answer is asked again."""
+              data = json.dumps(body).encode()
+              for delay in (1, 2, 4, None):
+                  request = urllib.request.Request(
+                      f"{api}/repos/{repository}/{path}",
+                      data=data,
+                      method="POST",
+                      headers={
+                          "Accept": "application/vnd.github+json",
+                          "Content-Type": "application/json",
+                          "X-GitHub-Api-Version": "2022-11-28",
+                          "User-Agent": "asleep-ai-actions-android-ci",
+                      },
+                  )
+                  request.add_unredirected_header("Authorization", f"Bearer {token}")
+                  try:
+                      with urllib.request.urlopen(request, timeout=30) as response:
+                          return response.status, json.loads(response.read() or b"null")
+                  except urllib.error.HTTPError as error:
+                      status, raw = error.code, error.read(500)
+                      if status < 500 or delay is None:
+                          try:
+                              return status, json.loads(raw)
+                          except ValueError:
+                              return status, None
+                  except (OSError, ValueError) as error:
+                      if delay is None:
+                          return 0, {"message": str(error) or type(error).__name__}
+                  time.sleep(delay)
+
+
+          def refused(status, answer):
+              message = answer.get("message") if isinstance(answer, dict) else ""
+              said = f": {message}" if isinstance(message, str) and message else ""
+              if status in (401, 403, 404):
+                  hint = " The job token needs contents: write, which the calling file grants (permissions: contents: write)."
+              elif status == 422 and "rule" in str(message).lower():
+                  hint = " A ruleset of the repository refuses it: let the job token create refs/sleepless/*, or keep those refs out of the ruleset."
+              else:
+                  hint = ""
+              print(
+                  f"::error title=The upload is not recorded::{package} {code} was uploaded to Sleepless, and {ref} "
+                  f"could not be written (HTTP {status}{said}).{hint} The next run uploads the build again, which "
+                  "Sleepless takes for the build it has."
+              )
+              sys.exit(1)
+
+
+          now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          message = (
+              f"Uploaded to Sleepless: {os.environ['APP']} {os.environ['VERSION_NAME']} ({code}), "
+              f"{os.environ['ASSET_NAME']} of {os.environ['TAG']}, by run {os.environ.get('GITHUB_RUN_ID', '')} of {repository}."
+          )
+          status, created = call(
+              "git/tags",
+              {"tag": "sleepless", "message": message, "object": os.environ["COMMIT"], "type": "commit", "tagger": {**TAGGER, "date": now}},
+          )
+          sha = created.get("sha") if isinstance(created, dict) else None
+          if status != 201 or not isinstance(sha, str):
+              refused(status, created)
+          status, answer = call("git/refs", {"ref": ref, "sha": sha})
+          if status == 201:
+              print(f"Recorded the upload as {ref}.")
+          elif status == 422 and "already exists" in str((answer or {}).get("message", "")).lower():
+              print(f"::notice title=Recorded already::{ref} exists: another run uploaded {code} at the same time, and recorded it.")
+          else:
+              refused(status, answer)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(f"### Uploaded to Sleepless\n\n{message}\n\nRecorded as `{ref}`.\n")
+          RECORD
+
+      # A runner of the office network keeps its disk between jobs.
+      - name: Delete the APK
+        if: ${{ always() }}
+        run: rm -rf "$RUNNER_TEMP/android-sleepless"
