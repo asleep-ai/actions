@@ -1028,10 +1028,11 @@ on:
   # 19:00 KST.
   schedule:
     - cron: '0 10 * * *'
-  # The name of the calling file of android-release.yml. A preview is
-  # released by the same workflow.
+  # The name: of the calling file of android-release.yml, exactly as it is
+  # written there (Release Build in sleephub-android and heysleep-android-v2).
+  # A preview is released by the same workflow.
   workflow_run:
-    workflows: [Release]
+    workflows: [Release Build]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -1073,12 +1074,12 @@ jobs:
 | trigger | tag | what goes up |
 |---------|-----|--------------|
 | `schedule`, `0 10 * * *` (19:00 KST) | `qa-develop` | The rolling QA build of the source branch, once a day, and only when it is newer than the last upload. A day without a new build uploads nothing. |
-| `workflow_run` of `Release`, when it succeeded | the tag of the release run | Every preview and every release, once it is published. |
+| `workflow_run` of `Release Build`, when it succeeded | the tag of the release run | Every preview and every release, once it is published. |
 | `workflow_dispatch` | `tag`, with `asset` | By hand: a label build (`qa-develop-ble-test`), a build of a version (`qa-develop-2.1.0`), the APK of another brand, or a build the other two did not upload. |
 
 - **A label build, a build of a version and another brand's APK go up by hand only.** Each upload of a higher build stops the regression that runs, so what goes up by itself is what the QA team tests every day: the QA build of the day, and a preview or a release when there is one.
 - The schedule's tag is the rolling pre-release of the source branch, `qa-<source branch>`. The QA builds of a maintenance line (`qa-release-1.x`) take a job of their own with that tag, or a manual run. GitHub may start a scheduled run some minutes late.
-- `workflows: [Release]` is the `name` of the calling file of `android-release.yml`. GitHub starts a `workflow_run` with the calling file of the default branch, and `github.event.workflow_run.head_branch` is the tag the release run was for. A release run that did not succeed is not followed. That includes a release whose build failed on the self-hosted runner and that the GitHub-hosted build then published: that run is red ([How a run is decided](#how-a-run-is-decided-1)). Upload such a release by hand.
+- `workflows: [Release Build]` is the `name` of the calling file of `android-release.yml` in sleephub-android and heysleep-android-v2. **Write the `name:` of the calling repository's release workflow there exactly**: `workflow_run` matches workflows by that name, not by file name, and a name that matches none starts nothing, without an error. GitHub starts a `workflow_run` with the calling file of the default branch, and `github.event.workflow_run.head_branch` is the tag the release run was for. A release run that did not succeed is not followed. That includes a release whose build failed on the self-hosted runner and that the GitHub-hosted build then published: that run is red ([How a run is decided](#how-a-run-is-decided-1)). Upload such a release by hand.
 - **`permissions` must grant `contents: write`**: the plan reads the release, its tag and the records of the uploads, and the upload job writes a record. GitHub refuses to start the run when the calling file grants less.
 - **Pass the two secrets by name**, not with `secrets: inherit`. The workflow needs `GADS_CLIENT_SECRET` and `RUNNER_READ_TOKEN` and no other. With `inherit` every secret of the calling repository would reach it, and the runner drops a job output that contains the value of a secret it has: a key alias such as `release` would empty the name of `HeySleep_release_2.0.0.apk` between the two jobs.
 - **The variables are not passed**: `GADS_URL`, `GADS_CLIENT_ID` and `GADS_TENANT` are organization variables, and a called workflow reads the variables of its caller. The calling repository has to be one the organization shares them with, and the secret `GADS_CLIENT_SECRET` as well.

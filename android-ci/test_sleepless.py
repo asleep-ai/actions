@@ -932,8 +932,12 @@ def test_the_example_calls_the_workflow_with_what_it_declares(entry):
     # The rolling QA build once a day at 19:00 KST; every release and preview once it is published;
     # anything else by hand.
     assert events["schedule"] == [{"cron": "0 10 * * *"}]
-    assert events["workflow_run"] == {"workflows": ["Release"], "types": ["completed"]}
-    assert yaml.safe_load((ROOT / "android-ci" / "release.yml.example").read_text())["name"] == "Release"
+    # workflow_run matches the name: of the calling release workflow, which is Release Build in
+    # sleephub-android and heysleep-android-v2; the README says to write the caller's own exactly.
+    assert events["workflow_run"] == {"workflows": ["Release Build"], "types": ["completed"]}
+    section = readme_section()
+    assert "| `workflow_run` of `Release Build`, when it succeeded |" in section
+    assert "**Write the `name:` of the calling repository's release workflow there exactly**" in section
     assert set(events["workflow_dispatch"]["inputs"]) == {"tag", "asset"}
     assert job["with"]["tag"] == (
         "${{ github.event_name == 'schedule' && 'qa-develop' || github.event_name == 'workflow_run' "

@@ -18,10 +18,11 @@ on:
   # 19:00 KST.
   schedule:
     - cron: '0 10 * * *'
-  # The name of the calling file of android-release.yml. A preview is
-  # released by the same workflow.
+  # The name: of the calling file of android-release.yml, exactly as it is
+  # written there (Release Build in sleephub-android and heysleep-android-v2).
+  # A preview is released by the same workflow.
   workflow_run:
-    workflows: [Release]
+    workflows: [Release Build]
     types: [completed]
   workflow_dispatch:
     inputs:
