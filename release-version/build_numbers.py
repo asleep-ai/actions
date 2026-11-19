@@ -279,15 +279,14 @@ class Repository:
                 numbers[int(match[1])] = target.get("sha", "") if isinstance(target, dict) else ""
         return numbers
 
-    def shipped(self) -> list:
-        """The versionCodes in the file names of the assets of the releases and pre-releases.
+    def published(self) -> list:
+        """The releases and pre-releases of the repository. A draft is not out, and is left out."""
+        return [release for release in self._listed("releases?per_page=100", "list the releases") if not release.get("draft")]
 
-        A draft is not out, and its assets do not count.
-        """
+    def shipped(self) -> list:
+        """The versionCodes in the file names of the assets of the releases and pre-releases."""
         out = []
-        for release in self._listed("releases?per_page=100", "list the releases"):
-            if release.get("draft"):
-                continue
+        for release in self.published():
             kind = "pre-release" if release.get("prerelease") else "release"
             for asset in release.get("assets") or []:
                 name = asset.get("name") if isinstance(asset, dict) else None

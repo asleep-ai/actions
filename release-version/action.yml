@@ -147,6 +147,19 @@ inputs:
       build since. The formula does not read it.
     required: false
     default: ''
+  asset-pattern:
+    description: >-
+      For code with version-code-scheme build-number and release-exists
+      true, optional: the file name pattern (*, ? and [...], compared case
+      by case) of the APKs the build makes, for a repository that builds
+      several apps (applicationIds) into one GitHub Release, one app per
+      run. The tag then counts as released for this build only when an
+      asset of its release matches. When none does, the build is the app's
+      first for the tag and takes the next number, unless a later release or
+      preview of the same major has an asset that matches: that build is
+      refused before it reserves.
+    required: false
+    default: ''
   version-code-scheme:
     description: >-
       For next, code and qa, optional. How a build gets its versionCode.
@@ -310,4 +323,5 @@ runs:
         VERSION_CODE_SCHEME: ${{ inputs.version-code-scheme }}
         VERSION_CODE_FLOOR: ${{ inputs.version-code-floor }}
         RELEASE_EXISTS: ${{ inputs.release-exists }}
+        ASSET_PATTERN: ${{ inputs.asset-pattern }}
       run: python3 "$GITHUB_ACTION_PATH/release_version.py"

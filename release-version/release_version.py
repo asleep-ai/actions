@@ -79,6 +79,7 @@ guess.
 """
 from __future__ import annotations
 
+import fnmatch
 import http.client
 import json
 import os
@@ -424,6 +425,74 @@ def build_number(
         return build_numbers.reserve(api, major, target, marker, date, seen, floor, kept_only)
     except BuildNumberError as exc:
         raise Failure(str(exc)) from None
+
+
+def release_order(text: str) -> Optional[tuple]:
+    """Where a release or preview version stands among the others: X.Y.0-preview.N below X.Y.0.
+
+    None for anything else.
+    """
+    match = VERSION.fullmatch(text)
+    if match:
+        return (*(int(part) for part in match.groups()), 1, 0)
+    match = PRERELEASE.fullmatch(text)
+    if match and match["kind"] in PRERELEASES:
+        return (*parse_version(match["version"]), 0, int(match["number"]))
+    return None
+
+
+def kept_only_for_the_app(
+    env: Mapping[str, str], call: build_numbers.Call, prefix: str, name: str, major: int, pattern: str
+) -> str:
+    """Why a build of a released tag may only keep a number, for the app of asset-pattern; empty when it may take one.
+
+    A repository may build several apps, each with an applicationId of its own, into one GitHub
+    Release, one app per run. Their versionCodes keep no order with each other, so the tag is out
+    for this app only when an asset of its release matches the pattern. Otherwise the build is the
+    app's first for the tag and takes the next number of the major, unless a later release or
+    preview of the major holds the app: the new build would be above it, and a device that took the
+    new build would refuse that later version.
+    """
+    tag = prefix + name
+    order = release_order(name)
+    try:
+        releases = repository_api(env, call).published()
+    except BuildNumberError as exc:
+        raise Failure(str(exc)) from None
+    own, later = [], []
+    for release in releases:
+        tag_name = str(release.get("tag_name") or "")
+        names = [asset.get("name") for asset in release.get("assets") or [] if isinstance(asset, dict)]
+        matching = sorted(item for item in names if isinstance(item, str) and fnmatch.fnmatchcase(item, pattern))
+        if not matching:
+            continue
+        theirs = release_order(tag_name[len(prefix):]) if tag_name.startswith(prefix) else None
+        if tag_name == tag:
+            own = matching
+        elif theirs and theirs[0] == major and theirs > order:
+            later.append((theirs, tag_name, matching[0]))
+    if own:
+        return (
+            f"{tag} has a GitHub Release with {own[0]} already, an APK that asset-pattern {pattern} matches, and no "
+            f"attempt of this run reserved a build number for it. With {BUILD_NUMBER} an APK that is out is built again "
+            "only by running its own run again (Re-run failed jobs or Re-run all jobs on the run that built it): a new "
+            f"run would take the next number of major {major}, above every build since, a later release included, and "
+            "a device that took it would refuse those. Nothing is built"
+        )
+    if later:
+        _, later_tag, asset = min(later)
+        return (
+            f"{tag} has a GitHub Release without an APK that asset-pattern {pattern} matches, and {later_tag}, a later "
+            f"version of major {major}, holds {asset}. The first build of that app for {tag} would take the next "
+            f"number of major {major}, above {asset}, and a device that took it would refuse {later_tag}. Nothing is "
+            "built. An app is added to the GitHub Release of a version only while no later release or preview of its "
+            "major holds it"
+        )
+    print(
+        f"{tag} has a GitHub Release, and none of its assets matches asset-pattern {pattern}: this build is the "
+        "first of that app for the tag, and takes a build number of its own."
+    )
+    return ""
 
 
 def formula_guard(env: Mapping[str, str], call: build_numbers.Call, major: int) -> None:
@@ -1131,12 +1200,17 @@ def run_code(env: Mapping[str, str], call: build_numbers.Call = http_call) -> No
         sha = env.get("SHA", "").strip()
         if not sha:
             raise Failure("sha is the commit that is built, and the build-number scheme needs it to reserve a number")
+        target = named_commit(sha)
         # The formula gave a tag the same code in every run, so building a released tag again was
         # safe. A new run takes the next number of the major instead: above every build since,
         # a later release included, and a device that took it would refuse those. Only the run
         # that built the release, run again, keeps its number.
         kept_only = ""
-        if exists == "true":
+        # Stripped as the publish job of android-release.yml strips it to check the APKs it publishes.
+        pattern = env.get("ASSET_PATTERN", "").strip()
+        if exists == "true" and pattern:
+            kept_only = kept_only_for_the_app(env, call, prefix, name, version[0], pattern)
+        elif exists == "true":
             kept_only = (
                 f"{prefix}{name} has a GitHub Release already, and no attempt of this run reserved a build number "
                 f"for it. With {BUILD_NUMBER} a release that is out is built again only by running its own run "
@@ -1144,7 +1218,7 @@ def run_code(env: Mapping[str, str], call: build_numbers.Call = http_call) -> No
                 f"next number of major {version[0]}, above every build since, a later release included, and a "
                 "device that took it would refuse those. Nothing is built"
             )
-        reserved = build_number(env, call, version[0], named_commit(sha), keep=True, kept_only=kept_only)
+        reserved = build_number(env, call, version[0], target, keep=True, kept_only=kept_only)
         code = reserved.code
         print_build_number(reserved)
     else:

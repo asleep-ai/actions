@@ -597,6 +597,7 @@ plan ─▶ primary / build ─▶ fallback / build ─▶ publish
 | `required-secrets` | `''` | Names of secrets and variables that must not be empty and are not written to `local.properties`, such as `SENTRY_AUTH_TOKEN`. |
 | `gradle-args` | `''` | Extra Gradle arguments for `./gradlew ciRelease`, split on whitespace without glob expansion. The build already gets `-PciVersionName`, `-PciVersionCode` and `-PciBuildKind`. |
 | `apk-directory` | `app/build/outputs/apk` | The directory `ciRelease` leaves the release APKs in, relative to the repository root. Every `.apk` file below it is released. |
+| `asset-pattern` | `''` | Optional, for a repository that builds several apps (applicationIds) into one GitHub Release, one app per run: the file name pattern of the APKs this run builds (`*`, `?`, `[…]`, compared case by case), such as `SweetSleep_*.apk`. Every APK of the build has to match it, or nothing is published. With `build-number` it says whether the release holds this app already ([Several apps in one release](#several-apps-in-one-release)). Empty: the release is one build, as before. |
 | `expected-cert-sha256` | `''` | Optional SHA-256 digest of the signing certificate every APK must carry, as [`android-signing`](../android-signing/#comparing-the-certificate) takes it. Empty checks only that the signatures are valid. |
 | `build-tools-version` | `''` | Optional build-tools version whose `apksigner` and `aapt2` check the APKs. Empty uses the highest installed version. |
 | `source-branch` | `''` | The branch releases are cut from. Empty means the repository's default branch. The tagged commit has to be in its first-parent history, or in that of `release/<major>.x`, the maintenance branch of the tag's major. |
@@ -707,6 +708,23 @@ After the build, every `.apk` file below `apk-directory` is an APK of the releas
 - A preview is created as a pre-release (`--prerelease --latest=false`), with its tag as the title. Its notes start at the published preview of the same version before it, so they say what changed since the build the site has, and the first preview of a version starts where the release would. A release never starts at a preview.
 - When the release of the tag exists already, its title, notes and latest mark are kept, because they may have been edited, and the APKs are uploaded again. An asset of the same name is replaced; an APK with another name is added next to it. Replacing means that `gh` deletes the asset and uploads the new one: for the length of that upload, and after one that failed, the release lacks that APK. Unlike the QA pre-release, which is replaced on every push and is protected against that gap, this happens only when a person builds a published tag again.
 - Running the release of a tag again is therefore safe. An APK the first run did not build, such as another flavor selected with a `gradle-args` property, is a second run for the same tag.
+- With build numbers, that second run is refused unless the APKs it adds are of another app and the calling file says which: [Several apps in one release](#several-apps-in-one-release).
+
+### Several apps in one release
+
+A repository can build apps with applicationIds of their own from one tag, one app per run, and release them together in the tag's GitHub Release. sleephub-android builds SleepHub and SweetSleep (`ai.asleep.sweetsleep`): its release run builds SleepHub and publishes the release, and a second run for the same tag (`gh workflow run release.yml --ref vX.Y.Z -f brand=sweetsleep`) builds SweetSleep and adds its APK. A `gradle-args` property chooses the app, and the calling file passes the file name pattern of that app's APKs as `asset-pattern`:
+
+```yaml
+      gradle-args: -PciBrand=${{ inputs.brand || 'sleephub' }}
+      asset-pattern: ${{ (inputs.brand || 'sleephub') == 'sweetsleep' && 'SweetSleep_*.apk' || 'SleepHub_*.apk' }}
+```
+
+- **The pattern names what the run builds.** `*`, `?` and `[…]`, compared case by case, as the `asset` of [`android-sleepless.yml`](#which-builds-are-uploaded), and stripped of the whitespace around it. Before anything is published, `publish` checks every APK of the build against it, and fails without publishing when one does not match (`An APK does not match asset-pattern`): the plan decided on the pattern, so a pattern that is not the app the run built would have made that decision wrong.
+- **With `build-number`, the release holds an app when one of its assets matches the pattern.** A release that holds none is new to this app: the run takes the next build number of the major, as a new release would, and adds the APK to the release. The other apps' versionCodes keep no order with this one's, so its number is not held below theirs. The run that built the app's APK, run again, keeps its number; a new run for a release that holds the app is refused, as a released tag is without the pattern ([Build numbers](#build-numbers)).
+- **And it is refused, before it reserves, when a later version of the major holds the app**: a release of a higher version, or a preview above this tag's version, whose GitHub Release or pre-release has an asset that matches. The new number would be above that build, and a device that took the new build would refuse the later version. A preview `X.Y.0-preview.N` counts as below `X.Y.0`, so `v2.0.0` is not refused for a preview of `2.0.0`; a preview of `2.1.0` that holds the app refuses an app's first build for `v2.0.1`. Add an app to a release before the next version of the major has it.
+- **The rules of [the tag](#the-tag-1) are the release's, not an app's.** A tag below the highest release tag of its major is built for another app only when its release exists. The release keeps its title, notes and latest mark, as for any run of a tag whose release exists.
+- **With the formula**, a tag has one versionCode in every run, and a run for another app was allowed before. Only the check of the APK names is new.
+- Without `asset-pattern`, nothing changes: heysleep-android-v2 releases one app, and its runs are what they were.
 
 ### How a run is decided
 
@@ -1424,7 +1442,7 @@ versionCode = X × 100000000 + n        n: the build number, 1 to 99999999, of t
 - **One counter per major, for every kind of build.** QA builds, label builds, previews and releases of major `X` take the next `n` in the order their plans run. Every build installs over every build of its major made before it, of any kind, and none over a later one. After `2.0.0` at `200050000`, the next QA build is `200050001`.
 - **The version names do not change**: `X.Y.Z`, `X.Y.0-preview.N`, `<next release>-qa.N` and `<next patch>-<label>.<k>`, computed as before. `N` is still the run number plus `sequence-offset`, and only a name. Without a versionCode to fit, `N` has no ceiling, a preview number neither, and the label builds after a release are counted from the names of the rolling tags, without the limit of 99.
 - **A run keeps its number; a new run gets a new one.** A run that is run again, its failed jobs or all of them, builds with the number it reserved first. The same commit built by another run (a manual run of the branch head) is another build with a higher number.
-- **A release that is out is built again only by its own run.** A new run of a tag whose GitHub Release exists would take a number above every build since, later releases included, and a device that took it would refuse those. `plan` of the release refuses it, and the version bump does not start the release again for a tag an earlier attempt pushed and released. Run the release's own run again (**Re-run failed jobs** or **Re-run all jobs**), which keeps its number. A release whose first run failed before it published has no GitHub Release yet, and a new run builds it. With the formula a tag had one code in every run, and a new run is allowed as before.
+- **A release that is out is built again only by its own run.** A new run of a tag whose GitHub Release exists would take a number above every build since, later releases included, and a device that took it would refuse those. `plan` of the release refuses it, and the version bump does not start the release again for a tag an earlier attempt pushed and released. Run the release's own run again (**Re-run failed jobs** or **Re-run all jobs**), which keeps its number. A release whose first run failed before it published has no GitHub Release yet, and a new run builds it. With the formula a tag had one code in every run, and a new run is allowed as before. With `asset-pattern` this holds per app: the release is out for the run's app when one of its assets matches the pattern, and a release without such an asset gets the app's APK from a new run, with the next number, unless a later release or preview of the major holds the app ([Several apps in one release](#several-apps-in-one-release)).
 - **A major is still a release line**, below every code of the next major, and `X` goes from 0 to 20.
 - **Within a major the order is the order of building, not of versions.** That is what makes a QA build after a release install over it. It also means that two branches of one major (two maintenance branches of 1.x, which this repository's [release lines](#release-lines) do not have) would interleave. A release of an older major after a later major exists stays below that major, as with the formula.
 
@@ -1457,7 +1475,7 @@ The plan refuses a build, with the reason and before it reserves anything, when:
 
 - its versionCode would not be above every code of its major that is out, as found above. That is the case when the reserved numbers are behind what was published: a build made with the formula after the switch, or one made by hand. The message names the code and where it is; pass that code as `version-code-floor` to go on above it;
 - its major is above 20, or `version-code-floor` is above every code of its major and that major has no build yet;
-- it is a new run of a tag whose GitHub Release exists ([above](#build-numbers));
+- it is a new run of a tag whose GitHub Release exists ([above](#build-numbers)); with `asset-pattern`, of a tag whose release holds an APK of the run's app, or the app's first build for a release while a later release or preview of the major holds the app ([Several apps in one release](#several-apps-in-one-release));
 - the calling file asks for `build-number` and the `release-version` the workflow runs does not know it: one from before build numbers, which ignores the input and computes the formula (`release-version is from before build numbers`). That is a `release-version@android-ci/v1` from before the tag moved, or a branch of these workflows tried from a calling repository: point its `uses:` lines at the branch as well.
 
 **With the formula**, the plan reads the build numbers of its major once, and refuses the build when there are any: that major is numbered with `build-number` elsewhere, and formula codes keep no order with build numbers (`2.0.1` would be `200050100`, above every build number of 2.x so far). That is a branch that did not get the switch, or a tag on a commit from before it. A repository that never switched has none, and builds as it always did; when GitHub cannot be asked, the plan goes on with a warning.
@@ -1581,6 +1599,18 @@ Moving the tag `android-ci/v1` to this release:
 
 - The upload compares versionCodes, so a calling repository switches to [build numbers](#build-numbers) first: with the formula, the QA builds after a release are below it and do not go up.
 - The upload job runs on the self-hosted labels it is given, in the office network. The first run that uploads is the one to look at: whether `pick-runner` finds the runner, whether the runner reaches `GADS_URL`, how long the upload of the APK takes, and whether GitHub lets the job token create `refs/sleepless/*`.
+
+`android-ci/v1.6.0` adds the input `asset-pattern` of `android-release.yml`, for a repository that builds several apps into one GitHub Release, one app per run ([Several apps in one release](#several-apps-in-one-release)). **A caller that does not pass it releases as before.**
+
+| what | before | from `v1.6.0` | a caller that does nothing |
+|------|--------|---------------|----------------------------|
+| input `asset-pattern` of `android-release.yml` | not there | the file name pattern of the APKs the run builds; empty by default | as before |
+| a new run of a tag whose GitHub Release exists, with `build-number` | refused | with `asset-pattern`: refused when the release holds an APK of the run's app, or when a later release or preview of the major holds the app; otherwise the app's first build for the tag, with the next number | as before: refused |
+| `publish` | publishes every APK of the build | with `asset-pattern`: checks every APK against it first, and publishes nothing when one does not match | as before |
+| input `asset-pattern` of `release-version` | not there | read by `code` with `build-number` and `release-exists: true`, which then lists the releases with the job token | as before |
+
+- sleephub-android adds the line of [Several apps in one release](#several-apps-in-one-release) to its `release.yml`, next to the `gradle-args` that chooses the app. Its second run for a tag, the one of SweetSleep, is then planned with a number of its own instead of being refused.
+- **Move the tag `android-ci/v1` before a calling file passes the input.** GitHub refuses to start a run that passes an input the called workflow does not declare, so a calling file with `asset-pattern` does not release with an `android-ci/v1` from before this release, and once one has it, the tag cannot go back to an earlier version.
 
 ## Development
 

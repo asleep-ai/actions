@@ -23,6 +23,9 @@ name: Android release
 # build-number it is the next build number of the tag's major instead, which
 # the plan reserves in the repository.
 #
+# With asset-pattern, one release holds several apps, one per run: a run adds
+# its app's APKs to the release that another app's run published.
+#
 # The caller's contract, every input and the secrets are in
 # android-ci/README.md.
 on:
@@ -111,6 +114,19 @@ on:
         required: false
         type: string
         default: app/build/outputs/apk
+      asset-pattern:
+        description: >-
+          Optional, for a repository that builds several apps (applicationIds)
+          into one GitHub Release, one app per run: the file name pattern of
+          the APKs this run builds (*, ? and [...], compared case by case),
+          such as SweetSleep_*.apk. Every APK of the build has to match it, or
+          nothing is published. With build-number, a release without an asset
+          that matches gets this app's APK from a new run, with a number of
+          its own, unless a later release or preview of the major has one.
+          Empty: the release is one build, as before.
+        required: false
+        type: string
+        default: ''
       expected-cert-sha256:
         description: >-
           Optional SHA-256 digest of the signing certificate the APK must
@@ -636,7 +652,8 @@ jobs:
       # once every check above has passed. A run that is started again keeps
       # its number. A new run for a tag whose GitHub Release exists is
       # refused: it would reserve a number above every build since, a later
-      # release included.
+      # release included. With asset-pattern only a release with an APK of
+      # this app counts: the codes of two apps keep no order with each other.
       - name: Compute the versionCode
         id: code
         uses: asleep-ai/actions/release-version@android-ci/v1
@@ -646,6 +663,7 @@ jobs:
           version: ${{ steps.tag.outputs.tag }}
           sha: ${{ steps.tag.outputs.sha }}
           release-exists: ${{ steps.tag.outputs.exists }}
+          asset-pattern: ${{ inputs.asset-pattern }}
           version-code-scheme: ${{ inputs.version-code-scheme }}
           version-code-floor: ${{ inputs.version-code-floor }}
 
@@ -793,6 +811,40 @@ jobs:
         with:
           name: android-release-apk-${{ needs.primary.result == 'success' && 'primary' || 'fallback' }}
           path: ${{ runner.temp }}/android-release-apk
+
+      # The plan decided from asset-pattern whether the release holds this
+      # app. An APK the pattern does not match makes that decision doubtful.
+      #
+      # python3 -I: the script comes from standard input, and without -I
+      # Python would look for the modules it imports in the checkout first.
+      - name: Check the APKs against asset-pattern
+        if: ${{ inputs.asset-pattern != '' }}
+        env:
+          ASSET_PATTERN: ${{ inputs.asset-pattern }}
+          APK_DIRECTORY: ${{ runner.temp }}/android-release-apk
+        run: |
+          set -euo pipefail
+          python3 -I - <<'NAMES'
+          import fnmatch
+          import os
+          import sys
+
+          pattern = os.environ["ASSET_PATTERN"].strip()
+          names = sorted(name for _, _, files in os.walk(os.environ["APK_DIRECTORY"]) for name in files if name.endswith(".apk"))
+          if not pattern:
+              print("asset-pattern is empty: every APK of the build is published.")
+              sys.exit(0)
+          others = [name for name in names if not fnmatch.fnmatchcase(name, pattern)]
+          if others:
+              print(
+                  f"::error title=An APK does not match asset-pattern::asset-pattern is {pattern}, and the build made "
+                  f"{', '.join(others)}, which it does not match. Nothing is published. Pass the pattern of the APKs "
+                  "this run builds, from the same input that chooses the app (gradle-args), and start a new run.",
+                  flush=True,
+              )
+              sys.exit(1)
+          print(f"Every APK of the build matches asset-pattern {pattern}: {', '.join(names) or 'none'}.")
+          NAMES
 
       - name: Look for the GitHub Release
         id: release

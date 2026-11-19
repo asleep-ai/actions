@@ -55,6 +55,12 @@ jobs:
       # As in qa.yml and version-bump.yml: the formula by default, or the
       # next build number of the tag's major.
       # version-code-scheme: build-number
+      # A repository that builds several apps (applicationIds) into one
+      # release, one app per run, names the APKs of the run: the run of the
+      # second app then adds its APK to the release the first one published.
+      # With a `brand` input of the manual run, next to `cold`:
+      # gradle-args: -PciBrand=${{ inputs.brand || 'sleephub' }}
+      # asset-pattern: ${{ (inputs.brand || 'sleephub') == 'sweetsleep' && 'SweetSleep_*.apk' || 'SleepHub_*.apk' }}
       # Secrets and variables written to local.properties under their own
       # names, next to the four signing keys.
       local-properties-secrets: |

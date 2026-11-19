@@ -859,6 +859,154 @@ def test_the_release_needs_the_commit_it_builds(repo, tmp_path, capsys):
     assert "sha is the commit that is built, and the build-number scheme needs it to reserve a number" in error_of(capsys)
 
 
+# --- several apps in one release --------------------------------------------------------------------
+
+# sleephub-android builds two apps from one tag, one per run: SleepHub, and SweetSleep with an
+# applicationId of its own (ai.asleep.sweetsleep). Their codes keep no order with each other.
+SLEEPHUB = "SleepHub_*.apk"
+SWEETSLEEP = "SweetSleep_*.apk"
+
+
+def add_asset(gh, tag, name):
+    """Attach an APK to a release that exists, as gh release upload does."""
+    (published,) = [item for item in gh.releases if item["tag_name"] == tag]
+    published["assets"].append({"name": name})
+
+
+def test_an_app_new_to_a_published_release_takes_a_number_of_its_own(repo, tmp_path, capsys):
+    target = commit(repo, "Feature (#1)")
+    gh = FakeGitHub()
+    # The SleepHub run publishes the release; it was not out when its plan ran.
+    _, first = release(tmp_path, gh, "v1.12.0", target, run_id="6001", release_exists="false", asset_pattern=SLEEPHUB)
+    assert first["version-code"] == "100000001"
+    gh.release("v1.12.0", "SleepHub_release_1.12.0_100000001.apk")
+    # The SweetSleep run of the same tag: the release holds no APK of it.
+    capsys.readouterr()
+    code, sweet = release(tmp_path, gh, "v1.12.0", target, run_id="6002", release_exists="true", asset_pattern=SWEETSLEEP)
+    assert (code, sweet["version-code"]) == (0, "100000002")
+    assert "v1.12.0 has a GitHub Release, and none of its assets matches asset-pattern SweetSleep_*.apk" in capsys.readouterr().out
+    add_asset(gh, "v1.12.0", "SweetSleep_release_1.12.0_100000002.apk")
+    # That run, run again once its APK is out: the same number.
+    code, again = release(tmp_path, gh, "v1.12.0", target, run_id="6002", release_exists="true", asset_pattern=SWEETSLEEP)
+    assert (code, again["version-code"]) == (0, "100000002")
+    # A new run of either app: refused before it reserves, as a released tag is without the pattern.
+    capsys.readouterr()
+    for run_id, pattern, apk in (
+        ("6003", SWEETSLEEP, "SweetSleep_release_1.12.0_100000002.apk"),
+        ("6004", SLEEPHUB, "SleepHub_release_1.12.0_100000001.apk"),
+    ):
+        code, out = release(tmp_path, gh, "v1.12.0", target, run_id=run_id, release_exists="true", asset_pattern=pattern)
+        assert (code, out) == (1, {})
+        message = error_of(capsys)
+        assert message.startswith(
+            f"v1.12.0 has a GitHub Release with {apk} already, an APK that asset-pattern {pattern} matches, and no "
+            "attempt of this run reserved a build number for it."
+        ), message
+        assert "Re-run failed jobs or Re-run all jobs on the run that built it" in message
+    assert gh.numbers(1) == [1, 2]
+    # Without the pattern, or with one of whitespace only, the release is one build, as before.
+    for pattern in ("", " \n"):
+        code, out = release(tmp_path, gh, "v1.12.0", target, run_id="6005", release_exists="true", asset_pattern=pattern)
+        assert (code, out) == (1, {})
+        assert error_of(capsys).startswith("v1.12.0 has a GitHub Release already, and no attempt of this run reserved")
+
+
+@pytest.mark.parametrize(
+    ("tag", "others", "later"),
+    [
+        # A later release or preview of the major holds the app.
+        ("v1.12.0", [("v1.13.0", "SweetSleep_release_1.13.0_100000003.apk", "release")], "v1.13.0"),
+        ("v1.12.0", [("v1.13.0-preview.1", "SweetSleep_preview_1.13.0-preview.1_100000003.apk", "pre-release")], "v1.13.0-preview.1"),
+        ("v1.12.0", [("v1.12.1", "SweetSleep_release_1.12.1_100000003.apk", "release")], "v1.12.1"),
+        # A preview is below the release of its version and below the later previews of it.
+        ("v1.13.0-preview.1", [("v1.13.0", "SweetSleep_release_1.13.0_100000003.apk", "release")], "v1.13.0"),
+        ("v1.13.0-preview.1", [("v1.13.0-preview.2", "SweetSleep_preview_1.13.0-preview.2_100000003.apk", "pre-release")], "v1.13.0-preview.2"),
+        ("v1.13.0-preview.9", [("v1.13.0-preview.10", "SweetSleep_preview_1.13.0-preview.10_100000003.apk", "pre-release")], "v1.13.0-preview.10"),
+        # Of several, the nearest is named.
+        (
+            "v1.12.0",
+            [("v1.14.0", "SweetSleep_release_1.14.0_100000004.apk", "release"), ("v1.13.0", "SweetSleep_release_1.13.0_100000003.apk", "release")],
+            "v1.13.0",
+        ),
+        # Nothing later holds the app: an earlier version, the previews of the release's own version,
+        # another major, a draft, a rolling QA build, another app, a name in another case.
+        ("v1.12.0", [("v1.11.0", "SweetSleep_release_1.11.0_100000003.apk", "release")], ""),
+        ("v1.13.0", [("v1.13.0-preview.2", "SweetSleep_preview_1.13.0-preview.2_100000003.apk", "pre-release")], ""),
+        ("v1.13.0-preview.2", [("v1.13.0-preview.1", "SweetSleep_preview_1.13.0-preview.1_100000003.apk", "pre-release")], ""),
+        ("v1.12.0", [("v2.0.0", "SweetSleep_release_2.0.0_200000001.apk", "release")], ""),
+        ("v1.12.0", [("v1.13.0", "SweetSleep_release_1.13.0_100000003.apk", "draft")], ""),
+        ("v1.12.0", [("qa-develop", "SweetSleep_qa_1.13.1-qa.4_100000004.apk", "pre-release")], ""),
+        ("v1.12.0", [("v1.13.0", "SleepHub_release_1.13.0_100000003.apk", "release")], ""),
+        ("v1.12.0", [("v1.13.0", "sweetsleep_release_1.13.0_100000003.apk", "release")], ""),
+    ],
+)
+def test_an_app_is_added_to_a_release_only_while_no_later_version_of_its_major_holds_it(repo, tmp_path, capsys, tag, others, later):
+    # A first build of SweetSleep for the tag takes the next number of the major: above every build
+    # so far, also above a later version of SweetSleep that is out, which would then be the lower.
+    target = commit(repo, "Feature (#1)")
+    gh = FakeGitHub()
+    kind = "preview" if "-preview." in tag else "release"
+    gh.release(tag, f"SleepHub_{kind}_{tag[1:]}_100000001.apk", prerelease=kind == "preview")
+    for other, asset, what in others:
+        gh.release(other, asset, prerelease=what == "pre-release", draft=what == "draft")
+    gh.reserve_by_hand(1, 9)
+    capsys.readouterr()
+    code, out = release(tmp_path, gh, tag, target, kind=kind, release_exists="true", asset_pattern=SWEETSLEEP)
+    if later:
+        assert (code, out) == (1, {})
+        message = error_of(capsys)
+        assert message.startswith(
+            f"{tag} has a GitHub Release without an APK that asset-pattern SweetSleep_*.apk matches, and {later}, a "
+            "later version of major 1, holds "
+        ), message
+        assert "Nothing is built." in message
+        assert gh.numbers(1) == [9] and ("POST", "git/refs") not in gh.requests
+    else:
+        assert (code, out["version-code"]) == (0, "100000010"), capsys.readouterr().out
+
+
+def test_a_run_that_reserved_before_a_later_version_got_the_app_keeps_its_number(repo, tmp_path, capsys):
+    target = commit(repo, "Feature (#1)")
+    gh = FakeGitHub()
+    gh.release("v1.12.0", "SleepHub_release_1.12.0_100000001.apk")
+    gh.reserve_by_hand(1, 1)
+    _, first = release(tmp_path, gh, "v1.12.0", target, run_id="6101", release_exists="true", asset_pattern=SWEETSLEEP)
+    assert first["version-code"] == "100000002"
+    # Its publish failed, and SweetSleep 1.13.0 came out meanwhile, with a higher number.
+    gh.release("v1.13.0", "SweetSleep_release_1.13.0_100000003.apk")
+    gh.reserve_by_hand(1, 3)
+    # The run, run again, keeps a number below that release; a new run is refused.
+    code, again = release(tmp_path, gh, "v1.12.0", target, run_id="6101", release_exists="true", asset_pattern=SWEETSLEEP)
+    assert (code, again["version-code"]) == (0, "100000002")
+    code, out = release(tmp_path, gh, "v1.12.0", target, run_id="6102", release_exists="true", asset_pattern=SWEETSLEEP)
+    assert (code, out) == (1, {})
+    assert "and v1.13.0, a later version of major 1, holds SweetSleep_release_1.13.0_100000003.apk" in error_of(capsys)
+    assert gh.numbers(1) == [1, 2, 3]
+
+
+def test_the_assets_are_read_only_for_a_released_tag_and_with_build_numbers(lines, repo, tmp_path, capsys):
+    git(repo, "tag", "v2.0.1", lines["c"])
+    gh = FakeGitHub()
+    gh.release("v2.0.1", "SleepHub_release_2.0.1_200050100.apk")
+    # A tag without a release yet: the first run of any app, as without the pattern.
+    code, out = release(tmp_path, gh, "v2.0.1", lines["c"], release_exists="false", asset_pattern=SWEETSLEEP)
+    assert (code, out["version-code"]) == (0, "200050101")
+    assert gh.requests.count(("GET", "releases")) == 1, "only the safety rule reads the releases"
+    # The formula gives the tag its one code in every run, and reads neither.
+    gh = FakeGitHub()
+    code, out = release(tmp_path, gh, "v2.0.1", lines["c"], release_exists="true", asset_pattern=SWEETSLEEP, version_code_scheme="")
+    assert (code, out["version-code"]) == (0, "200050100")
+    assert ("GET", "releases") not in gh.requests
+    # A token that may not read the releases stops the plan before it reserves.
+    gh = FakeGitHub()
+    gh.refuse[("GET", "releases")] = (403, "Resource not accessible by integration")
+    capsys.readouterr()
+    code, out = release(tmp_path, gh, "v2.0.1", lines["c"], release_exists="true", asset_pattern=SWEETSLEEP)
+    assert (code, out) == (1, {})
+    assert error_of(capsys).startswith("cannot list the releases: HTTP 403: Resource not accessible by integration.")
+    assert gh.refs == {}
+
+
 # --- the version bump looks and reserves nothing --------------------------------------------------
 
 
