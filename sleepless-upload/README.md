@@ -73,7 +73,8 @@ Sleepless's size limit for a file is not known yet (a question to the QA team). 
 
 ## Secrets
 
-- The client secret goes from the environment into a JSON file in `$RUNNER_TEMP`, readable by the runner's user only, which curl reads. The token goes into a header file the same way. Neither is on a command line, where another process of the same user could read it on a shared host.
+- The client secret goes from the environment into a JSON file, which curl reads. The token goes into a header file the same way. Neither is on a command line, where another process of the same user could read it on a shared host.
+- The step runs with `umask 077`, whatever the runner's umask, and keeps its files in `$RUNNER_TEMP/sleepless-upload`, which it makes, or finds and sets, with mode 0700. So every file it writes is 0600 to the runner's user alone: the secret, the header, and the two answers curl writes, the token request's with the token in it. Another user of the host can neither read them nor list the directory.
 - Both files and both answers are deleted when the step ends, however it ends.
 - The token is masked with `::add-mask::` before anything that could hold it is printed. The client secret is never printed.
 
@@ -83,4 +84,4 @@ Sleepless's size limit for a file is not known yet (a question to the QA team). 
 uv run --with pytest --with pyyaml python -m pytest sleepless-upload -q
 ```
 
-The tests run the step's script against a local stand-in for Sleepless: a refused token request, an answer without `access_token`, uploads answered with 2xx, 4xx, 413 and 5xx, an upload that succeeds when made again, an answer that comes after `max-time`, no server at all, a file that does not exist, a 64 MiB file that arrives whole, a description and a path with the characters `-F` would read, and the mask of the token. How the real Sleepless answers, and how long a 360 MB upload takes from the office network, is seen only there.
+The tests run the step's script against a local stand-in for Sleepless: a refused token request, an answer without `access_token`, uploads answered with 2xx, 4xx, 413 and 5xx, an upload that succeeds when made again, an answer that comes after `max-time`, no server at all, a file that does not exist, a 64 MiB file that arrives whole, a description and a path with the characters `-F` would read, the mask of the token, and, with the runner's umask 022, the mode of every file the step writes (0600) and of its directory (0700). How the real Sleepless answers, and how long a 360 MB upload takes from the office network, is seen only there.

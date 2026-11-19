@@ -13,7 +13,9 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -126,8 +128,11 @@ def apk(path: Path, size: int = 4096) -> Path:
     return path
 
 
-def run_action(action: dict, tmp_path: Path, gads: Gads | None, file: Path | str, **env: str):
-    """Run the step as GitHub would: its env from the inputs, the connection from the caller's env."""
+def run_action(action: dict, tmp_path: Path, gads: Gads | None, file: Path | str, before: str = "", **env: str):
+    """Run the step as GitHub would: its env from the inputs, the connection from the caller's env.
+
+    `before` is shell run ahead of the step's script in the same shell, such as the runner's umask.
+    """
     (step,) = action["runs"]["steps"]
     temp = tmp_path / "runner-temp"
     temp.mkdir(exist_ok=True)
@@ -150,7 +155,7 @@ def run_action(action: dict, tmp_path: Path, gads: Gads | None, file: Path | str
         **env,
     }
     result = subprocess.run(
-        ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]],
+        ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", before + step["run"]],
         cwd=tmp_path, env=environment, text=True, capture_output=True, check=False, timeout=120,
     )
     outputs = dict(line.split("=", 1) for line in output.read_text().splitlines() if "=" in line)
@@ -185,6 +190,8 @@ def test_neither_the_secret_nor_the_token_is_on_a_command_line(action):
     script = step["run"]
     # The secret goes from the environment into a file, and curl reads the file.
     assert '--data @"$auth"' in script and "umask 077" in script
+    # For the whole step, before the first file or directory is made.
+    assert script.index("umask 077") < script.index('mkdir -p "$work"') < script.index('chmod 700 "$work"') < script.index('> "$auth"')
     assert '-H @"$header"' in script
     assert "$GADS_CLIENT_SECRET" not in script and "${GADS_CLIENT_SECRET" not in script
     assert re.findall(r"\$token\b|\$\{token\}", script) == ["$token", "$token", "$token"]  # test, mask, header file
@@ -226,6 +233,61 @@ def test_the_token_is_masked_before_anything_else_is_printed_and_never_printed(a
     assert TOKEN not in result.stderr
     # The client secret is not printed at all.
     assert SECRET not in result.stdout + result.stderr
+
+
+# A stand-in for rm that writes down the mode of each file before it deletes it: the step deletes
+# every file it made, so this is where their modes can be seen.
+RM = f"""#!{sys.executable}
+import os, stat, sys
+with open(os.environ["RM_LOG"], "a") as log:
+    for path in sys.argv[1:]:
+        if path.startswith("-") or not os.path.lexists(path):
+            continue
+        log.write(f"{{os.path.basename(path)}} {{stat.S_IMODE(os.lstat(path).st_mode):o}}\\n")
+        os.remove(path)
+"""
+
+
+def run_with_umask_022(action, tmp_path, gads, file) -> tuple:
+    """The step on a runner whose umask is 022, with rm writing down what it deletes."""
+    bin_directory = tmp_path / "bin"
+    bin_directory.mkdir()
+    rm = bin_directory / "rm"
+    rm.write_text(RM)
+    rm.chmod(0o755)
+    log = tmp_path / "rm.log"
+    log.write_text("")
+    result, _ = run_action(
+        action, tmp_path, gads, file, before="umask 022\n",
+        PATH=f"{bin_directory}{os.pathsep}{os.environ['PATH']}", RM_LOG=str(log),
+    )
+    deleted = dict(line.split(" ", 1) for line in log.read_text().splitlines())
+    return result, deleted
+
+
+@pytest.mark.parametrize("left_behind", [False, True])
+def test_every_file_of_the_step_is_the_runners_users_alone(action, tmp_path, gads, left_behind):
+    # With the runner's umask 022, curl would write the answer to the token request, which holds
+    # the token, readable by every user of the host, in a directory every user can list.
+    work = tmp_path / "runner-temp" / "sleepless-upload"
+    if left_behind:
+        work.mkdir(parents=True)
+        work.chmod(0o755)
+    result, deleted = run_with_umask_022(action, tmp_path, gads, apk(tmp_path / "app.apk"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    # The secret, the answer with the token, the header with the token, and the answer to the upload.
+    assert deleted == {"auth.json": "600", "token.json": "600", "header": "600", "response": "600"}
+    assert stat.S_IMODE(work.stat().st_mode) == 0o700
+    assert list(work.iterdir()) == []
+
+
+def test_the_files_of_a_refused_token_request_are_the_runners_users_alone(action, tmp_path, gads):
+    gads.token_replies = [(401, b'{"error": "invalid_client"}')]
+    work = tmp_path / "runner-temp" / "sleepless-upload"
+    result, deleted = run_with_umask_022(action, tmp_path, gads, apk(tmp_path / "app.apk"))
+    assert result.returncode == 1
+    assert deleted == {"auth.json": "600", "token.json": "600"}
+    assert stat.S_IMODE(work.stat().st_mode) == 0o700
 
 
 @pytest.mark.parametrize("status", [200, 201, 202, 204])

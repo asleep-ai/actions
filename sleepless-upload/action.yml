@@ -57,6 +57,11 @@ runs:
         MAX_TIME: ${{ inputs.max-time }}
       run: |
         set -euo pipefail
+        # Every file and directory the step makes is the runner's user's alone:
+        # the secret, the token, and the answers curl writes (the answer to
+        # the token request holds the token). No other user of the host reads
+        # them, whatever umask the runner has.
+        umask 077
         missing=""
         for name in GADS_URL GADS_CLIENT_ID GADS_CLIENT_SECRET GADS_TENANT; do
           if [[ -z "${!name:-}" ]]; then
@@ -78,6 +83,8 @@ runs:
 
         work="$RUNNER_TEMP/sleepless-upload"
         mkdir -p "$work"
+        # Also when an earlier step or job left the directory with other modes.
+        chmod 700 "$work"
         url="${GADS_URL%/}"
         auth="$work/auth.json"
         answer="$work/token.json"
@@ -88,7 +95,7 @@ runs:
         # ever on a command line.
         trap 'rm -f "$auth" "$answer" "$header" "$response"' EXIT
 
-        ( umask 077; python3 -I -c 'import json, os; print(json.dumps({k: os.environ["GADS_" + k.upper()] for k in ("client_id", "client_secret", "tenant")}))' > "$auth" )
+        python3 -I -c 'import json, os; print(json.dumps({k: os.environ["GADS_" + k.upper()] for k in ("client_id", "client_secret", "tenant")}))' > "$auth"
         if code=$(curl -sS --max-time 30 --retry 2 --retry-connrefused \
           -o "$answer" -w '%{http_code}' \
           -X POST -H 'Content-Type: application/json' --data @"$auth" "$url/oauth/token"); then
@@ -113,7 +120,7 @@ runs:
           exit 1
         fi
         echo "::add-mask::$token"
-        ( umask 077; printf 'Authorization: Bearer %s\n' "$token" > "$header" )
+        printf 'Authorization: Bearer %s\n' "$token" > "$header"
         token=""
 
         # " · <ref> <commit>", from what is given.
