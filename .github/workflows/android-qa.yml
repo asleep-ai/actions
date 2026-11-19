@@ -42,7 +42,8 @@ name: Android QA build
 #
 # The versionCode follows from the version by default. With
 # version-code-scheme build-number it is the next build number of the
-# build's major instead, which the plan reserves in the repository.
+# build's major instead, which the plan reserves in the repository, and the
+# number in the name of a QA build counts the QA builds of its version.
 #
 # The caller's contract, every input and the secrets are in
 # android-ci/README.md.
@@ -205,7 +206,9 @@ on:
         description: >-
           A whole number added to the run number of the calling workflow to
           give N, the number of a QA build. For a calling file that is new
-          while QA builds with higher numbers are installed.
+          while QA builds with higher numbers are installed. With the formula
+          only: with build-number N counts the QA builds of the version, this
+          is not read, and the plan warns when it is not 0.
         required: false
         type: number
         default: 0
@@ -216,8 +219,10 @@ on:
           major * 100000000 plus the next build number of the major, which
           the plan reserves in the repository as refs/build-numbers/<major>/<n>
           (contents: write), one counter for the QA, label, preview and
-          release builds of the major. The version names are the same. Pass
-          the same value to android-release.yml and android-version-bump.yml.
+          release builds of the major. The version names have the same form,
+          and the N of a QA build counts the QA builds of its version from 1.
+          Pass the same value to android-release.yml and
+          android-version-bump.yml.
         required: false
         type: string
         default: minor-blocks
@@ -467,10 +472,12 @@ jobs:
       # the run number of the calling workflow, so a later run is a higher
       # versionCode; a run that is started again keeps its number.
       #
-      # With version-code-scheme build-number the number stays in the name,
-      # and the versionCode is the build number this step reserves once the
-      # plan has passed: the next of the major, whatever the run number. A run
-      # that is started again finds the number it reserved and keeps it.
+      # With version-code-scheme build-number the versionCode is the build
+      # number this step reserves once the plan has passed: the next of the
+      # major, whatever the run number. The number in the name is then not the
+      # run number either: the step reserves it too, counting the QA builds of
+      # the version (of the app, with asset-pattern) from 1. A run that is
+      # started again finds both numbers it reserved and keeps them.
       - name: Plan the QA build
         id: qa
         uses: asleep-ai/actions/release-version@android-ci/v1

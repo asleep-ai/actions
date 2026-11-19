@@ -57,6 +57,8 @@ class FakeGitHub:
         self.after_list = None
         # (method, path) -> (status, message): what the API refuses.
         self.refuse = {}
+        # (start of a ref's name, status, message): the refs whose creation the API refuses.
+        self.refuse_ref = None
         # The next pages are linked as GitHub links them, /repositories/<id>/..., or under the name.
         self.link_by_id = True
         # matching-refs/build-numbers/2/ answering for every ref that starts with build-numbers/2,
@@ -76,6 +78,9 @@ class FakeGitHub:
     def numbers(self, major):
         prefix = f"refs/build-numbers/{major}/"
         return sorted(int(name[len(prefix):]) for name in self.refs if name.startswith(prefix))
+
+    def qa_numbers(self):
+        return sorted(name for name in self.refs if name.startswith("refs/qa-numbers/"))
 
     def writes(self):
         return [request for request in self.requests if request[0] != "GET"]
@@ -129,6 +134,8 @@ class FakeGitHub:
             if self.before_create:
                 hook, self.before_create = self.before_create, None
                 hook(body["ref"])
+            if self.refuse_ref and body["ref"].startswith(self.refuse_ref[0]):
+                return self._answer(self.refuse_ref[1], {"message": self.refuse_ref[2]})
             with self.lock:
                 if body["ref"] in self.refs:
                     return self._answer(422, {"message": "Reference already exists"})
@@ -569,7 +576,7 @@ def test_a_new_repository_heading_for_1_0_0_starts_at_its_block(repo, tmp_path):
     origin(repo, "develop")
     gh = FakeGitHub()
     _, out = qa(tmp_path, gh, target, next_version="1.0.0")
-    assert (out["version-name"], out["version-code"]) == ("1.0.0-qa.57", "100000001")
+    assert (out["version-name"], out["version-code"]) == ("1.0.0-qa.1", "100000001")
 
 
 def test_major_zero_goes_on_into_major_one_above_all_of_it(repo, tmp_path):
@@ -579,11 +586,11 @@ def test_major_zero_goes_on_into_major_one_above_all_of_it(repo, tmp_path):
     gh = FakeGitHub()
     gh.release("v0.3.0", "App_release_0.3.0_41.apk")
     _, out = qa(tmp_path, gh, target)
-    assert (out["version-name"], out["version-code"]) == ("0.3.1-qa.57", "42")
+    assert (out["version-name"], out["version-code"]) == ("0.3.1-qa.1", "42")
     gh.reserve_by_hand(0, 99_999_999)
     _, out = qa(tmp_path, gh, target, next_version="1.0.0", run_id="7002")
     # Above every code major 0 can have.
-    assert (out["version-name"], out["version-code"]) == ("1.0.0-qa.57", "100000001")
+    assert (out["version-name"], out["version-code"]) == ("1.0.0-qa.1", "100000001")
 
 
 def test_a_floor_above_the_major_stops_the_build_of_a_repository_that_took_over_an_app(repo, tmp_path, capsys):
@@ -646,7 +653,8 @@ def test_the_first_build_after_the_switch_is_one_above_what_each_app_has_out(lin
     _, develop = qa(tmp_path, gh, lines["c"], run_id="1")
     _, maintenance = qa(tmp_path, gh, lines["h2"], ref="refs/heads/release/1.x", run_id="2")
     assert (develop["version-code"], maintenance["version-code"]) == ("200000007", "101300003")
-    assert (develop["version-name"], maintenance["version-name"]) == ("2.0.1-qa.57", "1.13.2-qa.57")
+    # The names go on from the QA builds of the same version that are out.
+    assert (develop["version-name"], maintenance["version-name"]) == ("2.0.1-qa.7", "1.13.2-qa.3")
 
 
 def test_the_first_heysleep_build_after_the_switch_is_above_its_preview(repo, tmp_path):
@@ -659,7 +667,7 @@ def test_the_first_heysleep_build_after_the_switch_is_above_its_preview(repo, tm
     gh = FakeGitHub()
     gh.release("v2.0.0-preview.1", "HeySleep_preview_2.0.0-preview.1_200049001.apk", prerelease=True)
     _, out = qa(tmp_path, gh, after, next_version="2.0.0")
-    assert (out["version-name"], out["version-code"]) == ("2.0.0-qa.57", "200049002")
+    assert (out["version-name"], out["version-code"]) == ("2.0.0-qa.1013", "200049002")
 
 
 def test_a_qa_build_after_a_release_is_above_the_release(repo, tmp_path):
@@ -676,7 +684,7 @@ def test_a_qa_build_after_a_release_is_above_the_release(repo, tmp_path):
     fix = commit(repo, "Fix after 2.0.0 (#2)")
     origin(repo, "develop")
     _, out = qa(tmp_path, gh, fix, run_id="1", sequence="1013")
-    assert (out["version-name"], out["version-code"]) == ("2.0.1-qa.1013", "200050001")
+    assert (out["version-name"], out["version-code"]) == ("2.0.1-qa.1", "200050001")
     in_order.append(int(out["version-code"]))
     # A label build, a release, a preview and QA builds, from one counter, in the order they are made.
     _, out = qa(tmp_path, gh, fix, run_id="2", label="ble-test")
@@ -689,7 +697,7 @@ def test_a_qa_build_after_a_release_is_above_the_release(repo, tmp_path):
     later = commit(repo, "Feature for 2.1 (#3)")
     origin(repo, "develop")
     _, out = qa(tmp_path, gh, later, run_id="4", sequence="1014")
-    assert out["version-name"] == "2.0.2-qa.1014"
+    assert out["version-name"] == "2.0.2-qa.1"
     in_order.append(int(out["version-code"]))
     git(repo, "tag", "v2.1.0-preview.1", later)
     _, out = release(tmp_path, gh, "v2.1.0-preview.1", later, kind="preview", run_id="5")
@@ -781,7 +789,8 @@ def test_the_reservation_names_the_commit_and_the_run(repo, tmp_path):
     gh = FakeGitHub()
     qa(tmp_path, gh, target, run_id="9001")
     [(sha, body)] = gh.objects.items()
-    assert gh.refs == {"refs/build-numbers/2/1": sha}
+    # One object for the run: its build number and the number in its name.
+    assert gh.refs == {"refs/build-numbers/2/1": sha, "refs/qa-numbers/2.0.1/1": sha}
     seconds = int(git(repo, "show", "-s", "--format=%ct", target))
     assert body == {
         "tag": "build-number",
@@ -837,19 +846,31 @@ def test_label_builds_are_counted_from_the_names_of_the_rolling_builds(lines, re
     rolling(repo, "qa-release-1.x-knox", "1.13.2-knox.5", 101_350_105, lines["h2"])
     _, out = qa(tmp_path, gh, lines["h2"], ref="refs/heads/release/1.x", label="knox", run_id="7003")
     assert out["version-name"] == "1.13.2-knox.6"
+    # A label build reserves no QA number: its k comes from the tags, as before.
+    assert gh.qa_numbers() == []
 
 
-def test_a_qa_number_has_no_ceiling_of_its_own(repo, tmp_path, capsys):
+def test_qa_sequence_is_not_read_with_build_numbers(repo, tmp_path, capsys):
     git(repo, "tag", "v2.0.0")
     target = commit(repo, "Fix (#1)")
     origin(repo, "develop")
     gh = FakeGitHub()
-    # The formula stops at 48999, where the previews start; a build number is the versionCode.
-    _, out = qa(tmp_path, gh, target, sequence="50000")
-    assert (out["version-name"], out["version-code"]) == ("2.0.1-qa.50000", "200000001")
-    code, _ = qa(tmp_path, gh, target, sequence="5", qa_sequence_offset="-5", run_id="7002")
-    assert code == 1
-    assert "qa-sequence plus qa-sequence-offset is 0, and the number of a QA build is 1 or higher" in error_of(capsys)
+    # The run number goes on across versions, and the name counts the QA builds of its version: the
+    # formula's ceiling of 48999, or a sequence that is no number, is nothing to it.
+    names = [qa(tmp_path, gh, target, sequence=sequence, run_id=run_id)[1]["version-name"] for run_id, sequence in (("7001", "50000"), ("7002", ""), ("7003", "abc"))]
+    assert names == ["2.0.1-qa.1", "2.0.1-qa.2", "2.0.1-qa.3"]
+    assert "::warning" not in capsys.readouterr().out
+    # An offset is not read either, and says so; 0 is what android-qa.yml passes by default.
+    code, out = qa(tmp_path, gh, target, sequence="5", qa_sequence_offset="-5", run_id="7004")
+    assert (code, out["version-name"], out["number"]) == (0, "2.0.1-qa.4", "4")
+    assert (
+        "::warning title=release-version::qa-sequence-offset is -5, and version-code-scheme is build-number: the number "
+        "of a QA build counts the QA builds of its version, and neither qa-sequence nor the offset is read. Take "
+        "sequence-offset out of the calling file"
+    ) in capsys.readouterr().out
+    _, out = qa(tmp_path, gh, target, qa_sequence_offset="0", run_id="7005")
+    assert out["version-name"] == "2.0.1-qa.5"
+    assert "::warning" not in capsys.readouterr().out
 
 
 def test_the_release_needs_the_commit_it_builds(repo, tmp_path, capsys):
@@ -1005,6 +1026,190 @@ def test_the_assets_are_read_only_for_a_released_tag_and_with_build_numbers(line
     assert (code, out) == (1, {})
     assert error_of(capsys).startswith("cannot list the releases: HTTP 403: Resource not accessible by integration.")
     assert gh.refs == {}
+
+
+# --- the number in the name of a QA build ---------------------------------------------------------
+
+DATE = "2026-11-19T00:00:00Z"
+
+
+def rolling_apps(repo, tag, first, *builds, revision="HEAD"):
+    """Move a rolling tag that holds a build per app, as the publish job of android-qa.yml does with asset-pattern."""
+    git(repo, "tag", "-f", "-a", tag, "-m", first, "-m", "\n".join(builds), revision)
+
+
+def test_the_qa_builds_of_a_version_are_numbered_from_one(repo, tmp_path):
+    # The run number goes on across versions: 1.14.0's first QA build was 1.14.0-qa.12.
+    git(repo, "tag", "v1.13.0")
+    target = commit(repo, "Fix (#1)")
+    origin(repo, "develop")
+    gh = FakeGitHub()
+    names = [qa(tmp_path, gh, target, run_id=str(run), sequence=str(run))[1]["version-name"] for run in (11, 12, 13)]
+    assert names == ["1.13.1-qa.1", "1.13.1-qa.2", "1.13.1-qa.3"]
+    # A build of the next minor for one run counts that version, and the branch goes on from there
+    # once it builds that version itself.
+    _, given = qa(tmp_path, gh, target, run_id="14", sequence="14", version="1.14.0")
+    assert (given["version-name"], given["number"], given["release-tag"]) == ("1.14.0-qa.1", "1", "qa-develop-1.14.0")
+    _, heading = qa(tmp_path, gh, target, run_id="15", sequence="15", next_version="1.14.0")
+    assert (heading["version-name"], heading["release-tag"]) == ("1.14.0-qa.2", "qa-develop")
+    # After the release, the next patch starts at 1 again.
+    git(repo, "tag", "v1.13.1", target)
+    fix = commit(repo, "Fix after 1.13.1 (#2)")
+    origin(repo, "develop")
+    _, after = qa(tmp_path, gh, fix, run_id="16", sequence="16")
+    assert after["version-name"] == "1.13.2-qa.1"
+    # The versionCodes are still one counter of the major, whatever the version.
+    assert (given["version-code"], heading["version-code"], after["version-code"]) == ("100000004", "100000005", "100000006")
+    assert gh.qa_numbers() == [
+        "refs/qa-numbers/1.13.1/1", "refs/qa-numbers/1.13.1/2", "refs/qa-numbers/1.13.1/3",
+        "refs/qa-numbers/1.13.2/1", "refs/qa-numbers/1.14.0/1", "refs/qa-numbers/1.14.0/2",
+    ]
+
+
+def test_a_run_that_is_run_again_keeps_the_number_in_its_name(repo, tmp_path, capsys):
+    git(repo, "tag", "v2.0.0")
+    target = commit(repo, "Fix (#1)")
+    origin(repo, "develop")
+    gh = FakeGitHub()
+    _, first = qa(tmp_path, gh, target, run_id="9001")
+    _, other = qa(tmp_path, gh, target, run_id="9002")
+    capsys.readouterr()
+    _, again = qa(tmp_path, gh, target, run_id="9001")
+    assert [first["version-name"], other["version-name"], again["version-name"]] == ["2.0.1-qa.1", "2.0.1-qa.2", "2.0.1-qa.1"]
+    assert first["version-code"] == again["version-code"] == "200000001"
+    assert "QA number 1 of 2.0.1 (refs/qa-numbers/2.0.1/1): reserved by an earlier attempt of this run, and kept." in capsys.readouterr().out
+    # A plan that reserved its build number and then could not reserve the name: run again, it
+    # keeps the build number and takes the name.
+    gh.refuse_ref = ("refs/qa-numbers/", 422, "Repository rule violations found\n\nCannot create ref due to creations being restricted.")
+    code, out = qa(tmp_path, gh, target, run_id="9003")
+    assert (code, out) == (1, {})
+    assert error_of(capsys).startswith(
+        "cannot create refs/qa-numbers/2.0.1/3: HTTP 422: Repository rule violations found%0A%0ACannot create ref due to "
+        "creations being restricted.. A ruleset of the repository refuses it: let the job token create refs/qa-numbers/*, "
+        "or keep those refs out of the ruleset."
+    )
+    assert gh.numbers(2) == [1, 2, 3]
+    gh.refuse_ref = None
+    _, again = qa(tmp_path, gh, target, run_id="9003")
+    assert (again["version-name"], again["version-code"]) == ("2.0.1-qa.3", "200000003")
+    assert gh.numbers(2) == [1, 2, 3]
+    assert gh.qa_numbers() == ["refs/qa-numbers/2.0.1/1", "refs/qa-numbers/2.0.1/2", "refs/qa-numbers/2.0.1/3"]
+
+
+def test_two_builds_that_reserve_a_qa_number_at_once_get_two():
+    # Pushes in a row are not cancelled before they plan, and each build takes minutes: two plans
+    # can read the counter at the same moment. The ref, created only once, keeps their names apart.
+    gh = FakeGitHub()
+    gh.refs["refs/qa-numbers/1.14.0/1"] = "0" * 40
+    barrier = threading.Barrier(2, timeout=10)
+    gh.after_list = barrier.wait
+    results = {}
+
+    def build(name):
+        results[name] = build_numbers.reserve_qa(repository(gh), "1.14.0", "", "a" * 40, f"run {name}", DATE, [])
+
+    threads = [threading.Thread(target=build, args=(name,)) for name in ("first", "second")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(result.number for result in results.values()) == [2, 3]
+    later = max(results.values(), key=lambda result: result.number)
+    assert later.why == "one above refs/qa-numbers/1.14.0/1, the last number reserved; 2 taken meanwhile by another build"
+
+
+def test_the_first_qa_number_of_a_version_is_above_its_qa_builds_that_are_out(repo, tmp_path, capsys):
+    git(repo, "tag", "v1.13.0")
+    target = commit(repo, "Fix (#1)")
+    origin(repo, "develop")
+    # Published before the switch, named by the run number.
+    rolling(repo, "qa-develop-1.14.0", "1.14.0-qa.12", 101_400_012, target)
+    rolling(repo, "qa-develop", "1.13.1-qa.40", 101_300_040, target)
+    # A label build is no QA build of its version.
+    rolling(repo, "qa-develop-ble-test", "1.13.1-ble-test.70", 101_350_070, target)
+    gh = FakeGitHub()
+    capsys.readouterr()
+    _, out = qa(tmp_path, gh, target, version="1.14.0")
+    assert out["version-name"] == "1.14.0-qa.13"
+    assert (
+        "QA number 13 of 1.14.0, reserved as refs/qa-numbers/1.14.0/13: one above 12, the build 1.14.0-qa.12 that "
+        "qa-develop-1.14.0 holds: no QA number of 1.14.0 was reserved before."
+    ) in capsys.readouterr().out
+    _, out = qa(tmp_path, gh, target, run_id="7002")
+    assert out["version-name"] == "1.13.1-qa.41"
+    # With numbers reserved, a name published above them (by a release-version from before) is
+    # still not given twice.
+    published = [(20, "the build 1.14.0-qa.20 that qa-develop-1.14.0 holds"), (12, "an earlier one")]
+    number = build_numbers.reserve_qa(repository(gh), "1.14.0", "", "b" * 40, "run 3", DATE, published)
+    assert (number.number, number.why) == (
+        21, "one above 20, the build 1.14.0-qa.20 that qa-develop-1.14.0 holds, above refs/qa-numbers/1.14.0/13, the last number reserved"
+    )
+    number = build_numbers.reserve_qa(repository(gh), "1.14.0", "", "b" * 40, "run 4", DATE, [(5, "below them")])
+    assert number.number == 22
+
+
+def test_each_app_numbers_its_qa_builds_of_a_version_apart(repo, tmp_path, capsys):
+    # sleephub-android: SleepHub on every push and SweetSleep by hand, into the one qa-<line>.
+    git(repo, "tag", "v1.13.0")
+    target = commit(repo, "Fix (#1)")
+    origin(repo, "develop")
+    gh = FakeGitHub()
+    hub = [qa(tmp_path, gh, target, run_id=str(run), asset_pattern=SLEEPHUB)[1]["version-name"] for run in (1, 2, 3)]
+    capsys.readouterr()
+    _, sweet = qa(tmp_path, gh, target, run_id="4", asset_pattern=SWEETSLEEP)
+    assert (hub, sweet["version-name"]) == (["1.13.1-qa.1", "1.13.1-qa.2", "1.13.1-qa.3"], "1.13.1-qa.1")
+    # One counter of build numbers for both apps.
+    assert sweet["version-code"] == "100000004"
+    assert gh.qa_numbers() == [
+        "refs/qa-numbers/1.13.1/app-SleepHub_-2a-2eapk/1", "refs/qa-numbers/1.13.1/app-SleepHub_-2a-2eapk/2",
+        "refs/qa-numbers/1.13.1/app-SleepHub_-2a-2eapk/3", "refs/qa-numbers/1.13.1/app-SweetSleep_-2a-2eapk/1",
+    ]
+    assert (
+        "QA number 1 of 1.13.1 of SweetSleep_*.apk, reserved as refs/qa-numbers/1.13.1/app-SweetSleep_-2a-2eapk/1: the "
+        "first QA build of 1.13.1 of SweetSleep_*.apk"
+    ) in capsys.readouterr().out
+    # The first numbers after the switch: each app above its own line of the tag.
+    rolling_apps(
+        repo, "qa-develop", "1.13.1-qa.60 (100000126)",
+        f"{SLEEPHUB} 1.13.1-qa.57 (100000123) {target}", f"{SWEETSLEEP} 1.13.1-qa.60 (100000126) {target}",
+    )
+    gh = FakeGitHub()
+    _, hub = qa(tmp_path, gh, target, run_id="5", asset_pattern=SLEEPHUB)
+    _, sweet = qa(tmp_path, gh, target, run_id="6", asset_pattern=SWEETSLEEP)
+    _, other = qa(tmp_path, gh, target, run_id="7", asset_pattern="HeySleep_*.apk")
+    assert (hub["version-name"], sweet["version-name"], other["version-name"]) == ("1.13.1-qa.58", "1.13.1-qa.61", "1.13.1-qa.1")
+    # Without the pattern the version has one counter, above every app's builds.
+    _, whole = qa(tmp_path, gh, target, run_id="8")
+    assert whole["version-name"] == "1.13.1-qa.61"
+    # A tag from before the pattern names one build of no app, which may be either's.
+    rolling(repo, "qa-develop", "1.13.1-qa.70", 100_000_140, target)
+    gh = FakeGitHub()
+    _, hub = qa(tmp_path, gh, target, run_id="9", asset_pattern=SLEEPHUB)
+    _, sweet = qa(tmp_path, gh, target, run_id="10", asset_pattern=SWEETSLEEP)
+    assert (hub["version-name"], sweet["version-name"]) == ("1.13.1-qa.71", "1.13.1-qa.71")
+
+
+@pytest.mark.parametrize(
+    ("pattern", "counter"),
+    [
+        ("", "refs/qa-numbers/1.13.1"),
+        (SLEEPHUB, "refs/qa-numbers/1.13.1/app-SleepHub_-2a-2eapk"),
+        (SWEETSLEEP, "refs/qa-numbers/1.13.1/app-SweetSleep_-2a-2eapk"),
+        # What git refuses in a ref: * ? [ .., a part that starts with . or ends in .lock.
+        ("[!a-z]?..lock", "refs/qa-numbers/1.13.1/app--5b-21a-2dz-5d-3f-2e-2elock"),
+        (".apk", "refs/qa-numbers/1.13.1/app--2eapk"),
+        # Digits only: app- keeps it apart from a number of the version's own counter.
+        ("123", "refs/qa-numbers/1.13.1/app-123"),
+    ],
+)
+def test_the_counter_of_an_app_is_a_ref_git_takes(repo, pattern, counter):
+    assert build_numbers.qa_counter("1.13.1", pattern) == counter
+    git(repo, "check-ref-format", f"{counter}/1")
+
+
+def test_no_two_patterns_share_a_counter():
+    patterns = ["a-b", "a_2db", "a-2db", "a.b", "a-2eb", "a", "A", "*", "-2a", ".apk", "-apk", SLEEPHUB, "SleepHub_?.apk", "SleepHub_[!x].apk"]
+    assert len({build_numbers.qa_counter("1.0.0", pattern) for pattern in patterns}) == len(patterns)
 
 
 # --- the version bump looks and reserves nothing --------------------------------------------------

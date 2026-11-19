@@ -35,6 +35,14 @@ refs are behind what was published (a build of another scheme, one made by
 hand), and when the floor is above every code of a major that has no build
 yet. A major above 20 has no codes at all.
 
+QA numbers. The name of a QA build, <version>-qa.<N>, has a number of its own,
+which counts the QA builds of that version from 1, of each app apart when the
+builds name their APKs by a pattern (asset-pattern). It is reserved the same
+way, as refs/qa-numbers/<version>/<N> or refs/qa-numbers/<version>/app-<key>/<N>,
+with the same object, so a run that is run again keeps its name too. The first
+number of a version is one above the QA builds of it that are out already, by
+the names the rolling tags hold, so no name is given twice.
+
 The API is reached through a function the caller passes, so the tests run
 against a stand-in. A server error, or a request that got no answer, is made
 again a few times; every request here may be.
@@ -50,6 +58,9 @@ from typing import Callable, Iterable, Optional
 from version_code import MAJOR_BLOCK, MAX_BUILD_NUMBER, MAX_VERSION_CODE, VersionCodeError, build_code, major_codes
 
 REFS = "refs/build-numbers"
+QA_REFS = "refs/qa-numbers"
+# What an asset pattern keeps of itself in the name of its counter: git and a URL take these as they are.
+APP_KEY = re.compile(r"[A-Za-z0-9_]")
 # The name inside the tag object of a reservation. The number is the ref's.
 OBJECT_TAG = "build-number"
 TAGGER = {"name": "github-actions[bot]", "email": "41898282+github-actions[bot]@users.noreply.github.com"}
@@ -95,6 +106,31 @@ class BuildNumber:
     ref: str  # the ref that holds it; empty when the plan only looked
     kept: bool  # an earlier attempt of the same run reserved it
     notice: str = ""  # something to say that did not stop the build
+
+
+@dataclass(frozen=True)
+class QaNumber:
+    version: str
+    pattern: str  # the asset pattern of the app; empty for the one counter of the version
+    number: int
+    why: str  # where the number comes from, for the log
+    ref: str
+    kept: bool  # an earlier attempt of the same run reserved it
+
+
+def qa_counter(version: str, pattern: str = "") -> str:
+    """Where the QA numbers of a version are reserved: refs/qa-numbers/<version>, or a directory of the app below it.
+
+    The pattern becomes one part of the ref's name. Every byte but a letter, a
+    digit and _ is written as - and two hex digits, so the part holds nothing
+    git refuses in a ref (* ? [ .. .lock) or a URL has to quote, and no two
+    patterns give the same part: SleepHub_*.apk is app-SleepHub_-2a-2eapk.
+    The app- in front keeps it apart from a number of the version's own counter.
+    """
+    if not pattern:
+        return f"{QA_REFS}/{version}"
+    key = "".join(chr(byte) if APP_KEY.fullmatch(chr(byte)) else f"-{byte:02x}" for byte in pattern.encode())
+    return f"{QA_REFS}/{version}/app-{key}"
 
 
 def codes_in_name(name: str) -> list:
@@ -235,7 +271,7 @@ class Repository:
         return status, headers, document
 
     @staticmethod
-    def _refusal(what: str, status: int, document: object, scope: str) -> BuildNumberError:
+    def _refusal(what: str, status: int, document: object, scope: str, refs: str = REFS) -> BuildNumberError:
         message = document.get("message") if isinstance(document, dict) else None
         message = message if isinstance(message, str) else ""
         said = f": {message}" if message else ""
@@ -243,7 +279,7 @@ class Repository:
         if "rate limit" in message.lower():
             hint = " GitHub limits the requests of the token for now: run the job again later."
         elif status == 422 and "rule" in message.lower():
-            hint = f" A ruleset of the repository refuses it: let the job token create {REFS}/*, or keep those refs out of the ruleset."
+            hint = f" A ruleset of the repository refuses it: let the job token create {refs}/*, or keep those refs out of the ruleset."
         elif status in (401, 403, 404):
             hint = f" The job's token needs {scope}."
         elif status >= 500:
@@ -268,16 +304,20 @@ class Repository:
                 raise BuildNumberError(f"the next page of the answer to {what} is not on {self.root}: {url}")
         return items
 
-    def reserved(self, major: int) -> dict:
-        """The numbers reserved for the major, each with the id of the object its ref names."""
-        ref = re.compile(rf"{re.escape(REFS)}/{major}/([1-9][0-9]*)")
+    def numbers(self, counter: str, what: str) -> dict:
+        """The numbers reserved as <counter>/<n>, each with the id of the object its ref names."""
+        ref = re.compile(rf"{re.escape(counter)}/([1-9][0-9]*)")
         numbers = {}
-        for item in self._listed(f"git/matching-refs/build-numbers/{major}/", f"list the build numbers of major {major}"):
+        for item in self._listed(f"git/matching-refs/{counter[len('refs/'):]}/", what):
             match = ref.fullmatch(str(item.get("ref", "")))
             target = item.get("object")
             if match:
                 numbers[int(match[1])] = target.get("sha", "") if isinstance(target, dict) else ""
         return numbers
+
+    def reserved(self, major: int) -> dict:
+        """The numbers reserved for the major, each with the id of the object its ref names."""
+        return self.numbers(f"{REFS}/{major}", f"list the build numbers of major {major}")
 
     def published(self) -> list:
         """The releases and pre-releases of the repository. A draft is not out, and is left out."""
@@ -322,7 +362,7 @@ class Repository:
         message = document.get("message") if isinstance(document, dict) else ""
         if status == 422 and isinstance(message, str) and "already exists" in message.lower():
             return False
-        raise self._refusal(f"create {name}", status, document, "contents: write")
+        raise self._refusal(f"create {name}", status, document, "contents: write", "/".join(name.split("/")[:2]))
 
 
 def reserve(
@@ -358,23 +398,82 @@ def reserve(
     shipped = [*repository.shipped(), *seen]
     number, why = next_number(major, reserved, shipped, floor)
     notice = floor_of_a_later_line(major, reserved, shipped, floor)
-    taken = []
-    for _ in range(MAX_TRIES):
-        ref = f"{REFS}/{major}/{number}"
-        if repository.create_ref(ref, own):
-            if taken:
-                why = f"{why}; {', '.join(taken)} taken meanwhile by another build"
-            return BuildNumber(major, number, build_code(major, number), why, ref, False, notice)
-        taken.append(str(number))
-        number += 1
+
+    def check(number: int) -> None:
         try:
             build_code(major, number)
         except VersionCodeError as exc:
             raise BuildNumberError(f"{exc}. Nothing is built") from None
+
+    number, ref, why = take(repository, f"{REFS}/{major}", number, own, why, f"build numbers of major {major}", check)
+    return BuildNumber(major, number, build_code(major, number), why, ref, False, notice)
+
+
+def take(
+    repository: Repository,
+    counter: str,
+    number: int,
+    own: str,
+    why: str,
+    what: str,
+    check: Callable[[int], None] = lambda _: None,
+) -> tuple:
+    """Create <counter>/<number> naming `own`, or the first such ref above it that is free.
+
+    Returns the number, its ref and why, with the numbers other builds took
+    meanwhile. `check` refuses a number above the first before it is tried.
+    """
+    taken = []
+    for _ in range(MAX_TRIES):
+        ref = f"{counter}/{number}"
+        if repository.create_ref(ref, own):
+            if taken:
+                why = f"{why}; {', '.join(taken)} taken meanwhile by another build"
+            return number, ref, why
+        taken.append(str(number))
+        number += 1
+        check(number)
     raise BuildNumberError(
-        f"{MAX_TRIES} build numbers of major {major} in a row were taken while this build tried them, up to "
-        f"{number - 1}. Run the plan again"
+        f"{MAX_TRIES} {what} in a row were taken while this build tried them, up to {number - 1}. Run the plan again"
     )
+
+
+def reserve_qa(
+    repository: Repository,
+    version: str,
+    pattern: str,
+    commit: str,
+    marker: str,
+    date: str,
+    published: Iterable[tuple],
+) -> QaNumber:
+    """Reserve the next QA number of the version for this run, or find the one an earlier attempt reserved.
+
+    With `pattern` the app of that asset pattern counts apart. `marker` and
+    `date` are those of the run's build number, so both refs name one object.
+    `published` is (k, where) of each QA build <version>-qa.<k> of the app that
+    is out: the next number is above them too, and a name is never given twice.
+    """
+    counter = qa_counter(version, pattern)
+    of = f"{version} of {pattern}" if pattern else version
+    own = repository.tag_object(commit, marker, date)
+    reserved = repository.numbers(counter, f"list the QA numbers of {of}")
+    kept = [number for number, sha in reserved.items() if sha == own]
+    if kept:
+        number = max(kept)
+        return QaNumber(version, pattern, number, "reserved by an earlier attempt of this run, and kept", f"{counter}/{number}", True)
+    last = max(reserved, default=0)
+    out = max(published, key=lambda item: item[0], default=None)
+    if out and out[0] > last:
+        # Names the run number gave, published before the counter existed or beside it.
+        before = f", above {counter}/{last}, the last number reserved" if last else f": no QA number of {of} was reserved before"
+        number, why = out[0] + 1, f"one above {out[0]}, {out[1]}{before}"
+    elif last:
+        number, why = last + 1, f"one above {counter}/{last}, the last number reserved"
+    else:
+        number, why = 1, f"the first QA build of {of}: no QA number of it was reserved before, and none of its QA builds is out"
+    number, ref, why = take(repository, counter, number, own, why, f"QA numbers of {of}")
+    return QaNumber(version, pattern, number, why, ref, False)
 
 
 def look(repository: Repository, major: int, seen: Iterable[Shipped], floor: Optional[int]) -> BuildNumber:

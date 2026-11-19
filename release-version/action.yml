@@ -65,7 +65,8 @@ inputs:
       (contents: read; with minor-blocks once, to refuse the formula for a
       major that has them), and with version-code-scheme build-number reads
       the releases (contents: read, for next) and reserves a build number
-      (contents: write, for qa and code).
+      (contents: write, for qa and code), and for qa the number in the name
+      of a QA build.
     required: false
     default: ${{ github.token }}
   version:
@@ -91,13 +92,16 @@ inputs:
   qa-sequence:
     description: >-
       For code with kind qa, and for qa. Number of the QA build, 1 or higher;
-      a later build has a higher number. Not read for a label build.
+      a later build has a higher number. Not read for a label build, nor
+      with version-code-scheme build-number: qa then counts the QA builds of
+      each version itself.
     required: false
     default: ''
   qa-sequence-offset:
     description: >-
       For qa, optional. A whole number added to qa-sequence, for a counter
-      that started again below the builds that are installed.
+      that started again below the builds that are installed. Not read with
+      version-code-scheme build-number, and a warning says so unless it is 0.
     required: false
     default: ''
   ref:
@@ -160,9 +164,10 @@ inputs:
       refused before it reserves. For qa and changes, optional: the same
       pattern, for a rolling pre-release that holds a build of several apps,
       one line per app in its tag's message. qa refuses a pattern with other
-      characters than an APK name's and the wildcards. changes then reads
-      the build before from this app's line, and hands the other apps' lines
-      back in kept-builds.
+      characters than an APK name's and the wildcards, and with build-number
+      numbers the QA builds of this app apart from the other apps'. changes
+      then reads the build before from this app's line, and hands the other
+      apps' lines back in kept-builds.
     required: false
     default: ''
   version-code-scheme:
@@ -172,7 +177,9 @@ inputs:
       version_code.py, from the version. build-number: the major's block plus
       the next build number of that major, which qa and code reserve in the
       repository as refs/build-numbers/<major>/<n>, and next looks up
-      without reserving. The version names are the same in both.
+      without reserving. The version names have the same form in both; with
+      build-number the N of <version>-qa.<N> counts the QA builds of the
+      version from 1, which qa reserves as refs/qa-numbers/<version>/<N>.
     required: false
     default: minor-blocks
   version-code-floor:
@@ -256,8 +263,10 @@ outputs:
   number:
     description: >-
       For qa. The number in the version name: of a QA build, qa-sequence plus
-      qa-sequence-offset; of a label build, one above the label builds
-      published after the same release.
+      qa-sequence-offset, or with build-number the number reserved for it
+      among the QA builds of its version (of its app, with asset-pattern);
+      of a label build, one above the label builds published after the same
+      release.
     value: ${{ steps.version.outputs.number }}
   line:
     description: For qa. The branch as it appears in names, slashes as hyphens.
