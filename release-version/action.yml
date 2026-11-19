@@ -157,7 +157,12 @@ inputs:
       asset of its release matches. When none does, the build is the app's
       first for the tag and takes the next number, unless a later release or
       preview of the same major has an asset that matches: that build is
-      refused before it reserves.
+      refused before it reserves. For qa and changes, optional: the same
+      pattern, for a rolling pre-release that holds a build of several apps,
+      one line per app in its tag's message. qa refuses a pattern with other
+      characters than an APK name's and the wildcards. changes then reads
+      the build before from this app's line, and hands the other apps' lines
+      back in kept-builds.
     required: false
     default: ''
   version-code-scheme:
@@ -279,10 +284,14 @@ outputs:
       the tag object of an annotated tag; empty when the tag does not exist.
     value: ${{ steps.version.outputs.since-object }}
   stale:
-    description: "For changes. 'true' when the since tag names a later commit that contains this one."
+    description: >-
+      For changes. 'true' when the since tag names a later commit that
+      contains this one; with asset-pattern, when its line of that app does.
     value: ${{ steps.version.outputs.stale }}
   unchanged:
-    description: "For changes. 'true' when the since tag names this very commit."
+    description: >-
+      For changes. 'true' when the since tag names this very commit; with
+      asset-pattern, when its line of that app does.
     value: ${{ steps.version.outputs.unchanged }}
   code-taken-by:
     description: >-
@@ -293,8 +302,16 @@ outputs:
   since-code:
     description: >-
       For changes with version-code. The versionCode of the build the since
-      tag holds, as its message names it; empty when it names none.
+      tag holds, as its message names it; empty when it names none. With
+      asset-pattern, of the build of that app.
     value: ${{ steps.version.outputs.since-code }}
+  kept-builds:
+    description: >-
+      For changes with asset-pattern. The lines of the since tag's message
+      that name the builds of the other apps, "<pattern> <version name>
+      (<versionCode>) <commit>", one per line and sorted: what the tag keeps
+      when this app's build is published. Empty when there are none.
+    value: ${{ steps.version.outputs.kept-builds }}
 
 runs:
   using: composite

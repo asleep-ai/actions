@@ -59,13 +59,17 @@ qa    Plan a QA build of a branch head: its version name, its versionCode and
         plus the number, which counts the label builds published after that
         release. It installs over the release, and the next patch release
         installs over it. A line without a release has no label builds.
+      - asset-pattern names the APKs of one app, for a pre-release that holds
+        a build of several apps; it is checked here and read by changes.
 
 changes
       What a commit adds to the commit a tag names (the previous build of a
       rolling QA release), as the pull request list of next. When the tag
       does not exist or is not part of the commit's history, the list starts
       at the last release the commit contains. With version-code, also
-      whether another rolling tag holds a build of that versionCode.
+      whether another rolling tag holds a build of that versionCode. With
+      asset-pattern, the build before is the one of that app in the tag's
+      message, and the builds of the other apps are handed back to be kept.
 
 version-code-scheme says which versionCode a build gets. minor-blocks, the
 default, is the formula of version_code.py, computed from the version and the
@@ -126,6 +130,10 @@ RESERVED_LABELS = (QA_SUFFIX, "release") + PRERELEASES
 # release are counted from these messages.
 ROLLING_TAGS = "refs/tags/qa-*"
 ROLLING_MESSAGE = re.compile(r"(?P<name>\S+) \((?P<code>[1-9][0-9]*)\)")
+# A line per app below the first when the pre-release holds several apps' builds, so each app's stays known.
+ROLLING_BUILD = re.compile(r"(?P<pattern>\S+) (?P<name>\S+) \((?P<code>[1-9][0-9]*)\) (?P<commit>[0-9a-f]{40})")
+# The characters of an APK's name and *, ? and [...]: the pattern is written into that line and a job name.
+ASSET_PATTERN = re.compile(r"[A-Za-z0-9._*?!\[\]-]+")
 MAINTENANCE = re.compile(r"release/(?P<major>0|[1-9][0-9]*)\.x")
 # Characters git allows in a ref name and that need no quoting anywhere a tag is used. Not a leading
 # hyphen: git would read such a tag as an option.
@@ -183,6 +191,13 @@ class Changes:
     prs: str
     stale: bool  # the tag names a later commit that contains this one
     unchanged: bool  # the tag names this very commit
+
+
+@dataclass(frozen=True)
+class Rolling:
+    name: str  # the version name of the build the message names first, the one published last
+    code: int
+    builds: tuple = ()  # (pattern, version name, versionCode, commit) per app, when the tag names one per app
 
 
 def escape(text: str) -> str:
@@ -904,21 +919,47 @@ def qa_base(
     return version, last, own, "given as version"
 
 
-def rolling_builds() -> list:
-    """The builds the rolling pre-releases hold, as (tag, version name, versionCode).
+def rolling_tags(refs: str = ROLLING_TAGS) -> dict:
+    """What the messages of the rolling tags among `refs` say, by tag.
 
     A rolling pre-release holds one build, and its tag says which: the publish
     job writes "<version name> (<versionCode>)" into the annotated tag it moves.
-    A tag without such a message names no build.
+    One that holds a build per app (asset-pattern) has a line per app below,
+    "<pattern> <version name> (<versionCode>) <commit>". A tag without such a
+    message names no build.
     """
-    listing = git("for-each-ref", "--format=%(refname:strip=2)%1f%(objecttype)%1f%(contents:subject)", ROLLING_TAGS)
+    listing = git(
+        "for-each-ref", "--format=%(refname:strip=2)%1f%(objecttype)%1f%(contents:subject)%1f%(contents:body)%1e", refs
+    )
+    tags = {}
+    for record in listing.stdout.split("\x1e"):
+        tag, kind, subject, body = (record.lstrip("\n").split("\x1f") + ["", "", ""])[:4]
+        match = ROLLING_MESSAGE.fullmatch(subject.strip()) if tag and kind == "tag" else None
+        if not match:
+            continue
+        lines = (ROLLING_BUILD.fullmatch(line.strip()) for line in body.splitlines())
+        builds = tuple((line["pattern"], line["name"], int(line["code"]), line["commit"]) for line in lines if line)
+        tags[tag] = Rolling(match["name"], int(match["code"]), builds)
+    return tags
+
+
+def rolling_builds() -> list:
+    """The builds the rolling pre-releases hold, as (tag, version name, versionCode): every app's."""
     builds = []
-    for line in listing.stdout.splitlines():
-        tag, kind, subject = (line.split("\x1f") + ["", ""])[:3]
-        match = ROLLING_MESSAGE.fullmatch(subject.strip()) if kind == "tag" else None
-        if match:
-            builds.append((tag, match["name"], int(match["code"])))
+    for tag, held in rolling_tags().items():
+        builds.extend((tag, name, code) for _, name, code, _ in held.builds or [("", held.name, held.code, "")])
     return builds
+
+
+def checked_asset_pattern(env: Mapping[str, str]) -> str:
+    """asset-pattern as it was given, or a Failure: it is written as it is into a tag message and a job name."""
+    pattern = env.get("ASSET_PATTERN", "")
+    if pattern and not ASSET_PATTERN.fullmatch(pattern):
+        raise Failure(
+            f"asset-pattern is {pattern!r}. It is the file name pattern of the APKs of one app, such as "
+            "SweetSleep_*.apk: letters, digits, . _ - and the wildcards * ? [ ] !, without whitespace"
+        )
+    return pattern
 
 
 def label_numbers(base: tuple, scheme: str = MINOR_BLOCKS) -> list:
@@ -944,9 +985,8 @@ def label_numbers(base: tuple, scheme: str = MINOR_BLOCKS) -> list:
     return numbers
 
 
-def changes_since(target: str, since_tag: str, prefix: str) -> Changes:
-    """What `target` adds to the commit `since_tag` names, or to its last release."""
-    earlier = commit_of(f"refs/tags/{since_tag}") if since_tag else None
+def changes_since(target: str, earlier: Optional[str], prefix: str) -> Changes:
+    """What `target` adds to `earlier`, the commit of the build before, or to its last release."""
     if earlier == target:
         return Changes(since=earlier, prs="", stale=False, unchanged=True)
     if earlier and contains(target, earlier):
@@ -984,6 +1024,7 @@ def plan_qa(env: Mapping[str, str], call: build_numbers.Call = http_call) -> QaP
     if not BRANCH.fullmatch(source_branch):
         raise Failure(f"source-branch is not a branch name: {source_branch!r}")
     scheme = version_code_scheme(env)
+    checked_asset_pattern(env)
 
     # Only what was merged is built: the source branch and the maintenance branches.
     branch = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ""
@@ -1236,7 +1277,9 @@ def run_qa(env: Mapping[str, str], call: build_numbers.Call = http_call) -> None
     if plan.build_number:
         print_build_number(plan.build_number)
     print(f"Version name: {plan.version_name} (versionCode {plan.version_code}, {what} {plan.number})")
-    print(f"Published as: {plan.release_tag}")
+    pattern = env.get("ASSET_PATTERN", "")
+    apart = f", the APKs that {pattern} matches next to the builds of the other apps" if pattern else ""
+    print(f"Published as: {plan.release_tag}{apart}")
     write_outputs(env, {
         "version": plan.version,
         "version-name": plan.version_name,
@@ -1262,8 +1305,19 @@ def run_changes(env: Mapping[str, str]) -> None:
         raise Failure(f"since is not a tag name: {since_tag!r}")
     if git("rev-parse", "--is-shallow-repository").stdout.strip() == "true":
         raise Failure("the checkout is shallow, so tags and history are incomplete; check out with fetch-depth: 0")
+    pattern = checked_asset_pattern(env)
     target = named_commit(env.get("SHA", "").strip())
-    changes = changes_since(target, since_tag, prefix)
+    tags = rolling_tags()
+    held = tags.get(since_tag)
+    # The tag names the commit of whichever app's build was published last, so this app's is read from its line.
+    own = next((build for build in held.builds if build[0] == pattern), None) if pattern and held else None
+    if pattern:
+        earlier = commit_of(own[3]) if own else None
+        before = f"{own[1]} ({own[2]}) of {own[3][:7]}" if own else "none, so the list starts at the last release"
+        print(f"The build of {pattern} that {since_tag or 'no tag'} holds: {before}.")
+    else:
+        earlier = commit_of(f"refs/tags/{since_tag}") if since_tag else None
+    changes = changes_since(target, earlier, prefix)
     # What the tag names in this checkout, unpeeled: the tag object of an annotated tag. A caller
     # that moves the tag afterwards can tell whether it is still where this list was read from.
     named = git("rev-parse", "--verify", "--quiet", f"refs/tags/{since_tag}", check=False) if since_tag else None
@@ -1275,24 +1329,42 @@ def run_changes(env: Mapping[str, str]) -> None:
     # The since tag itself counts unless it names this very commit: the same build published again
     # is no second build, but two runs of one label on two commits were planned with one number,
     # and the one that publishes second finds its own tag holding the code for another commit.
+    # With asset-pattern that is the build of this app in the since tag; the other apps' count.
     taken_by = ""
     given = {}
     given_code = env.get("VERSION_CODE", "").strip()
     if given_code:
         code = whole_number(given_code, "version-code")
-        builds = rolling_builds()
+        builds = [
+            (tag, line_pattern, line_code)
+            for tag, rolling in tags.items()
+            for line_pattern, _, line_code, _ in rolling.builds or [("", rolling.name, rolling.code, "")]
+        ]
+
+        def replaced(tag: str, line_pattern: str) -> bool:
+            return tag == since_tag and (not pattern or line_pattern == pattern)
+
         taken_by = next(
-            (tag for tag, _, held in builds if held == code and (tag != since_tag or not changes.unchanged)), ""
+            (tag for tag, line, number in builds if number == code and not (replaced(tag, line) and changes.unchanged)), ""
         )
         if taken_by:
             print(f"{taken_by} holds a build of the versionCode {code}.")
-        # The code of the build the since tag holds now. In the build-number scheme a build is not
-        # published over one with a higher code: the caller compares.
-        given["since-code"] = next((str(held) for tag, _, held in builds if tag == since_tag), "")
+        # The code of the build the since tag holds now (this app's with asset-pattern). In the
+        # build-number scheme a build is not published over one with a higher code: the caller compares.
+        if pattern:
+            given["since-code"] = str(own[2]) if own else ""
+        else:
+            given["since-code"] = str(held.code) if held else ""
+    if pattern:
+        # The builds of the other apps, which the caller writes into the tag again next to this one.
+        apps = held.builds if held else ()
+        kept = sorted(f"{app} {name} ({number}) {commit}" for app, name, number, commit in apps if app != pattern)
+        given["kept-builds"] = "\n".join(kept)
+    holds = f"{since_tag} holds the build of {pattern} of" if pattern else f"{since_tag} is at"
     if changes.stale:
-        print(f"{since_tag} is at {changes.since[:7]}, a later commit that contains {target[:7]}.")
+        print(f"{holds} {changes.since[:7]}, a later commit that contains {target[:7]}.")
     elif changes.unchanged:
-        print(f"{since_tag} is at {target[:7]} already.")
+        print(f"{holds} {target[:7]} already.")
     else:
         print(f"Changes of {target[:7]} since {changes.since or 'the first commit'}:")
         print(changes.prs or "No commits listed.")

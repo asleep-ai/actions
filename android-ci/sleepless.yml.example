@@ -50,7 +50,8 @@ jobs:
       # tag, and a manual run the tag it is given.
       tag: ${{ github.event_name == 'schedule' && 'qa-develop' || github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || inputs.tag }}
       app: HeySleep
-      # A release with one APK per brand names the one to upload by default:
+      # A release with one APK per brand, or a pre-release with a build per
+      # app (asset-pattern of qa.yml), names the one to upload by default:
       # asset: ${{ inputs.asset || 'HeySleep_main_*.apk' }}
       asset: ${{ inputs.asset }}
     # By name: the workflow needs these two, and no other secret.

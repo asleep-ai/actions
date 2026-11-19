@@ -652,6 +652,65 @@ def test_the_wait_is_two_minutes_and_the_calling_file_does_not_change_it(plan):
     assert plan["timeout-minutes"] == 15
 
 
+# A rolling pre-release of android-qa.yml with a build per app (asset-pattern): SleepHub of one commit,
+# SweetSleep of another and published last, each named in a line of the tag's message.
+HUB_APK = "SleepHub_qa_2.0.1-qa.57_200000123.apk"
+SWEET_APK = "SweetSleep_qa_2.0.1-qa.60_200000126.apk"
+APPS_TAG = (
+    "2.0.1-qa.60 (200000126)\n\n"
+    f"SleepHub_*.apk 2.0.1-qa.57 (200000123) {OTHER_COMMIT}\n"
+    f"SweetSleep_*.apk 2.0.1-qa.60 (200000126) {COMMIT}\n"
+)
+
+
+def test_each_apk_of_a_pre_release_with_a_build_per_app_is_of_its_apps_build(plan, tmp_path, github):
+    github.tag("qa-release-1.x", message=APPS_TAG)
+    ids = github.release("qa-release-1.x", **{HUB_APK: apk_bytes(), SWEET_APK: apk_bytes(code="200000126")})
+    # The calling file names the app, as for a release with an APK per brand: its code and commit are its line's.
+    result, outputs = find(plan, tmp_path, github, tag="qa-release-1.x", asset="SleepHub_*.apk")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs == {"asset-id": str(ids[HUB_APK]), "asset-name": HUB_APK, "commit": OTHER_COMMIT, "tag-code": "200000123"}
+    result, outputs = find(plan, tmp_path, github, tag="qa-release-1.x", asset="SweetSleep_*.apk")
+    assert outputs == {"asset-id": str(ids[SWEET_APK]), "asset-name": SWEET_APK, "commit": COMMIT, "tag-code": "200000126"}
+    # Without asset both are of a build the tag names: no replacing ends that.
+    result, outputs = find(plan, tmp_path, github, tag="qa-release-1.x")
+    assert result.returncode == 1 and outputs == {}
+    assert f"The release qa-release-1.x holds 2 APKs: {HUB_APK}, {SWEET_APK}. Name the one to upload with asset" in result.stdout
+    assert release_reads(github, "qa-release-1.x") == 3
+    # The lines are the ones release-version reads and android-qa.yml writes.
+    sys.path.insert(0, str(ROOT / "release-version"))
+    import release_version
+
+    assert re.sub(r"\?P<[a-z]+>", "", release_version.ROLLING_BUILD.pattern) in step(plan, "Find the APK")["run"]
+
+
+def test_while_one_app_replaces_its_apk_the_other_apps_apk_is_found_as_it_is(plan, tmp_path, github):
+    # SweetSleep's next build moved the tag and is going up next to its build before.
+    new_sweet = "SweetSleep_qa_2.0.1-qa.61_200000127.apk"
+    github.tag("qa-release-1.x", message=APPS_TAG.replace("2.0.1-qa.60 (200000126)", "2.0.1-qa.61 (200000127)"))
+    ids = github.release(
+        "qa-release-1.x", **{HUB_APK: apk_bytes(), SWEET_APK: apk_bytes(code="200000126"), new_sweet: apk_bytes(code="200000127")},
+    )
+    result, outputs = find(plan, tmp_path, github, tag="qa-release-1.x", asset="SweetSleep_*.apk")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (outputs["asset-id"], outputs["tag-code"]) == (str(ids[new_sweet]), "200000127")
+    assert f"also holds {SWEET_APK}, of the build before: the QA build that moved the tag to 2.0.1-qa.61 (200000127)" in result.stdout
+    result, outputs = find(plan, tmp_path, github, tag="qa-release-1.x", asset="SleepHub_*.apk")
+    assert (outputs["asset-id"], outputs["tag-code"], outputs["commit"]) == (str(ids[HUB_APK]), "200000123", OTHER_COMMIT)
+    assert release_reads(github, "qa-release-1.x") == 2
+
+
+def test_an_apk_that_no_line_of_the_tag_names_is_of_no_build(plan, tmp_path, github):
+    # SleepHub's APK from before the calling file named the apps; SweetSleep's run wrote its line since.
+    github.tag("qa-release-1.x", message=f"2.0.1-qa.60 (200000126)\n\nSweetSleep_*.apk 2.0.1-qa.60 (200000126) {COMMIT}\n")
+    ids = github.release("qa-release-1.x", **{HUB_APK: apk_bytes(), SWEET_APK: apk_bytes(code="200000126")})
+    result, outputs = find(plan, tmp_path, github, tag="qa-release-1.x", asset="SleepHub_*.apk")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs == {"asset-id": str(ids[HUB_APK]), "asset-name": HUB_APK, "commit": COMMIT, "tag-code": ""}
+    assert f"qa-release-1.x names no build that {HUB_APK} is of: the commit of the tag stands for it." in result.stdout
+    assert release_reads(github, "qa-release-1.x") == 1
+
+
 @pytest.mark.parametrize("message", ["v2.0.0", None])
 def test_several_apks_of_a_release_tag_are_an_error_at_once(plan, tmp_path, github, message):
     # A release tag names no build: nothing replaces its APKs, and several of them are a setting to make.

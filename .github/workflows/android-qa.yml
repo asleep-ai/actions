@@ -123,6 +123,19 @@ on:
         required: false
         type: string
         default: app/build/outputs/apk
+      asset-pattern:
+        description: >-
+          Optional, for a repository that builds several apps (applicationIds)
+          into one rolling pre-release, one app per run: the file name pattern
+          of the APKs this run builds (*, ? and [...], compared case by case),
+          such as SweetSleep_*.apk, as android-release.yml takes it. Every APK
+          of the build has to match it, or nothing is published. The run
+          replaces the APKs of the pre-release that the pattern matches and
+          keeps the other apps', and its tag names each app's build. Empty: the
+          pre-release is one build, as before.
+        required: false
+        type: string
+        default: ''
       expected-cert-sha256:
         description: >-
           Optional SHA-256 digest of the signing certificate the APK must
@@ -365,8 +378,9 @@ jobs:
   # label, its version, or neither. The inputs of a run cannot be read from
   # another run, and the names of its jobs can. That is how the step that
   # cancels earlier runs finds the manual runs of the same label.
+  # asset-pattern is in the name too, so a run of one app cancels no run of another.
   plan:
-    name: ${{ github.event_name == 'push' && 'plan' || format('plan ({0})', inputs.label || inputs.version || 'manual run') }}
+    name: ${{ github.event_name == 'push' && format('plan{0}', inputs.asset-pattern != '' && format(' ({0})', inputs.asset-pattern) || '') || format('plan ({0}{1})', inputs.label || inputs.version || 'manual run', inputs.asset-pattern != '' && format(', {0}', inputs.asset-pattern) || '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -472,6 +486,8 @@ jobs:
           qa-sequence-offset: ${{ inputs.sequence-offset }}
           version-code-scheme: ${{ inputs.version-code-scheme }}
           version-code-floor: ${{ inputs.version-code-floor }}
+          # Checked here, before anything is built: publish writes it into the tag's message.
+          asset-pattern: ${{ inputs.asset-pattern }}
 
       # release-version says which scheme it computed with. One from before
       # build numbers (the tag android-ci/v1 not moved yet, or a branch of
@@ -507,6 +523,7 @@ jobs:
           RELEASE_TAG: ${{ steps.qa.outputs.release-tag }}
           VERSION_GIVEN: ${{ inputs.version }}
           BUILD_NUMBER: ${{ steps.qa.outputs.build-number }}
+          ASSET_PATTERN: ${{ inputs.asset-pattern }}
         run: |
           set -euo pipefail
           after="no release yet"
@@ -538,6 +555,9 @@ jobs:
             fi
             echo "- versionCode: $VERSION_CODE"
             echo "- Published as the pre-release \`$RELEASE_TAG\` when the build and the commit's checks pass"
+            if [[ -n "$ASSET_PATTERN" ]]; then
+              echo "- Its APKs replace those that \`$ASSET_PATTERN\` matches there; the other apps' builds stay"
+            fi
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -573,7 +593,7 @@ jobs:
           WORKFLOW_REF: ${{ github.workflow_ref }}
           EVENT_NAME: ${{ github.event_name }}
           BRANCH: ${{ github.ref_name }}
-          PLAN_JOB: ${{ github.event_name == 'push' && 'plan' || format('plan ({0})', inputs.label || inputs.version || 'manual run') }}
+          PLAN_JOB: ${{ github.event_name == 'push' && format('plan{0}', inputs.asset-pattern != '' && format(' ({0})', inputs.asset-pattern) || '') || format('plan ({0}{1})', inputs.label || inputs.version || 'manual run', inputs.asset-pattern != '' && format(', {0}', inputs.asset-pattern) || '') }}
         run: |
           set -euo pipefail
           python3 -I - <<'CANCEL'
@@ -652,8 +672,10 @@ jobs:
               jobs = listed(f"actions/runs/{run['id']}/jobs?per_page=100", "jobs")
               # A push builds the one line of its branch. A manual run says in the name of its plan
               # job which line it builds; a run that has no such job yet is not known to be this one.
-              if event != "push" and not any(named(job, plan_job) for job in jobs):
-                  print(f"Run {number} ({theirs[:7]}) has no job '{plan_job}': another manual build, left alone.")
+              # A push with asset-pattern says which app it builds the same way.
+              if plan_job != "plan" and not any(named(job, plan_job) for job in jobs):
+                  other = "another manual build" if event != "push" else "a build of another app"
+                  print(f"Run {number} ({theirs[:7]}) has no job '{plan_job}': {other}, left alone.")
                   return False
               if any(named(job, "publish") and job.get("status") in ("in_progress", "completed") for job in jobs):
                   print(f"Run {number} ({theirs[:7]}) is publishing: left to finish.")
@@ -1093,6 +1115,7 @@ jobs:
     if: ${{ !cancelled() && needs.checks.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Not one group per app (asset-pattern): every app's run rewrites the one tag message, in turn.
     concurrency:
       group: ${{ needs.checks.result == 'success' && format('android-qa-publish-{0}-{1}', needs.plan.outputs.major || 'source', inputs.label || (inputs.version != '' && needs.plan.outputs.version) || 'rolling') || format('android-qa-no-publish-{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: false
@@ -1180,6 +1203,36 @@ jobs:
           name: android-qa-apk-${{ needs.primary.result == 'success' && 'primary' || 'fallback' }}
           path: ${{ runner.temp }}/android-qa-apk
 
+      # An APK the pattern does not match would be kept by every later build of this app.
+      - name: Check the APKs against asset-pattern
+        if: ${{ inputs.asset-pattern != '' }}
+        env:
+          ASSET_PATTERN: ${{ inputs.asset-pattern }}
+          APK_DIRECTORY: ${{ runner.temp }}/android-qa-apk
+        run: |
+          set -euo pipefail
+          python3 -I - <<'NAMES'
+          import fnmatch
+          import os
+          import sys
+
+          pattern = os.environ["ASSET_PATTERN"].strip()
+          names = sorted(name for _, _, files in os.walk(os.environ["APK_DIRECTORY"]) for name in files if name.endswith(".apk"))
+          if not pattern:
+              print("asset-pattern is empty: every APK of the build is published.")
+              sys.exit(0)
+          others = [name for name in names if not fnmatch.fnmatchcase(name, pattern)]
+          if others:
+              print(
+                  f"::error title=An APK does not match asset-pattern::asset-pattern is {pattern}, and the build made "
+                  f"{', '.join(others)}, which it does not match. Nothing is published. Pass the pattern of the APKs "
+                  "this run builds, from the same input that chooses the app (gradle-args), and start a new run.",
+                  flush=True,
+              )
+              sys.exit(1)
+          print(f"Every APK of the build matches asset-pattern {pattern}: {', '.join(names) or 'none'}.")
+          NAMES
+
       # Full history and every tag: the notes list what the commit adds to the
       # build before it, which the rolling tag still names, and the other
       # rolling tags say which versionCodes are published.
@@ -1200,6 +1253,8 @@ jobs:
           sha: ${{ needs.plan.outputs.sha }}
           since: ${{ steps.names.outputs.tag }}
           version-code: ${{ needs.plan.outputs.version-code }}
+          # The build before is this app's, and the other apps' builds are handed back to be kept.
+          asset-pattern: ${{ inputs.asset-pattern }}
 
       # One pre-release per line, named by a tag that is not a release tag
       # (qa-..., never v...). Every build moves the tag to its commit and
@@ -1257,6 +1312,8 @@ jobs:
           NOTES_FILE: ${{ runner.temp }}/android-qa-notes.md
           BUILT_ON: ${{ needs.primary.result == 'success' && 'primary' || 'fallback' }}
           SELF_HOSTED: ${{ needs.plan.outputs.self-hosted }}
+          ASSET_PATTERN: ${{ inputs.asset-pattern }}
+          KEPT_BUILDS: ${{ steps.changes.outputs.kept-builds }}
         run: |
           set -euo pipefail
           apks=()
@@ -1270,17 +1327,32 @@ jobs:
             exit 1
           fi
           url="$GITHUB_SERVER_URL/$GH_REPO/releases/tag/$TAG"
+          message="$VERSION_NAME ($VERSION_CODE)"
+          builds=""
+          at="$TAG is at"
+          of_app=""
+          if [[ -n "$ASSET_PATTERN" ]]; then
+            # The pre-release holds a build per app, so its tag names each, this one replacing its app's line.
+            builds=$(printf '%s\n' "$KEPT_BUILDS" "$ASSET_PATTERN $VERSION_NAME ($VERSION_CODE) $SHA" | sed '/^$/d' | LC_ALL=C sort)
+            message+=$'\n\n'"$builds"
+            at="$TAG holds the build of $ASSET_PATTERN of"
+            of_app=" of \`$ASSET_PATTERN\`"
+          fi
+          # Whether an asset is this app's to replace: the other apps' patterns protect theirs, and a copy counts by the name it takes.
+          of_this_app() {
+            [[ -z "$ASSET_PATTERN" ]] || python3 -I -c 'import fnmatch, re, sys; name = re.sub(r"\.run-[0-9]+-[0-9]+\.apk$", ".apk", sys.argv[1]); others = [line.split(" ", 1)[0] for line in sys.argv[3].splitlines() if line.strip()]; sys.exit(not fnmatch.fnmatchcase(name, sys.argv[2]) or any(fnmatch.fnmatchcase(name, other) for other in others))' "$1" "$ASSET_PATTERN" "$KEPT_BUILDS" < /dev/null
+          }
 
           # The pre-release is past this commit: a run that was started again
           # after the build of a later commit was published, or one whose
           # cancelling did not work. The commit was built, which is what its
           # check says; its APK is not what the line offers.
           if [[ "$STALE" == true ]]; then
-            echo "::notice title=A newer build is published::$TAG is at ${SINCE:0:7}, a later commit that contains ${SHA:0:7}. This build is not published: an older build does not replace a newer one."
+            echo "::notice title=A newer build is published::$at ${SINCE:0:7}, a later commit that contains ${SHA:0:7}. This build is not published: an older build does not replace a newer one."
             {
               echo "### $VERSION_NAME is not published"
               echo
-              echo "The pre-release [\`$TAG\`]($url) holds the build of \`${SINCE:0:7}\`, a later commit that contains \`${SHA:0:7}\`."
+              echo "The pre-release [\`$TAG\`]($url) holds the build$of_app of \`${SINCE:0:7}\`, a later commit that contains \`${SHA:0:7}\`."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -1305,14 +1377,22 @@ jobs:
           # published as before.
           if [[ "$VERSION_CODE_SCHEME" == build-number && -n "$SINCE_CODE" ]]; then
             if [[ "$UNCHANGED" == true ]] && (( 10#$SINCE_CODE > 10#$VERSION_CODE )); then
-              echo "::notice title=A higher build of this commit is published::$TAG holds ${SHA:0:7} with the versionCode $SINCE_CODE, above this build's $VERSION_CODE. This build is not published."
+              echo "::notice title=A higher build of this commit is published::$TAG holds ${ASSET_PATTERN:+the build of $ASSET_PATTERN of }${SHA:0:7} with the versionCode $SINCE_CODE, above this build's $VERSION_CODE. This build is not published."
               exit 0
             fi
             if [[ "$UNCHANGED" != true ]] && (( 10#$SINCE_CODE >= 10#$VERSION_CODE )); then
-              echo "::error title=A higher versionCode is published::$VERSION_NAME has the versionCode $VERSION_CODE, and the pre-release $TAG holds a build of ${SINCE:0:7} with the versionCode $SINCE_CODE, which is not lower: a device that has that build would not take this one. The two runs reserved their build numbers in another order than their commits. Nothing is published. Start the workflow again on the branch (a new run, not a re-run of this one): it reserves a new number."
+              echo "::error title=A higher versionCode is published::$VERSION_NAME has the versionCode $VERSION_CODE, and the pre-release $TAG holds a build ${ASSET_PATTERN:+of $ASSET_PATTERN }of ${SINCE:0:7} with the versionCode $SINCE_CODE, which is not lower: a device that has that build would not take this one. The two runs reserved their build numbers in another order than their commits. Nothing is published. Start the workflow again on the branch (a new run, not a re-run of this one): it reserves a new number."
               exit 1
             fi
           fi
+
+          # The next build of the other app would delete an APK of this one that its pattern matches.
+          for apk in "${apks[@]}"; do
+            if ! of_this_app "$(basename "$apk")"; then
+              echo "::error title=asset-pattern overlaps::$(basename "$apk") matches $ASSET_PATTERN, and also the pattern of another app whose build $TAG holds, one of: $(cut -d ' ' -f 1 <<< "$KEPT_BUILDS" | paste -s -d ' ' -). Nothing is published: that app's next build would delete it. Give each app a pattern that matches its own APKs only."
+              exit 1
+            fi
+          done
 
           # Two states, each read in a statement of its own: a request that
           # failed must not read as "does not exist".
@@ -1343,16 +1423,32 @@ jobs:
             exit 1
           fi
 
+          replaces="replaces the APK here"
+          if [[ -n "$ASSET_PATTERN" ]]; then
+            replaces="replaces the APKs of its app here, the ones its asset-pattern matches, and keeps the other apps'"
+          fi
           {
             if [[ "$KIND" == label ]]; then
-              echo "Label build \`$APART\` of \`$BRANCH\`: a named test build. Every build with this label replaces the APK here. This is not a release."
+              echo "Label build \`$APART\` of \`$BRANCH\`: a named test build. Every build with this label $replaces. This is not a release."
             else
-              echo "Rolling QA build of \`$BRANCH\`${APART:+, of the version \`$APART\` that was given for it}. Every build of it replaces the APK here. This is not a release."
+              echo "Rolling QA build of \`$BRANCH\`${APART:+, of the version \`$APART\` that was given for it}. Every build of it $replaces. This is not a release."
             fi
             echo
-            echo "| version | versionCode | commit | built |"
-            echo "|---------|-------------|--------|-------|"
-            echo "| \`$VERSION_NAME\` | $VERSION_CODE | [\`${SHA:0:7}\`]($GITHUB_SERVER_URL/$GH_REPO/commit/$SHA) | $(date -u '+%Y-%m-%d %H:%M UTC'), [run $GITHUB_RUN_NUMBER]($GITHUB_SERVER_URL/$GH_REPO/actions/runs/$GITHUB_RUN_ID) |"
+            built="$(date -u '+%Y-%m-%d %H:%M UTC'), [run $GITHUB_RUN_NUMBER]($GITHUB_SERVER_URL/$GH_REPO/actions/runs/$GITHUB_RUN_ID)"
+            if [[ -n "$ASSET_PATTERN" ]]; then
+              # A row per app, from the lines the tag gets: the notes are rewritten by every app's build.
+              echo "| APKs | version | versionCode | commit |"
+              echo "|------|---------|-------------|--------|"
+              while read -r held_pattern held_name held_code held_commit; do
+                echo "| \`$held_pattern\` | \`$held_name\` | ${held_code//[()]/} | [\`${held_commit:0:7}\`]($GITHUB_SERVER_URL/$GH_REPO/commit/$held_commit) |"
+              done <<< "$builds"
+              echo
+              echo "Published last: \`$VERSION_NAME\` of \`$ASSET_PATTERN\`, $built."
+            else
+              echo "| version | versionCode | commit | built |"
+              echo "|---------|-------------|--------|-------|"
+              echo "| \`$VERSION_NAME\` | $VERSION_CODE | [\`${SHA:0:7}\`]($GITHUB_SERVER_URL/$GH_REPO/commit/$SHA) | $built |"
+            fi
             echo
             if [[ "$KIND" == label ]]; then
               echo "Made after \`$PREVIOUS_TAG\`. It installs over \`$PREVIOUS_TAG\` and over the label builds made after it before this one, and \`$VERSION\` installs over it."
@@ -1363,20 +1459,20 @@ jobs:
             fi
             echo
             if [[ "$UNCHANGED" == true ]]; then
-              echo "#### Changes"
+              echo "#### Changes$of_app"
               echo
               echo "The same commit as the build before."
             elif [[ -z "$SINCE" ]]; then
               # No build and no release before this one: the list would be
               # the whole history of the repository.
-              echo "#### Changes"
+              echo "#### Changes$of_app"
               echo
               echo "The first build of this line, with no release before it to compare with."
             else
               if [[ "$SINCE" =~ ^[0-9a-f]{40}$ ]]; then
-                echo "#### Changes since the build before (\`${SINCE:0:7}\`)"
+                echo "#### Changes$of_app since the build before (\`${SINCE:0:7}\`)"
               else
-                echo "#### Changes since \`$SINCE\`"
+                echo "#### Changes$of_app since \`$SINCE\`"
               fi
               echo
               # printf: a pull request title is data, not a format or an option.
@@ -1388,7 +1484,7 @@ jobs:
           # each of these returns at its first failure itself.
           move_tag() {
             local object
-            object=$(GH_TOKEN="$TAG_TOKEN" gh api --method POST "repos/$GH_REPO/git/tags" -f "tag=$TAG" -f "message=$VERSION_NAME ($VERSION_CODE)" -f "object=$SHA" -f type=commit --jq '.sha') || return 1
+            object=$(GH_TOKEN="$TAG_TOKEN" gh api --method POST "repos/$GH_REPO/git/tags" -f "tag=$TAG" -f "message=$message" -f "object=$SHA" -f type=commit --jq '.sha') || return 1
             if [[ "$tag_exists" == true ]]; then
               GH_TOKEN="$TAG_TOKEN" gh api --method PATCH "repos/$GH_REPO/git/refs/tags/$TAG" -f "sha=$object" -F force=true > /dev/null || return 1
             else
@@ -1457,8 +1553,16 @@ jobs:
           }
 
           title="QA $LINE${APART:+ $APART}: $VERSION_NAME"
+          by_hand="-m '$VERSION_NAME ($VERSION_CODE)'"
+          if [[ -n "$ASSET_PATTERN" ]]; then
+            # The apps' builds have names of their own, which the notes list.
+            title="QA $LINE${APART:+ $APART}"
+            while IFS= read -r line; do
+              by_hand+=" -m '$line'"
+            done <<< "$builds"
+          fi
           if ! move_tag; then
-            echo "::error title=The tag could not be moved::$TAG was not moved to ${SHA:0:7}; the reason is in the lines above. Nothing is published, and the pre-release is as it was. When the repository's rules keep the job token from moving the tag, pass a token that may as the secret RELEASE_PUSH_TOKEN, or move it by hand: git tag -f -a $TAG -m '$VERSION_NAME ($VERSION_CODE)' ${SHA:0:7} && git push -f origin $TAG, and run this job again."
+            echo "::error title=The tag could not be moved::$TAG was not moved to ${SHA:0:7}; the reason is in the lines above. Nothing is published, and the pre-release is as it was. When the repository's rules keep the job token from moving the tag, pass a token that may as the secret RELEASE_PUSH_TOKEN, or move it by hand: git tag -f -a $TAG $by_hand ${SHA:0:7} && git push -f origin $TAG, and run this job again."
             exit 1
           fi
           # What a call of step 3 that failed left to do.
@@ -1517,7 +1621,7 @@ jobs:
                 if grep -Fxq -- "$asset" <<< "$kept"; then
                   keep=true
                 fi
-                if [[ -n "$id" && "$keep" == false ]]; then
+                if [[ -n "$id" && "$keep" == false ]] && of_this_app "$asset"; then
                   if gh api --method DELETE "repos/$GH_REPO/releases/assets/$id" > /dev/null; then
                     echo "Deleted $asset of the build before."
                   else
@@ -1529,6 +1633,9 @@ jobs:
               left="${left:+$left; }the APKs of the build before could not be listed and are still there"
             fi
             action="Replaced the APK of the pre-release with $names"
+            if [[ -n "$ASSET_PATTERN" ]]; then
+              action="Replaced the APKs$of_app in the pre-release with $names"
+            fi
           else
             # A release whose tag was deleted is a draft from then on, and a
             # draft is not found by its tag: it would stay behind next to the
