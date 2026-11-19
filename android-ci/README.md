@@ -8,6 +8,7 @@ Reusable workflows for Android app repositories. The calling repository keeps a 
 | [`android-version-bump.yml`](../.github/workflows/android-version-bump.yml) | Release cut, started by hand: computes the next version from the tags and checks the commit. A dry run by default; with `dry_run` off and the planned version in `confirm`, it tags the commit `vX.Y.Z`, or `vX.Y.0-preview.N` for a preview of a new minor or major version. |
 | [`android-release.yml`](../.github/workflows/android-release.yml) | Release of a tag `vX.Y.Z`: a check of the tagged commit, a signed build in which every task runs, a check of the APK, and a GitHub Release with the APK attached. A tag `vX.Y.0-preview.N` is built the same way and published as a pre-release. |
 | [`android-qa.yml`](../.github/workflows/android-qa.yml) | QA build of every push to a branch that is released from: the same signed build with a QA version, published as the rolling pre-release of its line once the commit's checks passed. Its check is what a release requires of the commit's release variant. A manual run can make a label build: a named test build that installs over the last release. |
+| [`android-sleepless.yml`](../.github/workflows/android-sleepless.yml) | Upload of the APK of a release, a preview or a rolling pre-release to Sleepless, the QA team's regression system, from a self-hosted runner in the office network, when its versionCode is above every upload of its package before. When to upload is the calling file's choice: the daily QA build, every preview and release, and the rest by hand. |
 
 A version exists only as a git tag. No file in the calling repository states it, and no branch marks it:
 
@@ -1014,6 +1015,171 @@ As for the release ([Secrets and variables](#secrets-and-variables)): the callin
 
 The runner drops a job output that contains the value of a secret, without failing the job that set it. The plan therefore passes on numbers, a commit id and a release tag only, and the other jobs put the names of a build together themselves: a key alias such as `release` does not empty the name of a maintenance line (`release/1.x`, `qa-release-1.x`). A job that still receives an empty value says so before it does anything else.
 
+## android-sleepless.yml
+
+Uploads an APK of the calling repository's GitHub Releases to Sleepless (GADS), the QA team's regression system: the rolling pre-release of a QA build (`qa-develop`), of a label build or of a version, a preview or a release, named by its tag. Sleepless installs the build on its devices, runs the regression and reports the result. The workflow ends with the upload, which [`sleepless-upload`](../sleepless-upload/) makes.
+
+### Usage
+
+```yaml
+name: Sleepless
+
+on:
+  # 19:00 KST.
+  schedule:
+    - cron: '0 10 * * *'
+  # The name of the calling file of android-release.yml. A preview is
+  # released by the same workflow.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'The release whose APK is uploaded: qa-develop-ble-test, qa-develop-2.1.0, v2.0.0, ...'
+        required: true
+        type: string
+      asset:
+        description: 'Optional: which APK of it, as a file name pattern (HeySleep_brand_*.apk). Empty: its only APK'
+        required: false
+        type: string
+
+permissions:
+  contents: write       # read the releases, and record each upload as a ref
+
+jobs:
+  sleepless:
+    # A release run that did not succeed may have published nothing.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    uses: asleep-ai/actions/.github/workflows/android-sleepless.yml@android-ci/v1
+    with:
+      # The schedule uploads the rolling QA build, the end of a release run its
+      # tag, and a manual run the tag it is given.
+      tag: ${{ github.event_name == 'schedule' && 'qa-develop' || github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || inputs.tag }}
+      app: HeySleep
+      # A release with one APK per brand names the one to upload by default:
+      # asset: ${{ inputs.asset || 'HeySleep_main_*.apk' }}
+      asset: ${{ inputs.asset }}
+    # By name: the workflow needs these two, and no other secret.
+    secrets:
+      GADS_CLIENT_SECRET: ${{ secrets.GADS_CLIENT_SECRET }}
+      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
+```
+
+[`sleepless.yml.example`](./sleepless.yml.example) is a complete file.
+
+**When a build goes up is the calling file's choice.** The example makes three, after [what Sleepless does](#sleepless) with what it gets:
+
+| trigger | tag | what goes up |
+|---------|-----|--------------|
+| `schedule`, `0 10 * * *` (19:00 KST) | `qa-develop` | The rolling QA build of the source branch, once a day, and only when it is newer than the last upload. A day without a new build uploads nothing. |
+| `workflow_run` of `Release`, when it succeeded | the tag of the release run | Every preview and every release, once it is published. |
+| `workflow_dispatch` | `tag`, with `asset` | By hand: a label build (`qa-develop-ble-test`), a build of a version (`qa-develop-2.1.0`), the APK of another brand, or a build the other two did not upload. |
+
+- **A label build, a build of a version and another brand's APK go up by hand only.** Each upload of a higher build stops the regression that runs, so what goes up by itself is what the QA team tests every day: the QA build of the day, and a preview or a release when there is one.
+- The schedule's tag is the rolling pre-release of the source branch, `qa-<source branch>`. The QA builds of a maintenance line (`qa-release-1.x`) take a job of their own with that tag, or a manual run. GitHub may start a scheduled run some minutes late.
+- `workflows: [Release]` is the `name` of the calling file of `android-release.yml`. GitHub starts a `workflow_run` with the calling file of the default branch, and `github.event.workflow_run.head_branch` is the tag the release run was for. A release run that did not succeed is not followed. That includes a release whose build failed on the self-hosted runner and that the GitHub-hosted build then published: that run is red ([How a run is decided](#how-a-run-is-decided-1)). Upload such a release by hand.
+- **`permissions` must grant `contents: write`**: the plan reads the release, its tag and the records of the uploads, and the upload job writes a record. GitHub refuses to start the run when the calling file grants less.
+- **Pass the two secrets by name**, not with `secrets: inherit`. The workflow needs `GADS_CLIENT_SECRET` and `RUNNER_READ_TOKEN` and no other. With `inherit` every secret of the calling repository would reach it, and the runner drops a job output that contains the value of a secret it has: a key alias such as `release` would empty the name of `HeySleep_release_2.0.0.apk` between the two jobs.
+- **The variables are not passed**: `GADS_URL`, `GADS_CLIENT_ID` and `GADS_TENANT` are organization variables, and a called workflow reads the variables of its caller. The calling repository has to be one the organization shares them with, and the secret `GADS_CLIENT_SECRET` as well.
+- **No `concurrency` group.** Two runs that upload builds of one package at the same moment both upload, and Sleepless keeps the higher one; the second record of the same versionCode is a notice. A group would keep one waiting run and cancel the one before it, which could be a release.
+- **The checks of a run are on the commit it started for**, the head of the default branch for a schedule and a `workflow_run`: `sleepless / plan` and `sleepless / upload` in the example. No check of a build or a release is among them, and nothing requires them, so an upload that fails changes no `pr-check / result`, no `qa / built` and no release. Do not make them required checks.
+
+### Jobs
+
+```
+plan ─▶ upload
+```
+
+| job | runs on | what it does |
+|-----|---------|--------------|
+| `plan` | GitHub-hosted | Checks the inputs and that the settings are there, finds the APK of the release, downloads it, reads its package, versionName and versionCode with `aapt2`, compares the versionCode with the uploads of the package, and asks [`pick-runner`](../pick-runner/) whether a runner with `runner-labels` is online. |
+| `upload` | `runner-labels`, and nothing else | Only when the plan says so. Downloads the APK again and checks that it has the bytes the plan read, compares again, uploads it with [`sleepless-upload`](../sleepless-upload/) and records the upload. |
+
+- **The APK is read, not its name.** The package and the versionCode are what Sleepless reads from the file, so the plan reads them from the file too, with the highest `aapt2` of the runner's Android SDK, and they decide. The description in the dashboard is `<app> <versionName> (<versionCode>) · <tag> <commit>`, as the medical apps' is: `HeySleep 2.0.1-qa.57 (200000123) · qa-develop 3ff9b1a`.
+- The plan downloads the APK on a GitHub-hosted runner, where that is fast and costs the office network nothing, so a day without a new build ends there and takes no self-hosted runner.
+- The upload job checks nothing out and runs no code of the calling repository. The secret is in the environment of its upload step and of no other step; the job token, with `contents: write`, reaches the steps that download, compare and record. It deletes the APK at its end, however it ends. The job shares its host with the builds that run there ([Self-hosted runners](#self-hosted-runners)).
+- The job token is not sent where GitHub redirects the download of an asset.
+
+### Which builds are uploaded
+
+**An APK goes up when its versionCode is above every versionCode uploaded before for its package**, the applicationId of the APK.
+
+- Each upload is recorded as the ref `refs/sleepless/<package>/<versionCode>`, created through the API once Sleepless answered the upload with 2xx. It names a tag object on the tagged commit whose message says what was uploaded, from which release and by which run. GitHub creates a ref only when it does not exist, as for [the build numbers](#reserving-a-number).
+- **An APK whose versionCode is recorded is not uploaded again** (`Uploaded already`), **and one below the highest record is not uploaded either** (`Not newer than the last upload`): Sleepless switches neither to the build it has nor to a lower one. Both are notices, and the run is green.
+- The plan compares, and the upload job compares again right before the upload, for a run that uploaded in between.
+- **The records are per package.** Another brand with an applicationId of its own is another app in Sleepless, and its uploads are counted apart. Two brands that share one applicationId are one app there, and here.
+- **With the formula, the QA builds after a release are below it** ([Version and versionCode](#version-and-versioncode)): after `2.0.0` (`200050000`), `2.0.1-qa.N` is `200000000 + N`, and none of them goes up until the next minor version. With [build numbers](#build-numbers) every build is above the one before it. Switch the calling files to them before the first upload.
+- An upload is recorded only when it succeeded, so the next run tries a failed one again. When the upload succeeded and the record could not be written, the job fails, and the next run uploads the build once more, which Sleepless takes for the build it has.
+- `git ls-remote origin 'refs/sleepless/*'` lists the records. To upload a recorded build again, because Sleepless does not have it after all (it took the upload before the product was registered there, say), delete its ref: `git push origin --delete refs/sleepless/<package>/<versionCode>`. A record of a higher versionCode still holds back every lower one.
+- Branch and tag rulesets do not cover `refs/sleepless/*`; a push ruleset that does refuses the record, and the job says so.
+
+**Which APK** of the release:
+
+- `asset` empty: the release has to hold exactly one APK. With several (one per brand), the plan fails and lists them.
+- `asset` set: a file name pattern (`*`, `?`, `[…]`, compared case by case) that exactly one APK of the release matches.
+- An APK that the publish job of `android-qa.yml` uploaded next to the one of the same name, `<name>.run-<run id>-<attempt>.apk`, is not chosen: it is the next build, for the moment before it takes the name ([The rolling pre-release](#the-rolling-pre-release)).
+- Its name holds letters, digits and `. _ -` only, as the names of the workflows' APKs do.
+
+**A rolling pre-release can be replaced while a run reads it.** Its tag names the build it holds, `<version name> (<versionCode>)`, and the versionCode of the APK that was read has to be that one; otherwise the warning `The pre-release is being replaced`. An APK that was deleted before it was downloaded gives the warning `The APK is gone`. Neither uploads anything, and the run is green: start it again once the new build is published.
+
+### Sleepless
+
+What the QA team said of Sleepless (2026-11-18):
+
+- It looks for new builds every 30 seconds.
+- When a higher version or build of the same app arrives while a regression runs, it stops that regression and starts again with the new build. The report of the build that was stopped is not sent.
+- An Android regression takes about 3 hours 40 minutes.
+- It does not switch to the same version and build, nor to a lower one.
+
+**Uploads have to be about four hours apart for a result report.** So the rolling QA build goes up once a day, at 19:00 KST, and its regression is done before the next working day. A preview or a release goes up when it is published, and stops the regression of the day's QA build when it comes within those hours, because it is the build that matters then. Builds by hand are for when the team means to replace what runs.
+
+- The product (SleepHub, HeySleep) has to be registered in Sleepless by the QA team.
+- Sleepless's size limit for a file is not known yet; HeySleep's QA APK is about 360 MB. An upload refused for its size fails with HTTP 413, and says so.
+
+### The runner of the upload
+
+- **`GADS_URL` is in the office network**, which no GitHub-hosted runner reaches. The upload job runs on `runner-labels`, by default `["self-hosted","threadripper"]`, and the plan refuses labels without `self-hosted`. **There is no GitHub-hosted fallback.**
+- The plan asks [`pick-runner`](../pick-runner/), on a GitHub-hosted runner, whether a runner with those labels is online, before the job is queued. **When none is, the upload is skipped with the warning `Sleepless upload skipped`, and the run does not fail.** The next run uploads the build, or the run is started again once a runner is back. pick-runner's own warning says the run uses its fallback; nothing does.
+- Without `RUNNER_READ_TOKEN`, or when GitHub cannot be asked, pick-runner keeps the labels with a warning, as it does everywhere. The job then waits for one of those runners, and GitHub cancels a job that has waited 24 hours.
+- The job takes the runner for some minutes: the download from GitHub, the upload and the record. Its timeout is 60 minutes, which two attempts of the longest `upload-max-time` fit in.
+
+### When an upload fails
+
+**An upload that fails fails the run.** The upload job is red, with the error of [`sleepless-upload`](../sleepless-upload/#what-fails-the-step), nothing is recorded, and the next run tries again.
+
+- Why a failure and not a warning: an upload that did not happen is a regression that does not run, which the medical apps decided not to let pass quietly (asleep-ai/medical-apps#58). GitHub tells whoever last changed the schedule of a calling file that its scheduled run failed; a warning on a green run is seen by nobody.
+- It is a failure of this run only. The run is no part of any check of a build or a release, as above.
+- What is not a failure: no runner online and an APK that was replaced are warnings, an APK that is not newer a notice. Nothing is uploaded, and the run is green.
+- The plan fails before anything is uploaded when an input cannot be (a tag that is no tag name, an `app` of several lines, labels without `self-hosted`, an `upload-max-time` outside 60 to 1500), a setting is empty, the tag, its release or its APK is not there, the release holds several APKs and `asset` names none, or `aapt2` cannot read the APK.
+- An upload attempt has `upload-max-time` seconds, 900 by default. The medical apps' 300 seconds are enough for a 360 MB APK only from about 10 Mbit/s up; 900 seconds hold down to about 3 Mbit/s ([Time and attempts](../sleepless-upload/#time-and-attempts)).
+
+### Inputs
+
+| name | default | description |
+|------|---------|-------------|
+| `tag` | required | The tag of the GitHub Release whose APK is uploaded: `qa-develop`, `qa-develop-ble-test`, `qa-develop-2.1.0`, `v2.1.0-preview.1`, `v2.0.0`. |
+| `app` | required | The name of the app in the dashboard's description, one line of at most 60 characters. |
+| `asset` | `''` | Which APK of the release, as a file name pattern that exactly one APK matches (`HeySleep_brand_*.apk`). Empty: the release has to hold one APK. |
+| `runner-labels` | `["self-hosted","threadripper"]` | The `runs-on` labels of the upload job, as a JSON array that holds `self-hosted`: runners in the office network. |
+| `upload-max-time` | `900` | Seconds one upload attempt may take, from 60 to 1500. |
+
+### Outputs
+
+`uploaded` (`true` when this run uploaded the APK, else `false`) and `version-code`, the versionCode read from the APK.
+
+### Secrets and variables
+
+| name | kind | used for |
+|------|------|----------|
+| `GADS_URL` | organization variable | The address of Sleepless, in the office network. |
+| `GADS_CLIENT_ID` | organization variable | Sleepless's CI client. |
+| `GADS_TENANT` | organization variable | The tenant of the token request. |
+| `GADS_CLIENT_SECRET` | organization secret, passed by name | The secret of the CI client. Given to the upload step alone. |
+| `RUNNER_READ_TOKEN` | secret, passed by name, optional | `pick-runner`'s token. Without it the labels are used unchecked. |
+
+The plan checks that the four `GADS_*` values are set, without reading them, and fails before it downloads anything when one is not, naming every one that is empty.
+
 ## The warm Gradle homes
 
 On a self-hosted runner, a build of `android-release.yml` or of `android-qa.yml` keeps its Gradle user home between builds, in a directory of the runner's user. Each calling repository has two such homes, and the kind of the build says which one it gets:
@@ -1310,7 +1476,7 @@ A repository that starts with `build-number` has no code out yet, so its first b
 - **A repository that takes over an app** (the same applicationId, released from another repository before): that app's versionCodes are in none of this repository's releases, and nothing here sees them. Before the first build, pass the highest versionCode in Google Play as `version-code-floor`, or start at a higher major (`next-version`). Without either, the builds would not install over the app.
 - Majors 0 to 20, as everywhere.
 - The `plan` jobs need `contents: write`, which the example files grant.
-- Uploading builds to Sleepless needs the product registered there (QA team) and the upload workflow (asleep-ai/actions#37).
+- Uploading builds to Sleepless needs the product registered there (QA team) and a calling file of [`android-sleepless.yml`](#android-sleeplessyml).
 
 ## Versioning
 
@@ -1405,6 +1571,11 @@ Moving the tag `android-ci/v1` to this release:
 - The scheme is chosen per calling repository, in its three calling files at once ([Switching a calling repository](#switching-a-calling-repository)). Turning it on is not undone.
 - The formula stays the default within `android-ci/v1`. Making build numbers the default, and removing the formula with `sequence-offset` and its limits, is for `android-ci/v2`, after the calling apps have switched.
 
+`android-ci/v1.5.0` adds [`android-sleepless.yml`](#android-sleeplessyml) and the action it uploads with, [`sleepless-upload`](../sleepless-upload/). **A caller that does nothing builds and releases as before**: no other workflow changed, and nothing is uploaded until the calling repository adds a calling file of the new workflow ([`sleepless.yml.example`](./sleepless.yml.example)).
+
+- The upload compares versionCodes, so a calling repository switches to [build numbers](#build-numbers) first: with the formula, the QA builds after a release are below it and do not go up.
+- The upload job runs on the self-hosted labels it is given, in the office network. The first run that uploads is the one to look at: whether `pick-runner` finds the runner, whether the runner reaches `GADS_URL`, how long the upload of the APK takes, and whether GitHub lets the job token create `refs/sleepless/*`.
+
 ## Development
 
 ```bash
@@ -1414,5 +1585,7 @@ uv run --with pytest --with pyyaml python -m pytest android-ci -q
 The tests read the workflow files. They run the shell of each `run` step against throwaway git repositories and stand-ins for `gradlew`, `keytool`, `gh`, `aapt2` and the GitHub API, check every combination of results and verdicts that `result` has to decide, and fail when the copies that have to match drift apart: the `verify` and `release-build` jobs, the `primary` and `fallback` calls of the build workflows, and the script that reads a commit's checks in the version bump, the release and the QA build. The step that chooses the Gradle user home and the one that tidies it are run for every kind of build, event and ref, against a stand-in for the home directory of the runner's user: which builds get the QA Gradle home and which the release Gradle home, that neither kind gets or touches the home of the other, that `gradle-home: cold` and a GitHub-hosted runner give a home of the job, that of several builds that start together one gets a home, what is deleted from it before and after a build, what becomes of a home whose build failed, was cancelled, died or was stopped, when a home is taken over from the job that has it, and that a link to another home is not followed. The plans are run with every value of `gradle-home` and of `qa-gradle-home`, alone and together. The step that cancels the runs of earlier commits is run against a stand-in for GitHub's lists of runs, jobs and artifacts and a git history of several pushes: which runs it cancels, that it never cancels a run that publishes, a run of a later commit or a manual run of another label, and that nothing it cannot ask fails the plan.
 
 The build numbers are tested in [`release-version`](../release-version/), against a stand-in for the API that creates a ref only once; here, what the plans pass to it and how the summary and `publish` read what it returns. Whether GitHub lets the job token create a ref under `refs/build-numbers/`, lists it through `matching-refs`, and makes the same tag object of the same content in a run that is run again, is seen only on GitHub.
+
+The upload to Sleepless is tested in `test_sleepless.py`, against a stand-in for the GitHub API (tags, releases, assets that are redirected elsewhere, refs that are created once) that also stands in for Sleepless, and a stand-in for `aapt2`: which APK of a release is chosen, that the token does not follow the redirect of a download, that a build that was uploaded, or is below the last upload, is not uploaded again, that a rolling pre-release being replaced and an APK that is gone upload nothing, that no online runner is a warning and no upload, how an upload is recorded and what a refused record says, and the upload job end to end with the script of `sleepless-upload`. Whether `pick-runner` finds the office runners, whether they reach `GADS_URL`, what Sleepless answers, how long a 360 MB upload takes, whether a `workflow_run` of a release run on a tag has the tag as `head_branch`, and whether the job token may create and list `refs/sleepless/*`, are seen only there.
 
 They cannot evaluate GitHub's expressions or its behaviour: job conditions, job names and the expressions that put a version name together are pinned as text, and how secrets of an environment reach a called workflow, whether a push or the move of a tag is accepted under the repository's rules, under which name the check of a job appears on a commit and a job in the list of a run's jobs, whether GitHub accepts the cancelling of a run by the job token and runs `built` for the run that was cancelled, which permissions the build job of a called workflow has, whether a started workflow runs, and how GitHub shows a pre-release whose tag was moved are verified only by running the workflows from a calling repository. The same holds for the two Gradle homes: no test runs Gradle, so how much time a filled home saves, what Gradle, its plugins and `setup-gradle` write into it, whether Gradle is content with a home that was tidied, and whether the run of a release has the ref and the event that give it its home are seen only on the runners ([What to look at in the first runs](#what-to-look-at-in-the-first-runs)). Which of `gradle-home` and `qa-gradle-home` reaches the build is an expression as well: the tests read `a || b || 'warm'` the way GitHub does, and do not run it. The stand-in for `gh` in the QA tests keeps the assets of a release and records them after every change, so the tests do see whether a release was ever without its APK; they do not see what the real API answers.

@@ -1,0 +1,58 @@
+name: Sleepless
+
+# Uploads APKs of this repository's GitHub Releases to Sleepless, the QA
+# team's regression system, which installs them on its devices, runs the
+# regression and reports. Sleepless takes about 3 hours 40 minutes for an
+# Android regression, and a higher build that arrives meanwhile stops it, so
+# uploads about four hours apart are the ones that get a report. Hence:
+#
+# - the rolling QA build of develop once a day, and only when it is newer than
+#   the last upload;
+# - every preview and every release, once it is published;
+# - a label build, a build of a version and another brand's APK by hand only.
+#
+# An APK whose versionCode is not above every upload of its package before is
+# not uploaded again; the run says so and stays green. The run is a run of its
+# own, so a failed upload changes no check of a build or a release.
+on:
+  # 19:00 KST.
+  schedule:
+    - cron: '0 10 * * *'
+  # The name of the calling file of android-release.yml. A preview is
+  # released by the same workflow.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'The release whose APK is uploaded: qa-develop-ble-test, qa-develop-2.1.0, v2.0.0, ...'
+        required: true
+        type: string
+      asset:
+        description: 'Optional: which APK of it, as a file name pattern (HeySleep_brand_*.apk). Empty: its only APK'
+        required: false
+        type: string
+
+# The called workflow can use no more than what is granted here, and it fails
+# to start when this is missing.
+permissions:
+  contents: write       # read the releases, and record each upload as a ref
+
+jobs:
+  sleepless:
+    # A release run that did not succeed may have published nothing.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    uses: asleep-ai/actions/.github/workflows/android-sleepless.yml@android-ci/v1
+    with:
+      # The schedule uploads the rolling QA build, the end of a release run its
+      # tag, and a manual run the tag it is given.
+      tag: ${{ github.event_name == 'schedule' && 'qa-develop' || github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || inputs.tag }}
+      app: HeySleep
+      # A release with one APK per brand names the one to upload by default:
+      # asset: ${{ inputs.asset || 'HeySleep_main_*.apk' }}
+      asset: ${{ inputs.asset }}
+    # By name: the workflow needs these two, and no other secret.
+    secrets:
+      GADS_CLIENT_SECRET: ${{ secrets.GADS_CLIENT_SECRET }}
+      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
