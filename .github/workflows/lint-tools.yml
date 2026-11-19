@@ -71,4 +71,4 @@ jobs:
       - name: Lint Ruff workflow example
         run: ${{ steps.get.outputs.executable }} ruff/ruff.yml.example
       - name: Lint Android workflow examples
-        run: ${{ steps.get.outputs.executable }} android-ci/pr-check.yml.example android-ci/version-bump.yml.example android-ci/release.yml.example
+        run: ${{ steps.get.outputs.executable }} android-ci/pr-check.yml.example android-ci/version-bump.yml.example android-ci/release.yml.example android-ci/sleepless.yml.example
