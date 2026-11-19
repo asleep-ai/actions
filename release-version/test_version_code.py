@@ -220,3 +220,45 @@ def test_the_highest_code_is_within_the_limit():
     highest = label_code(20, version_code.MAX_MINOR, version_code.MAX_PATCH, version_code.MAX_LABEL)
     assert release_code(20, version_code.MAX_MINOR, version_code.MAX_PATCH) < highest <= MAX_VERSION_CODE
     assert MAX_VERSION_CODE < 2**31
+
+
+# --- the build-number scheme --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("major", "number", "code"),
+    [(0, 1, 1), (0, 42, 42), (1, 1_300_003, 101_300_003), (2, 7, 200_000_007), (2, 50_001, 200_050_001), (20, 99_999_999, 2_099_999_999)],
+)
+def test_build_codes(major, number, code):
+    assert version_code.build_code(major, number) == code
+
+
+@pytest.mark.parametrize("major", [0, 1, 2, 19])
+def test_every_build_of_a_major_is_below_every_build_of_the_next(major):
+    # As with the formula: a maintenance line stays below the line after it.
+    assert version_code.build_code(major, version_code.MAX_BUILD_NUMBER) < version_code.build_code(major + 1, 1)
+    assert version_code.major_codes(major) == (major * 100_000_000 + 1, major * 100_000_000 + 99_999_999)
+    # And every code the formula gives a major is in the block a build number has for it.
+    low, high = version_code.major_codes(major)
+    assert low <= qa_code(major, 0, 1) and label_code(major, version_code.MAX_MINOR, version_code.MAX_PATCH, version_code.MAX_LABEL) <= high
+
+
+def test_major_twenty_is_the_last_with_codes():
+    assert version_code.MAX_MAJOR == 20
+    assert version_code.build_code(20, version_code.MAX_BUILD_NUMBER) <= MAX_VERSION_CODE
+    assert 21 * 100_000_000 + 1 > MAX_VERSION_CODE
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: version_code.build_code(21, 1),
+        lambda: version_code.build_code(-1, 1),
+        lambda: version_code.build_code(0, 0),
+        lambda: version_code.build_code(2, version_code.MAX_BUILD_NUMBER + 1),
+        lambda: version_code.major_codes(21),
+    ],
+)
+def test_build_numbers_outside_the_blocks_are_refused(call):
+    with pytest.raises(VersionCodeError):
+        call()

@@ -34,7 +34,7 @@ Four kinds of build come out of this, all signed with the same key and numbered 
 | preview | `X.Y.0-preview.N` | the version bump with `prerelease: preview` | the pre-release `vX.Y.0-preview.N` | every one |
 | release | `X.Y.Z` | the version bump | the release `vX.Y.Z` | every one |
 
-Within a minor version: QA build < preview < release < label build made after that release < the next patch release.
+Within a minor version: QA build < preview < release < label build made after that release < the next patch release. With [build numbers](#build-numbers), a choice of the calling files, every build installs over every earlier build of its major instead, a QA build after a release included.
 
 How the workflows fit together is in [Branches, tags and releases](#branches-tags-and-releases).
 
@@ -377,7 +377,7 @@ The plan refuses the release, with an error that says which rule it was, when:
 - `version` is not `X.Y.Z`, is tagged already, or is not higher than the last release the commit contains;
 - the commit does not hold `release-workflow` as a workflow that calls `android-release.yml` and can be started by hand ([Starting the release](#starting-the-release)): a commit from before the repository adopted these workflows;
 - a check named in `required-checks` has not succeeded on the commit. The newest run of each check counts, and a check that never ran on the commit is a refusal;
-- the version has no versionCode under [the formula](#version-and-versioncode);
+- the version has no versionCode under [the formula](#version-and-versioncode); with `version-code-scheme: build-number`, its major is above 20 or the release would meet [the safety rule](#the-safety-rule);
 - with `prerelease`: the value is not `preview`, the version is a patch release, or the commit is the commit of the last preview of the version or does not contain it ([Previews](#previews));
 - the run is not a dry run and `confirm` is not the planned version ([Dry run and confirmation](#dry-run-and-confirmation)).
 
@@ -475,7 +475,7 @@ What this is and is not:
 ### Running again
 
 - The `tag` job plans the version again from the repository as it is when the job runs, and stops when the result differs from the plan: another release happened meanwhile. That covers a job that waited, for a runner or for an environment's reviewers, and a re-run of a failed job, which keeps the earlier plan.
-- A run whose `tag` job failed can be run again with **Re-run failed jobs**: the plan is kept, and the job finds out by itself how far it got. When the tag is on the commit already, it does only what is left: starting the release.
+- A run whose `tag` job failed can be run again with **Re-run failed jobs**: the plan is kept, and the job finds out by itself how far it got. When the tag is on the commit already, it does only what is left: starting the release. With [build numbers](#build-numbers), when the release of the tag exists by then, nothing is left, and the release is not started again: a new release run of a released tag is refused.
 - **Re-run all jobs**, or a new run with the same inputs, plans again. After the tag was pushed that plan fails, because the commit is now the last release and has nothing new. What is left can then be done by hand: start the release workflow for the tag.
 - A re-run keeps the inputs of the run, `dry_run` and `confirm` included: re-running a release that failed before it tagged is that release again, with no dry run in between.
 
@@ -495,6 +495,8 @@ What this is and is not:
 | `main-branch` | `''` | Optional. A branch that is moved to the commit of a release from the source branch. Empty, the default, moves no branch. |
 | `release-workflow` | `release.yml` | File name, in `.github/workflows`, of the calling repository's workflow that is started for the new tag. The commit that is released has to hold it, calling `android-release.yml`. Empty starts nothing and checks nothing. |
 | `environment` | `''` | Optional. An environment for the `tag` job. Empty, the default: no environment, and the job follows the plan at once. Only where required reviewers exist does naming one add an approval. Not the environment of the signing key. |
+| `version-code-scheme` | `minor-blocks` | The versionCode scheme the release is built with, as the calling `release.yml` passes it: `minor-blocks` (the formula; empty is the same) or `build-number`. With `build-number` the plan shows the build number the release would get now, reserves none, and refuses what the release would refuse ([Build numbers](#build-numbers)). |
+| `version-code-floor` | `''` | Optional, with `build-number`: the `version-code-floor` the release is built with. |
 
 ### Secrets
 
@@ -599,6 +601,8 @@ plan ─▶ primary / build ─▶ fallback / build ─▶ publish
 | `source-branch` | `''` | The branch releases are cut from. Empty means the repository's default branch. The tagged commit has to be in its first-parent history, or in that of `release/<major>.x`, the maintenance branch of the tag's major. |
 | `required-checks` | `pr-check / result`<br>`qa / built` | Names of the checks that must have succeeded on the tagged commit, one per line: by default the pull request check and the QA build of the push. Checked for every tag, whoever pushed it. Empty requires none. |
 | `release-notes-prompt` | `''` | System prompt for [`release-notes`](../release-notes/), replacing its built-in one. |
+| `version-code-scheme` | `minor-blocks` | How the build gets its versionCode. `minor-blocks`, the default (empty is the same): [the formula](#version-and-versioncode), from the tag. `build-number`: the next build number of the tag's major, reserved by `plan` ([Build numbers](#build-numbers)). Pass the same value to the QA build and the version bump. |
+| `version-code-floor` | `''` | Optional, with `build-number`: the highest versionCode of the app that is out where the repository's releases do not show it. Every build of its major is numbered above it. A build of a lower major is refused while that major has no build, and passed over with a notice once it has ([Where a major starts](#where-a-major-starts)). With `minor-blocks` it is not read, and a warning says so. |
 | `build-timeout-minutes` | `60` | Timeout of the build job, on either kind of runner. Size it for a cold build, in the release Gradle home as well: the first build on a host, a build that finds the home in use or discarded and the build on the GitHub-hosted runner are cold. |
 | `gradle-home` | `warm` | The Gradle user home of the build on a self-hosted runner. `warm`: the [release Gradle home](#the-warm-gradle-homes) of the repository, which only its releases and previews use, one at a time, and which is kept between them. `cold`: a home of the job, empty at its start and gone at its end. `reset`: the release Gradle home, emptied first. Empty means `warm`, so a calling file can pass an input of its manual run; any other value fails in `plan`. The build on a GitHub-hosted runner and the build after a failed one are always cold. |
 | `self-hosted-max-workers` | `32` | Gradle `--max-workers` on a self-hosted runner. Empty leaves Gradle's default. |
@@ -873,6 +877,7 @@ Two inputs change it:
 - A QA build installs over an earlier QA build of the same minor version, and a preview or a release of that minor version installs over it.
 - A QA build does not install over a release of its own minor version. `1.13.1-qa.57` is `101300057`, below `1.13.0` at `101350000`. What goes onto a device that runs the release is a [label build](#label-builds), or a QA build of the next minor version.
 - `N` has to stay below 49000, where the previews start. A build that would reach it fails in `plan`. `sequence-offset` may be negative.
+- With `version-code-scheme: build-number` the versionCode is the next [build number](#build-numbers) of the major instead, which `plan` reserves, and `N` is only part of the name.
 
 ### Label builds
 
@@ -893,6 +898,7 @@ A label build is a named test build: a fix to be confirmed on the device that sh
 - **It is published as a pre-release of its own**, `qa-<line>-<label>`. The line's rolling pre-release is not touched, and a later build with the same label replaces the labelled one. It stays until someone deletes it (`gh release delete qa-develop-ble-test --cleanup-tag`).
 - A label is lowercase letters, digits and single hyphens, at most 40 characters, and not the name of the line or of another kind of build (`qa`, `preview`, `release`). It cannot be combined with `version`.
 - Everything else is the build of a QA build: the same branches only, the same checks of the commit before the APK is published. `-PciBuildKind` is `label`.
+- With `version-code-scheme: build-number` its versionCode is a [build number](#build-numbers), above every build of the major before it, the release included, and below the next patch release, which is built after it. `k` is then counted from the version names the rolling tags hold (`<next patch>-<label>.<k>`, whatever the label), and has no limit of 99; a versionCode is never taken twice, so `The versionCode is taken` does not happen.
 
 A label is a name for a build, not a switch in the app. Behaviour that only one customer or one site gets belongs in the source branch behind a flag or a flavor; a label build of a branch that carries such a change is still that branch's code for everyone.
 
@@ -979,6 +985,8 @@ Each line has one GitHub Release, a pre-release that is never the latest release
 | `next-version` | `''` | Optional, for every run of the calling file: the version the branch is heading for. Used while it is higher than the last release, no higher than the next major version after it, and not released. |
 | `label` | `''` | Optional, for one run: makes the build a label build, a named test build numbered right after the last release of its line ([Label builds](#label-builds)). |
 | `sequence-offset` | `0` | A whole number added to the run number of the calling workflow to give the `N` of a QA build. |
+| `version-code-scheme` | `minor-blocks` | How a build gets its versionCode. `minor-blocks`, the default (empty is the same): [the formula](#version-and-versioncode), from the version and `N`. `build-number`: the next build number of the build's major, reserved by `plan`; `N` stays in the name ([Build numbers](#build-numbers)). Pass the same value to the release and the version bump. |
+| `version-code-floor` | `''` | Optional, with `build-number`: the highest versionCode of the app that is out where the repository's releases do not show it. Every build of its major is numbered above it. A build of a lower major is refused while that major has no build, and passed over with a notice once it has ([Where a major starts](#where-a-major-starts)). With `minor-blocks` it is not read, and a warning says so. |
 | `required-checks` | `pr-check / result` | Names of the checks that must have succeeded on the commit before its APK is published, one per line. Empty requires none. |
 | `checks-timeout-minutes` | `60` | How long `checks` waits, after the build, for a required check that has not finished. A whole number, at most 100. |
 | `build-timeout-minutes` | `60` | Timeout of the build job, on either kind of runner. Size it for a cold build, in the QA Gradle home as well: the first build on a host, a build that finds the home in use or discarded and the build on the GitHub-hosted runner are cold. |
@@ -1233,6 +1241,77 @@ The versionCode is computed in one place, [`release-version/version_code.py`](..
 
 A change of the formula has to keep every new code above the codes that devices already have; the tests next to the formula state the order it has to keep and the codes the calling apps have shipped. A release that shipped under an earlier formula keeps the code it has: a calling repository whose `1.13.0` is `101300000` finds the QA builds of 1.13 above that one release, and from `1.13.1` on the order above holds.
 
+### Build numbers
+
+The formula puts a QA build made after a release below that release: after `2.0.0` (`200050000`), `2.0.1-qa.N` is `200000000 + N`. A device, or a system that takes a build only when its versionCode is higher (Sleepless), does not take the QA builds that follow a release. `version-code-scheme: build-number` in the calling files gives every build the next build number of its major instead:
+
+```
+versionCode = X × 100000000 + n        n: the build number, 1 to 99999999, of the major version X
+```
+
+- **One counter per major, for every kind of build.** QA builds, label builds, previews and releases of major `X` take the next `n` in the order their plans run. Every build installs over every build of its major made before it, of any kind, and none over a later one. After `2.0.0` at `200050000`, the next QA build is `200050001`.
+- **The version names do not change**: `X.Y.Z`, `X.Y.0-preview.N`, `<next release>-qa.N` and `<next patch>-<label>.<k>`, computed as before. `N` is still the run number plus `sequence-offset`, and only a name. Without a versionCode to fit, `N` has no ceiling, a preview number neither, and the label builds after a release are counted from the names of the rolling tags, without the limit of 99.
+- **A run keeps its number; a new run gets a new one.** A run that is run again, its failed jobs or all of them, builds with the number it reserved first. The same commit built by another run (a manual run of the branch head) is another build with a higher number.
+- **A release that is out is built again only by its own run.** A new run of a tag whose GitHub Release exists would take a number above every build since, later releases included, and a device that took it would refuse those. `plan` of the release refuses it, and the version bump does not start the release again for a tag an earlier attempt pushed and released. Run the release's own run again (**Re-run failed jobs** or **Re-run all jobs**), which keeps its number. A release whose first run failed before it published has no GitHub Release yet, and a new run builds it. With the formula a tag had one code in every run, and a new run is allowed as before.
+- **A major is still a release line**, below every code of the next major, and `X` goes from 0 to 20.
+- **Within a major the order is the order of building, not of versions.** That is what makes a QA build after a release install over it. It also means that two branches of one major (two maintenance branches of 1.x, which this repository's [release lines](#release-lines) do not have) would interleave. A release of an older major after a later major exists stays below that major, as with the formula.
+
+#### Reserving a number
+
+- The `plan` job of [`android-qa.yml`](#android-qayml) and of [`android-release.yml`](#android-releaseyml) reserves the number through the GitHub API, with the job token: it creates the ref `refs/build-numbers/<X>/<n>`. GitHub creates a ref only when it does not exist, so of two builds that try one number at once, one gets it and the other takes the next. The refs are the counter.
+- Reserved once the plan has passed every rule: a run that is refused (a ref that is not built, a tag that is not on its branch, a check that failed) takes no number. A number whose build is cancelled or fails is not used again; a gap between versionCodes costs nothing.
+- The ref names a tag object made of the commit, the run's id and the time of the commit. A run that is run again makes the same object, finds the ref that names it and keeps the number, even when its first plan reserved the number and then failed.
+- **Call `android-qa.yml` and `android-release.yml` once per run of the calling workflow.** Two calls in one run (a job per flavor) make the same object for the same commit: the second finds the first one's number and keeps it when the two run one after the other, and takes another when they run at once.
+- [`android-version-bump.yml`](#android-version-bumpyml) reserves nothing. Its plan shows the number the release would get if it were built now, and refuses what the release would refuse; builds in between move the release's number up.
+- **Permissions**: the two `plan` jobs ask for `contents: write`. The calling files grant it already, for the rolling pre-release and for the GitHub Release; with the formula nothing is written. Branch and tag rulesets do not cover `refs/build-numbers/*`; a push ruleset that does refuses the ref, and the plan says so.
+- A request that GitHub answers with a server error, or does not answer, is made again up to three times before the plan fails. The pages of a long answer are followed where GitHub links them, `…/repositories/<id>/…`, on the API the token is for and nowhere else.
+- The refs are not cloned or fetched (a clone takes branches and tags) and GitHub shows them nowhere. `git ls-remote origin 'refs/build-numbers/*'` lists them.
+- **The refs grow by one per build**, and every plan reads those of its major. When that gets long, delete the lower ones and keep the highest few of each major (`git push origin --delete refs/build-numbers/2/1 …`): the highest is the counter. A run whose ref was deleted no longer finds its number when it is run again, and takes a new one.
+
+#### Where a major starts
+
+- A major with reserved numbers goes on one above the highest.
+- A major without any starts one above the highest versionCode of that major that is out:
+  - the versionCodes in the file names of the APKs and app bundles attached to the repository's GitHub Releases and pre-releases (drafts do not count). A versionCode is a part of the name of digits only between `_`, `-` and the ends of the name: `App_qa_2.0.0-qa.6_200000006.apk` holds `200000006`. A name without such a part is not counted, and a part of digits that is no versionCode (`64` of `x86_64`) is read as one, which matters only in major 0;
+  - the versionCodes the rolling tags `qa-*` name, `<version name> (<versionCode>)`.
+- Without either, the first build of major `X` is `X × 100000000 + 1`.
+- **`version-code-floor`** is the highest versionCode of the app that is out where neither shows it: the app in Google Play built from another repository, a build that was never attached to a release, a pre-release that was deleted. Every build of its major is numbered above it, also once numbers are reserved. A floor below the major does nothing. One above every code of a major that has no build yet refuses the build: no build of it would install over the app (a new repository that takes over an app, below). The floor is the calling file's, for every branch it builds, so a floor for 2.x is above every code of the maintenance line `release/1.x` too: for a major that has builds already (a number reserved, a code out) it is taken for a later line's floor, not used, and a notice says so.
+- With `version-code-scheme: minor-blocks` the floor is not read, and a warning says so: a calling file that sets a floor and not the scheme has missed half the switch.
+- The calling apps' codes on 2026-11-18 give these first builds: sleephub 2.x `200000007` (above `200000006` of `qa-develop`), 1.x `101300003` (above `101300002` of `qa-release-1.x`), heysleep 2.x `200049002` (above `2.0.0-preview.1`).
+
+#### The safety rule
+
+The plan refuses a build, with the reason and before it reserves anything, when:
+
+- its versionCode would not be above every code of its major that is out, as found above. That is the case when the reserved numbers are behind what was published: a build made with the formula after the switch, or one made by hand. The message names the code and where it is; pass that code as `version-code-floor` to go on above it;
+- its major is above 20, or `version-code-floor` is above every code of its major and that major has no build yet;
+- it is a new run of a tag whose GitHub Release exists ([above](#build-numbers));
+- the calling file asks for `build-number` and the `release-version` the workflow runs does not know it: one from before build numbers, which ignores the input and computes the formula (`release-version is from before build numbers`). That is a `release-version@android-ci/v1` from before the tag moved, or a branch of these workflows tried from a calling repository: point its `uses:` lines at the branch as well.
+
+**With the formula**, the plan reads the build numbers of its major once, and refuses the build when there are any: that major is numbered with `build-number` elsewhere, and formula codes keep no order with build numbers (`2.0.1` would be `200050100`, above every build number of 2.x so far). That is a branch that did not get the switch, or a tag on a commit from before it. A repository that never switched has none, and builds as it always did; when GitHub cannot be asked, the plan goes on with a warning.
+
+And the `publish` job of a QA build does not put a build over one with a higher versionCode. Which scheme it holds the build to is the one `plan` read, handed on as one of the two words, and not the calling file's value as it was written: `' build-number '` is `build-number` for both jobs, and an output that arrives as anything else stops `publish` with `The plan is incomplete`. Runs of two pushes in a row reserve in the order their plans get there, which need not be the order of their commits; the run of the later commit then has the lower number. It cancels the earlier run ([When pushes follow one another](#when-pushes-follow-one-another)), and when that did not happen, its `publish` fails with `A higher versionCode is published`: a new run of the branch reserves a new number. A run of the same commit with a higher number, published already, leaves the pre-release as it is. The comparison is with the build of the same pre-release only: between pre-releases (`qa-develop` and `qa-develop-<label>`), the order of publishing can differ from the order of the codes.
+
+#### Switching a calling repository
+
+1. Move the tag `android-ci/v1` to a version with build numbers first. A calling file that asks for `build-number` from an older `release-version` is refused ([The safety rule](#the-safety-rule)).
+2. Pass `version-code-scheme: build-number` in `qa.yml`, `release.yml` and `version-bump.yml`, and the same `version-code-floor` in all three if one is needed. The version bump does not build, but its plan reads the scheme to show and check the right versionCode.
+3. **Make the same change on every branch that is built**: the source branch and every `release/<major>.x`. A run takes the calling file of its own commit: the QA build the one of the pushed branch, the release the one of the tagged commit.
+4. **Do not release a commit from before the switch.** Its `release.yml` builds with the formula. The formula's plan refuses a major that has build numbers, so such a release fails in its plan rather than going out with a formula code; release a commit after the switch.
+5. Before the first build, look at what is out: the asset names of the releases and pre-releases, and the app in Google Play. A code that does not show there goes into `version-code-floor`.
+6. The first build's plan says where its number comes from: `Build number 7 of major 2, reserved as refs/build-numbers/2/7: one above 200000006, the build 2.0.0-qa.6 that qa-develop holds`. Install it over what the devices have before releasing with it. **A versionCode that went out cannot be taken back**: Android refuses to install a lower one.
+7. **There is no switching back.** Once a major has build numbers, the formula is refused for it; and its codes are below most build numbers (a QA build of 2.0 would be `200000000 + N` again).
+
+#### A new repository
+
+A repository that starts with `build-number` has no code out yet, so its first build is `X × 100000000 + 1`.
+
+- The major is the one of the version name. Without a release tag the builds are of `0.0.1`, major 0, and their versionCodes `1`, `2`, `3`, …. With `next-version: 1.0.0` the first QA build is `100000001`. A repository that goes from `0.x` to `1.0.0` starts major 1 at `100000001`, above every code major 0 can have.
+- **A repository that takes over an app** (the same applicationId, released from another repository before): that app's versionCodes are in none of this repository's releases, and nothing here sees them. Before the first build, pass the highest versionCode in Google Play as `version-code-floor`, or start at a higher major (`next-version`). Without either, the builds would not install over the app.
+- Majors 0 to 20, as everywhere.
+- The `plan` jobs need `contents: write`, which the example files grant.
+- Uploading builds to Sleepless needs the product registered there (QA team) and the upload workflow (asleep-ai/actions#37).
+
 ## Versioning
 
 The workflows are released together under `android-ci/vX.Y.Z`, with `android-ci/v1` as the floating major tag.
@@ -1314,6 +1393,18 @@ Moving the tag `android-ci/v1` to this release:
 - Moving the tag: not while a version bump, a release or a QA build is running, as before. A QA build of the version before that still has the QA Gradle home when the tag moves is known to the new builds by its file, which has not changed.
 - What only the first runs show is in [What to look at in the first runs](#what-to-look-at-in-the-first-runs).
 
+`android-ci/v1.4.0` adds [build numbers](#build-numbers): the inputs `version-code-scheme` and `version-code-floor` of the three workflows. **A caller that passes neither builds as before**, with the formula, and nothing is reserved or written.
+
+| what | before | from `v1.4.0` | a caller that does nothing |
+|------|--------|---------------|----------------------------|
+| inputs `version-code-scheme`, `version-code-floor` of `android-qa.yml`, `android-release.yml`, `android-version-bump.yml` | not there | `minor-blocks` (the formula) and empty by default; `build-number` gives every build the next build number of its major | as before |
+| the plans with the formula | read nothing from the API | read the build numbers of their major once, and refuse the formula for a major that has some | Nothing changes: a repository that never switched has none. When GitHub does not answer, the plan goes on with a warning. |
+| permissions of the `plan` jobs of `android-qa.yml` and `android-release.yml` | `contents: read` | `contents: write`, to reserve a build number; with the formula nothing is written | Nothing changes: the calling files grant `contents: write` already, for the pre-release and the GitHub Release. A calling file that grants only `contents: read` would not start, and could not publish before either. |
+| outputs of `release-version` | | `build-number`, written with `build-number` only; `version-code-scheme` of `next`, `code` and `qa`, the scheme as the step read it; `since-code` of `changes`, written whenever `version-code` is given | `version-code-scheme` and `since-code` reach the `publish` job of `android-qa.yml`, which compares the code with `build-number` only |
+
+- The scheme is chosen per calling repository, in its three calling files at once ([Switching a calling repository](#switching-a-calling-repository)). Turning it on is not undone.
+- The formula stays the default within `android-ci/v1`. Making build numbers the default, and removing the formula with `sequence-offset` and its limits, is for `android-ci/v2`, after the calling apps have switched.
+
 ## Development
 
 ```bash
@@ -1321,5 +1412,7 @@ uv run --with pytest --with pyyaml python -m pytest android-ci -q
 ```
 
 The tests read the workflow files. They run the shell of each `run` step against throwaway git repositories and stand-ins for `gradlew`, `keytool`, `gh`, `aapt2` and the GitHub API, check every combination of results and verdicts that `result` has to decide, and fail when the copies that have to match drift apart: the `verify` and `release-build` jobs, the `primary` and `fallback` calls of the build workflows, and the script that reads a commit's checks in the version bump, the release and the QA build. The step that chooses the Gradle user home and the one that tidies it are run for every kind of build, event and ref, against a stand-in for the home directory of the runner's user: which builds get the QA Gradle home and which the release Gradle home, that neither kind gets or touches the home of the other, that `gradle-home: cold` and a GitHub-hosted runner give a home of the job, that of several builds that start together one gets a home, what is deleted from it before and after a build, what becomes of a home whose build failed, was cancelled, died or was stopped, when a home is taken over from the job that has it, and that a link to another home is not followed. The plans are run with every value of `gradle-home` and of `qa-gradle-home`, alone and together. The step that cancels the runs of earlier commits is run against a stand-in for GitHub's lists of runs, jobs and artifacts and a git history of several pushes: which runs it cancels, that it never cancels a run that publishes, a run of a later commit or a manual run of another label, and that nothing it cannot ask fails the plan.
+
+The build numbers are tested in [`release-version`](../release-version/), against a stand-in for the API that creates a ref only once; here, what the plans pass to it and how the summary and `publish` read what it returns. Whether GitHub lets the job token create a ref under `refs/build-numbers/`, lists it through `matching-refs`, and makes the same tag object of the same content in a run that is run again, is seen only on GitHub.
 
 They cannot evaluate GitHub's expressions or its behaviour: job conditions, job names and the expressions that put a version name together are pinned as text, and how secrets of an environment reach a called workflow, whether a push or the move of a tag is accepted under the repository's rules, under which name the check of a job appears on a commit and a job in the list of a run's jobs, whether GitHub accepts the cancelling of a run by the job token and runs `built` for the run that was cancelled, which permissions the build job of a called workflow has, whether a started workflow runs, and how GitHub shows a pre-release whose tag was moved are verified only by running the workflows from a calling repository. The same holds for the two Gradle homes: no test runs Gradle, so how much time a filled home saves, what Gradle, its plugins and `setup-gradle` write into it, whether Gradle is content with a home that was tidied, and whether the run of a release has the ref and the event that give it its home are seen only on the runners ([What to look at in the first runs](#what-to-look-at-in-the-first-runs)). Which of `gradle-home` and `qa-gradle-home` reaches the build is an expression as well: the tests read `a || b || 'warm'` the way GitHub does, and do not run it. The stand-in for `gh` in the QA tests keeps the assets of a release and records them after every change, so the tests do see whether a release was ever without its APK; they do not see what the real API answers.

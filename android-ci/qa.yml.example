@@ -36,7 +36,7 @@ on:
 # The called workflow can use no more than what is granted here, and it fails
 # to start when one of these is missing.
 permissions:
-  contents: write       # the rolling pre-release and its tag
+  contents: write       # the rolling pre-release and its tag, and a build number
   packages: read        # private GitHub Packages of this repository
   checks: read          # the checks of the commit
   actions: write        # cancel the runs of earlier commits, delete a build's artifact
@@ -60,6 +60,12 @@ jobs:
       # Gradle homes" in android-ci/README.md has who can write to that home
       # and what to look at in the first runs.
       # gradle-home: cold
+      # The versionCode follows from the version by default. build-number
+      # gives every build the next build number of its major instead, one
+      # counter for QA, label, preview and release builds. Set it here, in
+      # release.yml and in version-bump.yml alike ("Build numbers" in
+      # android-ci/README.md).
+      # version-code-scheme: build-number
       # Secrets and variables written to local.properties under their own
       # names, next to the four signing keys.
       local-properties-secrets: |

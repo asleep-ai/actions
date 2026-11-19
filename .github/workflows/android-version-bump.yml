@@ -127,6 +127,25 @@ on:
         required: false
         type: string
         default: ''
+      version-code-scheme:
+        description: >-
+          The versionCode scheme android-release.yml builds the tag with:
+          minor-blocks, the default (empty is the same), or build-number. With
+          build-number the plan shows the build number the release would get
+          now, reserves none (the release does), holds the version to the
+          limits of that scheme instead of the formula's, and refuses what
+          the release would refuse. Pass the value the release gets.
+        required: false
+        type: string
+        default: minor-blocks
+      version-code-floor:
+        description: >-
+          Optional, with build-number: the version-code-floor the release
+          gets, so that the plan shows and checks what the release will.
+          minor-blocks does not read it, and says so in a warning.
+        required: false
+        type: string
+        default: ''
     secrets:
       RELEASE_PUSH_TOKEN:
         description: >-
@@ -175,6 +194,10 @@ jobs:
       target-sha: ${{ steps.version.outputs.target-sha }}
       branch: ${{ steps.version.outputs.branch }}
       main-branch: ${{ steps.main.outputs.main-branch }}
+      # As release-version read it. A release-version from before the
+      # output computed the formula, and with build-number the plan has
+      # stopped before this (Check the scheme release-version read).
+      version-code-scheme: ${{ steps.version.outputs.version-code-scheme || 'minor-blocks' }}
     steps:
       # Every tag, every branch and the whole history: the last release is
       # searched among the tags the commit contains, and the commit has to be
@@ -198,6 +221,30 @@ jobs:
           version: ${{ inputs.version }}
           prerelease: ${{ inputs.prerelease }}
           source-branch: ${{ inputs.source-branch || github.event.repository.default_branch }}
+          version-code-scheme: ${{ inputs.version-code-scheme }}
+          version-code-floor: ${{ inputs.version-code-floor }}
+
+      # release-version says which scheme it computed with. One from before
+      # build numbers (the tag android-ci/v1 not moved yet, or a branch of
+      # these workflows that still names it) ignores version-code-scheme with
+      # no more than a warning and computes the formula: a calling file that
+      # asked for build numbers would get formula codes. That is refused.
+      # android-qa.yml and android-release.yml run the same script, and
+      # android-ci's tests fail when the copies differ.
+      - name: Check the scheme release-version read
+        env:
+          GIVEN: ${{ inputs.version-code-scheme }}
+          READ: ${{ steps.version.outputs.version-code-scheme }}
+        run: |
+          set -euo pipefail
+          # Stripped the way release-version strips it, Python's str.strip(): every input it
+          # reads as build-number is checked. A no-break space is whitespace there, not in bash.
+          given=$(python3 -I -c 'import os, sys; sys.stdout.write(os.environ["GIVEN"].strip())')
+          if [[ "$given" == build-number && "$READ" != build-number ]]; then
+            echo "::error title=release-version is from before build numbers::version-code-scheme is build-number, and release-version answered with ${READ:-no scheme}: the release-version this workflow runs (asleep-ai/actions/release-version@android-ci/v1) is one from before build numbers, and computed the formula's versionCode. Nothing is built. Move the tag android-ci/v1 to a version with build numbers first; to try a branch of these workflows, point their uses: at that branch as well."
+            exit 1
+          fi
+          echo "version-code-scheme: ${READ:-minor-blocks}."
 
       - name: Write the plan to the summary
         env:
@@ -206,6 +253,7 @@ jobs:
           PREVIOUS_PRERELEASE_TAG: ${{ steps.version.outputs.previous-prerelease-tag }}
           NOTICE: ${{ steps.version.outputs.notice }}
           VERSION_CODE: ${{ steps.version.outputs.version-code }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build-number }}
           TARGET_SHA: ${{ steps.version.outputs.target-sha }}
           LINE_BRANCH: ${{ steps.version.outputs.branch }}
           PRS: ${{ steps.version.outputs.prs }}
@@ -227,7 +275,12 @@ jobs:
             echo
             echo "- Commit: [\`${TARGET_SHA:0:7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$TARGET_SHA)${PR:+, the merge commit of #${PR#\#}}"
             echo "- Release line: \`$LINE_BRANCH\`"
-            echo "- versionCode: $VERSION_CODE"
+            if [[ -n "$BUILD_NUMBER" ]]; then
+              # The release reserves its number when it is built; builds in between move it up.
+              echo "- versionCode: $VERSION_CODE if it were built now (build number $BUILD_NUMBER). The release reserves its own when it is built, so a build made before then moves it up."
+            else
+              echo "- versionCode: $VERSION_CODE"
+            fi
             if [[ -n "$VERSION_GIVEN" ]]; then
               echo "- The version was given (\`version\`); \`bump\` ($BUMP) is ignored."
             fi
@@ -605,6 +658,8 @@ jobs:
           version: ${{ inputs.version }}
           prerelease: ${{ inputs.prerelease }}
           source-branch: ${{ inputs.source-branch || github.event.repository.default_branch }}
+          version-code-scheme: ${{ inputs.version-code-scheme }}
+          version-code-floor: ${{ inputs.version-code-floor }}
 
       # One atomic push. With a main-branch, the tag and the branch move
       # together or not at all, so a branch the token may not push to leaves
@@ -647,22 +702,45 @@ jobs:
       # A tag pushed with the job token starts no workflow, so the caller's
       # release workflow is started for the tag explicitly. Starting a
       # workflow by hand is one of the two events the job token may cause.
+      #
+      # With build numbers, a job run again after its tag was pushed and its
+      # release published starts nothing: a new release run of a released
+      # tag would reserve a number above every build since, and
+      # android-release.yml refuses it. Whether the release exists is asked
+      # only then; when GitHub cannot say, the release is started, and its
+      # plan decides.
       - name: Start the release workflow
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.plan.outputs.tag }}
           RELEASE_WORKFLOW: ${{ inputs.release-workflow }}
+          TAG_EXISTS: ${{ steps.state.outputs.exists }}
+          VERSION_CODE_SCHEME: ${{ needs.plan.outputs.version-code-scheme }}
         run: |
           set -euo pipefail
+          released=false
+          if [[ -n "$RELEASE_WORKFLOW" && "$TAG_EXISTS" == true && "$VERSION_CODE_SCHEME" == build-number ]]; then
+            if answer=$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq '.tag_name' 2>&1); then
+              released=true
+            elif ! grep -q 'HTTP 404' <<< "$answer"; then
+              echo "::warning::Cannot tell whether the release $TAG exists ($answer). The release workflow is started; its plan refuses a released tag."
+            fi
+          fi
           {
             echo "### Tagged $TAG"
             echo
             if [[ -z "$RELEASE_WORKFLOW" ]]; then
               echo "No release workflow is started (\`release-workflow\` is empty)."
+            elif [[ "$released" == true ]]; then
+              echo "\`$TAG\` was tagged by an earlier attempt of this run, and its GitHub Release exists: \`$RELEASE_WORKFLOW\` is not started again. With build numbers a release is built again only by running its own run again."
             else
               gh workflow run "$RELEASE_WORKFLOW" --ref "$TAG" >&2
               echo "Started [\`$RELEASE_WORKFLOW\`]($GITHUB_SERVER_URL/$GH_REPO/actions/workflows/$RELEASE_WORKFLOW) for \`$TAG\`."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "Tagged $TAG. Release workflow: ${RELEASE_WORKFLOW:-none}."
+          if [[ "$released" == true ]]; then
+            echo "Tagged $TAG before; its release exists, and $RELEASE_WORKFLOW is not started again."
+          else
+            echo "Tagged $TAG. Release workflow: ${RELEASE_WORKFLOW:-none}."
+          fi

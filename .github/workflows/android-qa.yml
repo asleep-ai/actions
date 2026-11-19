@@ -40,6 +40,10 @@ name: Android QA build
 # build, numbered right after the last release of its line, in a pre-release
 # of its own.
 #
+# The versionCode follows from the version by default. With
+# version-code-scheme build-number it is the next build number of the
+# build's major instead, which the plan reserves in the repository.
+#
 # The caller's contract, every input and the secrets are in
 # android-ci/README.md.
 on:
@@ -192,6 +196,30 @@ on:
         required: false
         type: number
         default: 0
+      version-code-scheme:
+        description: >-
+          How a build gets its versionCode. minor-blocks, the default (empty
+          is the same): the formula, from the version and N. build-number:
+          major * 100000000 plus the next build number of the major, which
+          the plan reserves in the repository as refs/build-numbers/<major>/<n>
+          (contents: write), one counter for the QA, label, preview and
+          release builds of the major. The version names are the same. Pass
+          the same value to android-release.yml and android-version-bump.yml.
+        required: false
+        type: string
+        default: minor-blocks
+      version-code-floor:
+        description: >-
+          Optional, with build-number: the highest versionCode of the app that
+          is out where the repository's releases do not show it, such as the
+          app in Google Play built from another repository. Every build of its
+          major is numbered above it. A build of a lower major is refused
+          while that major has no build, and passed over with a notice once
+          it has (a maintenance line). minor-blocks does not read it, and says
+          so in a warning.
+        required: false
+        type: string
+        default: ''
       required-checks:
         description: >-
           Names of the checks that must have succeeded on the commit before
@@ -342,7 +370,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: read
+      # Reads the repository; with version-code-scheme build-number it also
+      # reserves the build number, a ref of the repository. A permission
+      # cannot follow an input, so the job has it with the formula too, and
+      # writes nothing then. No code of the checkout is run.
+      contents: write
       # Cancels the runs of earlier commits and deletes their build artifacts.
       actions: write
     outputs:
@@ -352,6 +384,11 @@ jobs:
       number: ${{ steps.qa.outputs.number }}
       version-code: ${{ steps.qa.outputs.version-code }}
       previous-tag: ${{ steps.qa.outputs.previous-tag }}
+      # The scheme as release-version read it, one of two words: the jobs
+      # after the plan compare this, never the input, which may hold
+      # whitespace around the word. A release-version from before the output
+      # (the tag android-ci/v1 not moved yet) computed the formula.
+      version-code-scheme: ${{ steps.qa.outputs.version-code-scheme || 'minor-blocks' }}
       runs-on: ${{ steps.pick.outputs.runs-on }}
       self-hosted: ${{ steps.pick.outputs.self-hosted }}
     steps:
@@ -415,6 +452,11 @@ jobs:
       # source branch and release/<major>.x pass. The number of a QA build is
       # the run number of the calling workflow, so a later run is a higher
       # versionCode; a run that is started again keeps its number.
+      #
+      # With version-code-scheme build-number the number stays in the name,
+      # and the versionCode is the build number this step reserves once the
+      # plan has passed: the next of the major, whatever the run number. A run
+      # that is started again finds the number it reserved and keeps it.
       - name: Plan the QA build
         id: qa
         uses: asleep-ai/actions/release-version@android-ci/v1
@@ -428,6 +470,30 @@ jobs:
           label: ${{ inputs.label }}
           qa-sequence: ${{ github.run_number }}
           qa-sequence-offset: ${{ inputs.sequence-offset }}
+          version-code-scheme: ${{ inputs.version-code-scheme }}
+          version-code-floor: ${{ inputs.version-code-floor }}
+
+      # release-version says which scheme it computed with. One from before
+      # build numbers (the tag android-ci/v1 not moved yet, or a branch of
+      # these workflows that still names it) ignores version-code-scheme with
+      # no more than a warning and computes the formula: a calling file that
+      # asked for build numbers would get formula codes. That is refused.
+      # android-release.yml and android-version-bump.yml run the same script,
+      # and android-ci's tests fail when the copies differ.
+      - name: Check the scheme release-version read
+        env:
+          GIVEN: ${{ inputs.version-code-scheme }}
+          READ: ${{ steps.qa.outputs.version-code-scheme }}
+        run: |
+          set -euo pipefail
+          # Stripped the way release-version strips it, Python's str.strip(): every input it
+          # reads as build-number is checked. A no-break space is whitespace there, not in bash.
+          given=$(python3 -I -c 'import os, sys; sys.stdout.write(os.environ["GIVEN"].strip())')
+          if [[ "$given" == build-number && "$READ" != build-number ]]; then
+            echo "::error title=release-version is from before build numbers::version-code-scheme is build-number, and release-version answered with ${READ:-no scheme}: the release-version this workflow runs (asleep-ai/actions/release-version@android-ci/v1) is one from before build numbers, and computed the formula's versionCode. Nothing is built. Move the tag android-ci/v1 to a version with build numbers first; to try a branch of these workflows, point their uses: at that branch as well."
+            exit 1
+          fi
+          echo "version-code-scheme: ${READ:-minor-blocks}."
 
       - name: Write the plan to the summary
         env:
@@ -440,6 +506,7 @@ jobs:
           PREVIOUS_TAG: ${{ steps.qa.outputs.previous-tag }}
           RELEASE_TAG: ${{ steps.qa.outputs.release-tag }}
           VERSION_GIVEN: ${{ inputs.version }}
+          BUILD_NUMBER: ${{ steps.qa.outputs.build-number }}
         run: |
           set -euo pipefail
           after="no release yet"
@@ -458,7 +525,13 @@ jobs:
               echo "- A named test build made after \`$PREVIOUS_TAG\`: it installs over that release, and \`$VERSION\` installs over it."
             else
               echo "- Leads up to \`$VERSION\`, $after"
-              echo "- It installs over the earlier QA builds of ${VERSION%.*}. Every preview and every release of ${VERSION%.*} installs over it, and it over none of them."
+              if [[ -z "$BUILD_NUMBER" ]]; then
+                echo "- It installs over the earlier QA builds of ${VERSION%.*}. Every preview and every release of ${VERSION%.*} installs over it, and it over none of them."
+              fi
+            fi
+            if [[ -n "$BUILD_NUMBER" ]]; then
+              # One counter for every kind of build of the major.
+              echo "- Build number $BUILD_NUMBER of major ${VERSION%%.*}: it installs over every build of major ${VERSION%%.*} made before it, of any kind, and every build made after it installs over it."
             fi
             if [[ -n "$VERSION_GIVEN" ]]; then
               echo "- The version was given (\`version\`) for this run. The build is published apart from the rolling build of \`$BRANCH\`, which goes on from the tags."
@@ -1032,6 +1105,12 @@ jobs:
       # two). An output that arrives empty was dropped by the runner because
       # it held the value of a secret; the job says so instead of going on
       # with half a name.
+      #
+      # The scheme comes from the plan too, as release-version read it, and
+      # is handed on from here: the step that publishes compares this, never
+      # the input. One that is empty or not one of the two words stops the
+      # job, so that no build is published past the check of build numbers
+      # for want of the word.
       - name: Name the build
         id: names
         env:
@@ -1040,13 +1119,14 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
           NUMBER: ${{ needs.plan.outputs.number }}
           VERSION_CODE: ${{ needs.plan.outputs.version-code }}
+          VERSION_CODE_SCHEME: ${{ needs.plan.outputs.version-code-scheme }}
           SOURCE_BRANCH: ${{ inputs.source-branch || github.event.repository.default_branch }}
           LABEL: ${{ inputs.label }}
           VERSION_GIVEN: ${{ inputs.version }}
         run: |
           set -euo pipefail
           missing=""
-          for name in SHA VERSION NUMBER VERSION_CODE; do
+          for name in SHA VERSION NUMBER VERSION_CODE VERSION_CODE_SCHEME; do
             if [[ -z "${!name}" ]]; then
               missing="${missing:+$missing, }$name"
             fi
@@ -1055,6 +1135,13 @@ jobs:
             echo "::error title=The plan is incomplete::Empty: $missing. The plan job passed, so the runner dropped the output: it does that to an output that contains the value of a secret. Look for a secret whose value is a short word or number."
             exit 1
           fi
+          case "$VERSION_CODE_SCHEME" in
+            minor-blocks|build-number) ;;
+            *)
+              echo "::error title=The plan is incomplete::The plan's version-code-scheme is '$VERSION_CODE_SCHEME', and release-version gives minor-blocks or build-number. Nothing is published."
+              exit 1
+              ;;
+          esac
           if [[ -n "$MAJOR" ]]; then
             branch="release/$MAJOR.x"
           else
@@ -1079,6 +1166,7 @@ jobs:
             echo "apart=$apart"
             echo "version-name=$version_name"
             echo "tag=$tag"
+            echo "version-code-scheme=$VERSION_CODE_SCHEME"
           } >> "$GITHUB_OUTPUT"
           echo "$kind build $version_name ($VERSION_CODE) of $branch, published as $tag."
 
@@ -1161,6 +1249,9 @@ jobs:
           STALE: ${{ steps.changes.outputs.stale }}
           UNCHANGED: ${{ steps.changes.outputs.unchanged }}
           CODE_TAKEN_BY: ${{ steps.changes.outputs.code-taken-by }}
+          SINCE_CODE: ${{ steps.changes.outputs.since-code }}
+          # The word the plan read and the step above checked, not the input.
+          VERSION_CODE_SCHEME: ${{ steps.names.outputs.version-code-scheme }}
           APK_DIRECTORY: ${{ runner.temp }}/android-qa-apk
           STAGING_DIRECTORY: ${{ runner.temp }}/android-qa-upload
           NOTES_FILE: ${{ runner.temp }}/android-qa-notes.md
@@ -1201,6 +1292,26 @@ jobs:
           if [[ -n "$CODE_TAKEN_BY" ]]; then
             echo "::error title=The versionCode is taken::$VERSION_NAME has the versionCode $VERSION_CODE, and the pre-release $CODE_TAKEN_BY holds a build of that versionCode: it was published while this one was built. Nothing is published. Start the workflow again with the same inputs (a new run, not a re-run of this one): it takes the next number."
             exit 1
+          fi
+
+          # With build numbers, a device that has the build of the pre-release
+          # takes this one only when its versionCode is higher. Runs that plan
+          # at the same moment reserve their numbers in the order their plans
+          # get there, not in the order of their commits, so the build of a
+          # later commit can have the lower number; the run of the later
+          # commit cancels the earlier one, and this is for when that did not
+          # happen. A run of the same commit with a higher number was
+          # published already: nothing to do. The same build again is
+          # published as before.
+          if [[ "$VERSION_CODE_SCHEME" == build-number && -n "$SINCE_CODE" ]]; then
+            if [[ "$UNCHANGED" == true ]] && (( 10#$SINCE_CODE > 10#$VERSION_CODE )); then
+              echo "::notice title=A higher build of this commit is published::$TAG holds ${SHA:0:7} with the versionCode $SINCE_CODE, above this build's $VERSION_CODE. This build is not published."
+              exit 0
+            fi
+            if [[ "$UNCHANGED" != true ]] && (( 10#$SINCE_CODE >= 10#$VERSION_CODE )); then
+              echo "::error title=A higher versionCode is published::$VERSION_NAME has the versionCode $VERSION_CODE, and the pre-release $TAG holds a build of ${SINCE:0:7} with the versionCode $SINCE_CODE, which is not lower: a device that has that build would not take this one. The two runs reserved their build numbers in another order than their commits. Nothing is published. Start the workflow again on the branch (a new run, not a re-run of this one): it reserves a new number."
+              exit 1
+            fi
           fi
 
           # Two states, each read in a statement of its own: a request that
@@ -1245,6 +1356,8 @@ jobs:
             echo
             if [[ "$KIND" == label ]]; then
               echo "Made after \`$PREVIOUS_TAG\`. It installs over \`$PREVIOUS_TAG\` and over the label builds made after it before this one, and \`$VERSION\` installs over it."
+            elif [[ "$VERSION_CODE_SCHEME" == build-number ]]; then
+              echo "Leads up to \`$VERSION\`${PREVIOUS_TAG:+, after \`$PREVIOUS_TAG\`}. It installs over every build of major ${VERSION%%.*} made before it, releases included, and every build made after it installs over it."
             else
               echo "Leads up to \`$VERSION\`${PREVIOUS_TAG:+, after \`$PREVIOUS_TAG\`}. It installs over the earlier QA builds of ${VERSION%.*}. Every preview and every release of ${VERSION%.*} installs over it, and it over none of them."
             fi

@@ -44,6 +44,18 @@ earlier releases of its own line, not than every release made before it.
 
 To change the formula, change this file and its tests in test_version_code.py;
 nothing else computes a versionCode.
+
+The build-number scheme, which a calling repository chooses instead
+(version-code-scheme: build-number), keeps the block of each major version
+and drops the blocks of the minor versions:
+
+    build n of major X              X * 100_000_000 + n                                  n 1..99_999_999
+
+n counts the builds of the major, of every kind, in the order they are
+planned (build_numbers.py reserves it), so every build installs over every
+earlier build of its major and none over a later one. A major version is still
+a release line, below every code of the next major. X goes up to 20, as in the
+formula above.
 """
 from __future__ import annotations
 
@@ -116,3 +128,35 @@ def label_code(major: int, minor: int, patch: int, number: int) -> int:
             f"the code after them is the next patch release's"
         )
     return _checked(release_code(major, minor, patch) + number, f"label build {number} after {major}.{minor}.{patch}")
+
+
+# The build-number scheme. The highest major whose whole block is within the limit: 20, whose last
+# code is 2_099_999_999.
+MAX_MAJOR = MAX_VERSION_CODE // MAJOR_BLOCK - 1
+MAX_BUILD_NUMBER = MAJOR_BLOCK - 1  # 99_999_999
+
+
+def check_major(major: int) -> None:
+    """Refuse a major version that has no block of versionCodes."""
+    if not 0 <= major <= MAX_MAJOR:
+        raise VersionCodeError(
+            f"major version {major} is outside 0..{MAX_MAJOR}: its versionCodes would be above "
+            f"{MAX_VERSION_CODE}, Google Play's limit"
+        )
+
+
+def major_codes(major: int) -> tuple:
+    """The lowest and the highest versionCode of the major version in the build-number scheme."""
+    check_major(major)
+    return major * MAJOR_BLOCK + 1, major * MAJOR_BLOCK + MAX_BUILD_NUMBER
+
+
+def build_code(major: int, number: int) -> int:
+    """The versionCode of build `number` of the major version, in the build-number scheme."""
+    check_major(major)
+    if not 1 <= number <= MAX_BUILD_NUMBER:
+        raise VersionCodeError(
+            f"build number {number} is outside 1..{MAX_BUILD_NUMBER}, the builds one major version has room for: "
+            "the code after them is the next major's"
+        )
+    return major * MAJOR_BLOCK + number
