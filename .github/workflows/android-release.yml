@@ -451,7 +451,7 @@ jobs:
       # Every branch and the whole history, for the step below. The tag was
       # checked above, so the ref is a release tag that exists. Nothing of the
       # checkout is run.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           ref: refs/tags/${{ steps.tag.outputs.tag }}
           fetch-depth: 0
@@ -797,7 +797,7 @@ jobs:
     steps:
       # Full history and every tag: release-notes reads the commits between
       # two tags.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           ref: refs/tags/${{ needs.plan.outputs.tag }}
           fetch-depth: 0

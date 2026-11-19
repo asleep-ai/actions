@@ -348,7 +348,7 @@ jobs:
       # GIT_TOKEN is used only when submodules are checked out: it reaches
       # private ones, and the job token reads the repository itself. No token
       # stays in the clone.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         id: checkout
         with:
           ref: ${{ inputs.ref }}
@@ -374,7 +374,7 @@ jobs:
 
       - name: Set up the JDK
         id: java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         with:
           distribution: ${{ inputs.java-distribution }}
           java-version: ${{ inputs.java-version }}
