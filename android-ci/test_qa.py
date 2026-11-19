@@ -90,6 +90,8 @@ def test_the_plan_is_the_qa_operation_of_release_version_for_the_ref_of_the_run(
         # Or, with build-number, the next build number of the major, reserved by this step.
         "version-code-scheme": "${{ inputs.version-code-scheme }}",
         "version-code-floor": "${{ inputs.version-code-floor }}",
+        # Refused here when it cannot be written into the tag's message.
+        "asset-pattern": "${{ inputs.asset-pattern }}",
     }
     assert "if" not in qa
     # The default token reserves the build number: contents: write. That is a permission of the
@@ -232,6 +234,7 @@ def plan_summary(entry, tmp_path, **overrides) -> str:
         "RELEASE_TAG": "qa-develop",
         "VERSION_GIVEN": "",
         "BUILD_NUMBER": "",
+        "ASSET_PATTERN": "",
         "GITHUB_SERVER_URL": "https://github.invalid",
         "GITHUB_REPOSITORY": "acme/app",
         "GITHUB_STEP_SUMMARY": str(summary),
@@ -522,13 +525,19 @@ def test_no_other_run_is_cancelled(entry, pushes, other):
     assert "::" not in result.stdout and summary == ""
 
 
-# The name of the plan job, which is how a manual run says which line of builds it is.
-PLAN_NAME = "${{ github.event_name == 'push' && 'plan' || format('plan ({0})', inputs.label || inputs.version || 'manual run') }}"
+# The name of the plan job, which is how a manual run says which line of builds it is, and a run
+# with asset-pattern which app.
+PLAN_NAME = (
+    "${{ github.event_name == 'push' && format('plan{0}', inputs.asset-pattern != '' && format(' ({0})', inputs.asset-pattern) || '') "
+    "|| format('plan ({0}{1})', inputs.label || inputs.version || 'manual run', inputs.asset-pattern != '' && format(', {0}', inputs.asset-pattern) || '') }}"
+)
 
 
-def plan_name(event: str, label: str = "", version: str = "") -> str:
+def plan_name(event: str, label: str = "", version: str = "", pattern: str = "") -> str:
     """PLAN_NAME as GitHub evaluates it."""
-    return "plan" if event == "push" else f"plan ({label or version or 'manual run'})"
+    if event == "push":
+        return f"plan ({pattern})" if pattern else "plan"
+    return f"plan ({label or version or 'manual run'}{f', {pattern}' if pattern else ''})"
 
 
 @pytest.mark.parametrize(("label", "version"), [("ble-test", ""), ("", "1.14.0"), ("", "")])
@@ -689,7 +698,7 @@ def test_the_build_is_the_build_of_a_release_with_ci_qa(entry):
     assert forwarded == set(inputs) - {
         "runner-labels", "fallback-runs-on", "source-branch", "version", "next-version", "label", "sequence-offset",
         "version-code-scheme", "version-code-floor", "required-checks", "checks-timeout-minutes", "gradle-home",
-        "qa-gradle-home",
+        "qa-gradle-home", "asset-pattern",
     }
     for name in forwarded:
         assert primary["with"][name] == fallback["with"][name] == f"${{{{ inputs.{name} }}}}"
@@ -1049,17 +1058,20 @@ def test_publish_follows_the_checks_and_is_the_only_job_that_writes(entry, publi
     assert names == [
         "Name the build",
         "Download the signed APKs",
+        "Check the APKs against asset-pattern",
         "actions/checkout@v7",
         "List the changes since the build before",
         "Publish the rolling pre-release",
         "Delete the build artifact",
     ]
-    # No step runs with always() but the one that deletes the artifact.
-    for item in publish["steps"][:5]:
-        assert "if" not in item, item
+    # No step runs with always() but the one that deletes the artifact, and the check of the APK
+    # names only with asset-pattern.
+    for item in publish["steps"][:6]:
+        assert item.get("if", "${{ inputs.asset-pattern != '' }}") == "${{ inputs.asset-pattern != '' }}", item
+        assert "always()" not in item.get("if", "")
     # The tags are read after the download, right before the tag is moved: what they say about the
     # other pre-releases is then as fresh as it can be.
-    assert publish["steps"][2]["with"] == {
+    assert publish["steps"][3]["with"] == {
         "ref": "${{ needs.plan.outputs.sha }}", "fetch-depth": 0, "persist-credentials": False,
     }
     download = step(publish, "Download the signed APKs")["with"]
@@ -1073,6 +1085,7 @@ def test_publish_follows_the_checks_and_is_the_only_job_that_writes(entry, publi
         "sha": "${{ needs.plan.outputs.sha }}",
         "since": "${{ steps.names.outputs.tag }}",
         "version-code": "${{ needs.plan.outputs.version-code }}",
+        "asset-pattern": "${{ inputs.asset-pattern }}",
     }
     # Nothing in the job waits for anything but its own uploads.
     assert "Check the commit's checks" not in names
@@ -1546,6 +1559,8 @@ def publish_build(publish, tmp_path, directory: Path, apks=(APK,), **overrides):
         "NOTES_FILE": str(temp / "android-qa-notes.md"),
         "BUILT_ON": "primary",
         "SELF_HOSTED": "true",
+        "ASSET_PATTERN": "",
+        "KEPT_BUILDS": "",
         "GITHUB_SERVER_URL": "https://github.invalid",
         "GITHUB_RUN_NUMBER": "57",
         "GITHUB_RUN_ID": "9001",
@@ -2144,6 +2159,219 @@ def test_the_rolling_tag_is_never_a_release_tag(publish):
         assert pattern.startswith("v")
 
 
+# --- several apps in one pre-release ---------------------------------------------------------------
+
+# sleephub-android builds SleepHub on every push and SweetSleep by hand, both into qa-<line>.
+SLEEPHUB = "SleepHub_*.apk"
+SWEETSLEEP = "SweetSleep_*.apk"
+HUB_APK = "SleepHub_qa_1.13.2-qa.58_101300058.apk"
+SWEET_APK = "SweetSleep_qa_1.13.2-qa.60_101300060.apk"
+ONE_LINE = {
+    "TAG": "qa-release-1.x", "BRANCH": "release/1.x", "LINE": "release-1.x", "VERSION": "1.13.2", "PREVIOUS_TAG": "v1.13.1",
+}
+
+
+def test_a_push_of_one_app_cancels_only_the_runs_of_that_app(entry, pushes):
+    repo, shas = pushes
+    mine = plan_name("push", pattern=SLEEPHUB)
+    assert mine == "plan (SleepHub_*.apk)"
+    with runs_api() as api:
+        api.runs = [qa_run(51, shas["a"]), qa_run(52, shas["a"]), qa_run(53, shas["b"]), qa_run(54, shas["b"], status="queued")]
+        api.jobs = {
+            9051: [job_of(f"qa / {mine}", "completed"), job_of("qa / primary / build")],
+            9052: [job_of(f"qa / {plan_name('push', pattern='Other_*.apk')}", "completed"), job_of("qa / primary / build")],
+            # A run of the calling file from before it named its APKs.
+            9053: BUILDING,
+        }
+        result, _ = cancel_earlier(entry, repo, api, shas["c"], PLAN_JOB=mine)
+        assert api.cancelled == [9051]
+    assert f"Run 52 ({shas['a'][:7]}) has no job '{mine}': a build of another app, left alone." in result.stdout
+    assert f"Run 54 ({shas['b'][:7]}) has no job '{mine}': a build of another app, left alone." in result.stdout
+    # A manual run of the other app cancels the manual runs of that app alone, and no push.
+    mine = plan_name("workflow_dispatch", pattern=SWEETSLEEP)
+    assert mine == "plan (manual run, SweetSleep_*.apk)"
+    assert plan_name("workflow_dispatch", label="ble-test", pattern=SWEETSLEEP) == "plan (ble-test, SweetSleep_*.apk)"
+    with runs_api() as api:
+        api.runs = [qa_run(61, shas["a"], event="workflow_dispatch"), qa_run(62, shas["a"], event="workflow_dispatch")]
+        api.jobs = {9061: [job_of(f"qa / {mine}", "completed")], 9062: [job_of("qa / plan (manual run)", "completed")]}
+        cancel_earlier(entry, repo, api, shas["c"], EVENT_NAME="workflow_dispatch", PLAN_JOB=mine)
+        assert api.cancelled == [9061]
+    # Without asset-pattern a push names its job plan, and cancels every earlier push as before.
+    assert plan_name("push") == "plan"
+
+
+def test_the_plan_says_which_apks_the_build_replaces(entry, tmp_path):
+    text = plan_summary(entry, tmp_path, BRANCH="release/1.x", RELEASE_TAG="qa-release-1.x", ASSET_PATTERN=SWEETSLEEP)
+    assert "- Published as the pre-release `qa-release-1.x` when the build and the commit's checks pass\n" in text
+    assert "- Its APKs replace those that `SweetSleep_*.apk` matches there; the other apps' builds stay\n" in text
+    assert "other apps" not in plan_summary(entry, tmp_path)
+    env = step(entry["jobs"]["plan"], "Write the plan to the summary")["env"]
+    assert env["ASSET_PATTERN"] == "${{ inputs.asset-pattern }}"
+
+
+def test_the_apks_of_a_qa_build_are_held_to_asset_pattern_as_a_release_holds_them(entry, publish, tmp_path):
+    # One check in both workflows: the run publishes the APKs its pattern names, and no other.
+    check = step(publish, "Check the APKs against asset-pattern")
+    release = step(load(RELEASE)["jobs"]["publish"], "Check the APKs against asset-pattern")
+    assert check["run"] == release["run"]
+    assert check["if"] == "${{ inputs.asset-pattern != '' }}"
+    assert check["env"] == {"ASSET_PATTERN": "${{ inputs.asset-pattern }}", "APK_DIRECTORY": "${{ runner.temp }}/android-qa-apk"}
+    apk_directory = tmp_path / "apk"
+    for name in ("sleephub/release/" + HUB_APK, "sweetsleep/release/" + SWEET_APK):
+        (apk_directory / name).parent.mkdir(parents=True)
+        (apk_directory / name).write_text("apk")
+    result = run_script(check["run"], {"ASSET_PATTERN": SWEETSLEEP, "APK_DIRECTORY": str(apk_directory)}, tmp_path)
+    assert result.returncode == 1
+    assert f"::error title=An APK does not match asset-pattern::asset-pattern is {SWEETSLEEP}, and the build made {HUB_APK}" in result.stdout
+    # The plan reads the input as release-version does, and the publish step reads it unchanged.
+    inputs = trigger(entry)["inputs"]
+    assert inputs["asset-pattern"] == {**inputs["asset-pattern"], "type": "string", "default": "", "required": False}
+    env = step(publish, "Publish the rolling pre-release")["env"]
+    assert env["ASSET_PATTERN"] == "${{ inputs.asset-pattern }}"
+    assert env["KEPT_BUILDS"] == "${{ steps.changes.outputs.kept-builds }}"
+    # Written into the tag's message, so the plan refuses what a line of it cannot hold.
+    assert step(entry["jobs"]["plan"], "Plan the QA build")["with"]["asset-pattern"] == "${{ inputs.asset-pattern }}"
+
+
+def publish_app(publish, tmp_path, directory, name, pattern, apk, version_name, code, sha, **overrides):
+    """Publish one app's build into qa-release-1.x as release-version's changes would hand it on, from a
+    checkout whose tag is the one the stand-in for gh holds."""
+    from test_release_version import parse_outputs
+
+    repo, work = Path.cwd(), tmp_path / name
+    work.mkdir()
+    held = state_of(directory)
+    if held["tag"]:
+        tag = held["tags"][held["tag"]]
+        (work / "message").write_text(tag["message"])
+        git(repo, "-c", "tag.gpgsign=false", "tag", "-f", "-a", "qa-release-1.x", "-F", str(work / "message"), tag["object"])
+    output = work / "changes"
+    output.write_text("")
+    env = {
+        "OPERATION": "changes", "SHA": sha, "SINCE": "qa-release-1.x", "VERSION_CODE": code, "ASSET_PATTERN": pattern,
+        "TAG_PREFIX": "v", "GITHUB_OUTPUT": str(output),
+    }
+    assert release_version.main(env) == 0
+    changes = parse_outputs(output.read_text())
+    planned = {
+        "SINCE": changes["since"], "PRS": changes["prs"], "STALE": changes["stale"], "UNCHANGED": changes["unchanged"],
+        "CODE_TAKEN_BY": changes["code-taken-by"], "SINCE_CODE": changes["since-code"], "KEPT_BUILDS": changes["kept-builds"],
+    }
+    return publish_build(
+        publish, work, directory, apks=(apk,), SHA=sha, ASSET_PATTERN=pattern, VERSION_NAME=version_name, VERSION_CODE=code,
+        **ONE_LINE, **{**planned, **overrides},
+    )
+
+
+def test_each_app_replaces_its_own_apks_in_the_pre_release_of_its_line(publish, lines, tmp_path):
+    #   release/1.x after v1.13.1: SleepHub is built on a push, SweetSleep by hand, then SleepHub again.
+    head = lines["release/1.x"]
+    directory = gh_directory(tmp_path)
+    result, _, state, summary = publish_app(publish, tmp_path, directory, "hub", SLEEPHUB, HUB_APK, "1.13.2-qa.58", "101300058", head)
+    assert result.returncode == 0, result.stdout + result.stderr
+    hub_line = f"{SLEEPHUB} 1.13.2-qa.58 (101300058) {head}"
+    assert state["tags"][state["tag"]]["message"] == f"1.13.2-qa.58 (101300058)\n\n{hub_line}"
+    assert state["title"] == "QA release-1.x"
+    assert f"Created the pre-release with {HUB_APK}" in summary
+
+    result, _, state, summary = publish_app(publish, tmp_path, directory, "sweet", SWEETSLEEP, SWEET_APK, "1.13.2-qa.60", "101300060", head)
+    assert result.returncode == 0, result.stdout + result.stderr
+    sweet_line = f"{SWEETSLEEP} 1.13.2-qa.60 (101300060) {head}"
+    # The first line names the build published last, and a line per app names each app's.
+    assert state["tags"][state["tag"]]["message"] == f"1.13.2-qa.60 (101300060)\n\n{hub_line}\n{sweet_line}"
+    assert [asset["name"] for asset in state["assets"]] == [HUB_APK, SWEET_APK]
+    assert all(HUB_APK in names for names in state["history"]), "SleepHub's APK stays while SweetSleep's goes up"
+    assert f"Replaced the APKs of `{SWEETSLEEP}` in the pre-release with {SWEET_APK}" in summary
+    notes = state["notes"]
+    assert notes.startswith(
+        "Rolling QA build of `release/1.x`. Every build of it replaces the APKs of its app here, the ones its "
+        "asset-pattern matches, and keeps the other apps'. This is not a release.\n"
+    )
+    assert f"| `{SLEEPHUB}` | `1.13.2-qa.58` | 101300058 | [`{head[:7]}`](https://github.invalid/acme/app/commit/{head}) |\n" in notes
+    assert f"| `{SWEETSLEEP}` | `1.13.2-qa.60` | 101300060 | [`{head[:7]}`](https://github.invalid/acme/app/commit/{head}) |\n" in notes
+    assert re.search(r"^Published last: `1\.13\.2-qa\.60` of `SweetSleep_\*\.apk`, \d{4}-\d\d-\d\d \d\d:\d\d UTC, \[run 57\]\(", notes, re.MULTILINE)
+    # SweetSleep's first build lists what it adds to the release, not to SleepHub's build.
+    assert f"#### Changes of `{SWEETSLEEP}` since `v1.13.1`\n" in notes
+
+    hub_next = "SleepHub_qa_1.13.2-qa.61_101300061.apk"
+    result, _, state, _ = publish_app(publish, tmp_path, directory, "hub-again", SLEEPHUB, hub_next, "1.13.2-qa.61", "101300061", head)
+    assert result.returncode == 0, result.stdout + result.stderr
+    hub_line = f"{SLEEPHUB} 1.13.2-qa.61 (101300061) {head}"
+    assert state["tags"][state["tag"]]["message"] == f"1.13.2-qa.61 (101300061)\n\n{hub_line}\n{sweet_line}"
+    assert sorted(asset["name"] for asset in state["assets"]) == [hub_next, SWEET_APK]
+    assert f"Deleted {HUB_APK} of the build before." in result.stdout
+    assert "#### Changes of `SleepHub_*.apk`\n\nThe same commit as the build before.\n" in state["notes"]
+    # What release-version reads from the tag the publish step wrote: every app's build.
+    (tmp_path / "message").write_text(state["tags"][state["tag"]]["message"])
+    git(Path.cwd(), "-c", "tag.gpgsign=false", "tag", "-f", "-a", "qa-release-1.x", "-F", str(tmp_path / "message"), head)
+    assert sorted(release_version.rolling_builds()) == [
+        ("qa-release-1.x", "1.13.2-qa.60", 101_300_060), ("qa-release-1.x", "1.13.2-qa.61", 101_300_061),
+    ]
+
+
+def test_an_apk_of_another_app_is_neither_replaced_nor_published_over(publish, tmp_path):
+    # The other app's pattern matches this build's APK: its next build would delete it.
+    kept = f"*.apk 1.13.2-qa.58 (101300058) {BEFORE}"
+    directory = gh_directory(tmp_path, release=True, tag=BEFORE_TAG, assets=(HUB_APK,))
+    result, calls, state, _ = publish_build(
+        publish, tmp_path, directory, apks=(SWEET_APK,), ASSET_PATTERN=SWEETSLEEP, KEPT_BUILDS=kept, **ONE_LINE,
+    )
+    assert result.returncode == 1
+    assert (
+        f"::error title=asset-pattern overlaps::{SWEET_APK} matches {SWEETSLEEP}, and also the pattern of another app whose "
+        "build qa-release-1.x holds, one of: *.apk. Nothing is published: that app's next build would delete it."
+    ) in result.stdout
+    assert calls == [] and state["tag"] == BEFORE_TAG
+    # This app's pattern matches an APK of the other one, whose pattern is narrower: that APK stays.
+    pro = "SweetSleepPro_qa_1.13.2-qa.59_101300059.apk"
+    kept = f"SweetSleepPro_*.apk 1.13.2-qa.59 (101300059) {BEFORE}"
+    directory = gh_directory(tmp_path / "pro", release=True, tag=BEFORE_TAG, assets=(pro, "SweetSleep_qa_1.13.2-qa.12_101300012.apk"))
+    result, _, state, _ = publish_build(
+        publish, tmp_path / "pro", directory, apks=(SWEET_APK,), ASSET_PATTERN="Sweet*.apk", KEPT_BUILDS=kept, **ONE_LINE,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [asset["name"] for asset in state["assets"]] == [pro, SWEET_APK]
+    # And a copy of this app's APK that an earlier attempt left goes, by the name it was to take.
+    staged = "SweetSleep_qa_1.13.2-qa.12_101300012.run-8990-1.apk"
+    directory = gh_directory(tmp_path / "copy", release=True, tag=BEFORE_TAG, assets=(HUB_APK, staged))
+    result, _, state, _ = publish_build(
+        publish, tmp_path / "copy", directory, apks=(SWEET_APK,), ASSET_PATTERN=SWEETSLEEP, KEPT_BUILDS=f"{SLEEPHUB} 1.13.2-qa.58 (101300058) {BEFORE}", **ONE_LINE,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [asset["name"] for asset in state["assets"]] == [HUB_APK, SWEET_APK]
+
+
+def test_what_keeps_a_build_of_one_app_back_is_that_apps_build(publish, tmp_path):
+    app = {"ASSET_PATTERN": SWEETSLEEP, "KEPT_BUILDS": f"{SLEEPHUB} 1.13.2-qa.70 (101300070) {BEFORE}", **ONE_LINE}
+    directory = gh_directory(tmp_path, release=True, tag=BEFORE_TAG, assets=(HUB_APK,))
+    result, calls, _, summary = publish_build(publish, tmp_path, directory, apks=(SWEET_APK,), STALE="true", **app)
+    assert result.returncode == 0
+    assert f"::notice title=A newer build is published::qa-release-1.x holds the build of {SWEETSLEEP} of {BEFORE[:7]}, a later commit that contains {BUILT[:7]}." in result.stdout
+    assert f"holds the build of `{SWEETSLEEP}` of `{BEFORE[:7]}`, a later commit" in summary and calls == []
+    result, calls, _, _ = publish_build(
+        publish, tmp_path / "code", gh_directory(tmp_path / "code", release=True, tag=BEFORE_TAG), apks=(SWEET_APK,),
+        VERSION_CODE_SCHEME="build-number", VERSION_NAME="1.13.2-qa.60", VERSION_CODE="101300060", SINCE_CODE="101300065", **app,
+    )
+    assert result.returncode == 1
+    assert f"the pre-release qa-release-1.x holds a build of {SWEETSLEEP} of {BEFORE[:7]} with the versionCode 101300065" in result.stdout
+    assert calls == []
+
+
+def test_a_tag_of_several_apps_that_cannot_be_moved_says_how_to_move_it_by_hand(publish, tmp_path):
+    hub_line = f"{SLEEPHUB} 1.13.2-qa.58 (101300058) {BEFORE}"
+    directory = gh_directory(tmp_path, release=True, tag=BEFORE_TAG, assets=(HUB_APK,), refuse_tag=True)
+    result, _, state, _ = publish_build(
+        publish, tmp_path, directory, apks=(SWEET_APK,), ASSET_PATTERN=SWEETSLEEP, KEPT_BUILDS=hub_line,
+        VERSION_NAME="1.13.2-qa.60", VERSION_CODE="101300060", **ONE_LINE,
+    )
+    assert result.returncode == 1
+    assert (
+        f"git tag -f -a qa-release-1.x -m '1.13.2-qa.60 (101300060)' -m '{hub_line}' "
+        f"-m '{SWEETSLEEP} 1.13.2-qa.60 (101300060) {BUILT}' 3ff9b1a && git push -f origin qa-release-1.x"
+    ) in result.stdout
+    assert state["tag"] == BEFORE_TAG
+
+
 # --- publish: the artifact -------------------------------------------------------------------------
 
 
@@ -2213,7 +2441,7 @@ def test_inputs_and_outputs(entry):
     call = trigger(entry)
     assert list(call["inputs"]) == [
         "runner-labels", "fallback-runs-on", "environment", "java-version", "java-distribution", "checkout-submodules",
-        "local-properties-secrets", "required-secrets", "gradle-args", "apk-directory", "expected-cert-sha256",
+        "local-properties-secrets", "required-secrets", "gradle-args", "apk-directory", "asset-pattern", "expected-cert-sha256",
         "build-tools-version", "sentry-upload", "source-branch", "version", "next-version", "label", "sequence-offset",
         "version-code-scheme", "version-code-floor", "required-checks", "checks-timeout-minutes",
         "build-timeout-minutes", "gradle-home", "qa-gradle-home", "self-hosted-max-workers",

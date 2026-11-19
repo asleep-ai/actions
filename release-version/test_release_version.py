@@ -1572,6 +1572,99 @@ def test_changes_refuses_what_it_cannot_read(repo, tmp_path, capsys, inputs, mes
     assert message in error_of(capsys)
 
 
+# --- a rolling pre-release with a build per app ----------------------------------------------------
+
+# sleephub-android builds SleepHub on every push and SweetSleep by hand, into one rolling pre-release.
+SLEEPHUB = "SleepHub_*.apk"
+SWEETSLEEP = "SweetSleep_*.apk"
+
+
+def rolling_apps(repo: Path, tag: str, last: str, revision: str, *builds: tuple) -> None:
+    """Move a rolling tag the way the publish job does with asset-pattern: the build published last
+    first, then a line per app, "<pattern> <version name> (<versionCode>) <commit>"."""
+    body = "\n".join(f"{pattern} {name} ({code}) {sha}" for pattern, name, code, sha in sorted(builds))
+    git(repo, "tag", "-f", "-a", tag, "-m", last, "-m", body, revision)
+
+
+def test_a_tag_with_a_build_per_app_is_read_per_app(lines, repo, tmp_path, capsys):
+    #   develop:      base(v1.13.0) ── a ── b(v2.0.0) ── c
+    #   release/1.x:    └── h1(v1.13.1) ── h2
+    # SleepHub was built from h1, then SweetSleep from h2, which is where the tag is now.
+    hub, sweet = (SLEEPHUB, "1.13.2-qa.58", 101_300_058, lines["h1"]), (SWEETSLEEP, "1.13.2-qa.60", 101_300_060, lines["h2"])
+    rolling_apps(repo, "qa-release-1.x", "1.13.2-qa.60 (101300060)", lines["h2"], hub, sweet)
+    hub_line, sweet_line = (f"{p} {n} ({c}) {s}" for p, n, c, s in (hub, sweet))
+
+    def changes(sha, pattern, code="101300061"):
+        return run(tmp_path, operation="changes", sha=sha, since="qa-release-1.x", asset_pattern=pattern, version_code=code)
+
+    # SleepHub's next build lists what it adds to SleepHub's build before, not to the tag's commit.
+    code, out = changes(lines["h2"], SLEEPHUB)
+    assert code == 0
+    assert (out["since"], out["prs"], out["stale"], out["unchanged"]) == (lines["h1"], "- #22 Hotfix two", "false", "false")
+    assert (out["since-code"], out["code-taken-by"], out["kept-builds"]) == ("101300058", "", sweet_line)
+    assert f"The build of {SLEEPHUB} that qa-release-1.x holds: 1.13.2-qa.58 (101300058) of {lines['h1'][:7]}." in capsys.readouterr().out
+    # SweetSleep's own build again: the same commit, and its own code is not taken.
+    _, out = changes(lines["h2"], SWEETSLEEP, "101300060")
+    assert (out["since"], out["unchanged"], out["since-code"], out["code-taken-by"], out["kept-builds"]) == (lines["h2"], "true", "101300060", "", hub_line)
+    # An older SweetSleep build is past, whatever SleepHub's commit is.
+    _, out = changes(lines["h1"], SWEETSLEEP)
+    assert (out["since"], out["stale"], out["unchanged"]) == (lines["h2"], "true", "false")
+    assert f"qa-release-1.x holds the build of {SWEETSLEEP} of {lines['h2'][:7]}, a later commit that contains {lines['h1'][:7]}." in capsys.readouterr().out
+    # Another app's code is taken, in the since tag as anywhere.
+    _, out = changes(lines["h2"], SLEEPHUB, "101300060")
+    assert out["code-taken-by"] == "qa-release-1.x"
+    # A third app has no build here yet: the list starts at the last release, and both lines are kept.
+    _, out = changes(lines["h2"], "Third_*.apk")
+    assert (out["since"], out["prs"], out["since-code"]) == ("v1.13.1", "- #22 Hotfix two", "")
+    assert out["kept-builds"] == f"{hub_line}\n{sweet_line}"
+    # Without asset-pattern the tag is one build, as before: its commit and its first line.
+    _, out = run(tmp_path, operation="changes", sha=lines["h2"], since="qa-release-1.x", version_code="101300060")
+    assert (out["since"], out["unchanged"], out["since-code"], out["code-taken-by"]) == (lines["h2"], "true", "101300060", "")
+    assert "kept-builds" not in out
+    # Every app's build counts as published.
+    assert sorted(release_version.rolling_builds()) == [
+        ("qa-release-1.x", "1.13.2-qa.58", 101_300_058), ("qa-release-1.x", "1.13.2-qa.60", 101_300_060),
+    ]
+
+
+def test_a_tag_from_before_asset_pattern_names_no_build_of_an_app(lines, repo, tmp_path):
+    # The rolling build of develop as every build wrote it before: one line, of no app.
+    rolling(repo, "qa-develop", "2.0.1-qa.57", 200_000_057, lines["c"])
+    code, out = run(tmp_path, operation="changes", sha=lines["c"], since="qa-develop", asset_pattern=SWEETSLEEP, version_code="200000058")
+    assert code == 0
+    assert (out["since"], out["unchanged"], out["since-code"], out["kept-builds"]) == ("v2.0.0", "false", "", "")
+    # It still counts as published, and without the pattern it is the build before, as it was.
+    assert release_version.rolling_builds() == [("qa-develop", "2.0.1-qa.57", 200_000_057)]
+    _, out = run(tmp_path, operation="changes", sha=lines["c"], since="qa-develop", version_code="200000058")
+    assert (out["since"], out["unchanged"], out["since-code"]) == (lines["c"], "true", "200000057")
+
+
+def test_the_label_builds_of_every_app_are_counted(lines, repo, tmp_path):
+    # SleepHub and SweetSleep each made a label build after v2.0.0, into one pre-release.
+    rolling_apps(
+        repo, "qa-develop-ble-test", "2.0.1-ble-test.2 (200050002)", lines["c"],
+        (SLEEPHUB, "2.0.1-ble-test.1", 200_050_001, lines["c"]), (SWEETSLEEP, "2.0.1-ble-test.2", 200_050_002, lines["c"]),
+    )
+    _, out = run_qa(tmp_path, lines["c"], label="ble-test", asset_pattern=SLEEPHUB)
+    assert (out["version-name"], out["version-code"], out["release-tag"]) == ("2.0.1-ble-test.3", "200050003", "qa-develop-ble-test")
+
+
+@pytest.mark.parametrize("pattern", [" SweetSleep_*.apk", "SweetSleep_*.apk\n", "Sweet Sleep_*.apk", "SweetSleep_*.apk|x", "../*.apk"])
+def test_an_asset_pattern_that_cannot_be_written_into_a_tag_is_refused(lines, tmp_path, capsys, pattern):
+    code, out = run_qa(tmp_path, lines["c"], asset_pattern=pattern)
+    assert (code, out) == (1, {})
+    assert f"asset-pattern is {pattern!r}. It is the file name pattern of the APKs of one app" in error_of(capsys)
+    code, out = run(tmp_path, operation="changes", sha=lines["c"], since="qa-develop", asset_pattern=pattern)
+    assert (code, out) == (1, {})
+    assert "asset-pattern is " in error_of(capsys)
+
+
+def test_a_qa_plan_says_where_the_apks_of_its_app_go(lines, tmp_path, capsys):
+    code, out = run_qa(tmp_path, lines["h2"], ref="refs/heads/release/1.x", asset_pattern="SweetSleep_[a-z]*.apk")
+    assert (code, out["version-name"], out["release-tag"]) == (0, "1.13.2-qa.57", "qa-release-1.x")
+    assert "Published as: qa-release-1.x, the APKs that SweetSleep_[a-z]*.apk matches next to the builds of the other apps" in capsys.readouterr().out
+
+
 def test_the_action_passes_every_input_to_the_script():
     import re
 

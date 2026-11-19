@@ -261,15 +261,29 @@ jobs:
           lines = (message or "").strip().splitlines()
           named = re.fullmatch(r"(.+) \(([1-9][0-9]*)\)", lines[0].strip()) if lines else None
           tag_name, tag_code = (named[1], named[2]) if named else ("", "")
+          # A pre-release with a build per app (asset-pattern of android-qa.yml) names each in a line below the first.
+          LINE = re.compile(r"(\S+) (\S+) \(([1-9][0-9]*)\) ([0-9a-f]{40})")
+          builds = [line.groups() for line in (LINE.fullmatch(text.strip()) for text in lines[1:]) if line] if named else []
+
+
+          def build_of(name):
+              """(version name, versionCode, commit) of the build an APK of this name is of, as the tag names it, or None."""
+              if not builds:
+                  return (tag_name, tag_code, commit) if tag_code else None
+              found = [build[1:] for build in builds if fnmatch.fnmatchcase(name, build[0])]
+              return found[0] if len(found) == 1 else None
 
 
           def of_the_tag(name):
               """Whether a file name names the build the rolling tag names, as <App>_<kind>_<versionName>_<versionCode>.apk
               does: its versionCode or its version name as a part between _ and -, or the ends."""
+              build = build_of(name)
+              if not build:
+                  return False
               stem = name[: -len(".apk")]
-              if tag_code in re.split(r"[_-]", stem):
+              if build[1] in re.split(r"[_-]", stem):
                   return True
-              return re.search(rf"(?:^|[_-]){re.escape(tag_name)}(?:[_-]|$)", stem) is not None
+              return re.search(rf"(?:^|[_-]){re.escape(build[0])}(?:[_-]|$)", stem) is not None
 
 
           def choose(release, last):
@@ -296,9 +310,10 @@ jobs:
                   if len(ours) == 1:
                       others = [item["name"] for item in candidates if item is not ours[0]]
                       if others:
+                          name, code, _ = build_of(ours[0]["name"])
                           print(
                               f"{tag} also holds {', '.join(others)}, of the build before: the QA build that moved the tag "
-                              f"to {tag_name} ({tag_code}) is replacing it. {ours[0]['name']} is of {tag_name}."
+                              f"to {name} ({code}) is replacing it. {ours[0]['name']} is of {name}."
                           )
                       return ours[0], None
                   if ours:
@@ -344,6 +359,10 @@ jobs:
               fail(f"{asset['name']} of {tag} has a name of other characters than letters, digits and . _ -.")
           if not isinstance(asset.get("id"), int) or not isinstance(asset.get("size"), int):
               fail(f"The release {tag} lists {asset['name']} without an id and a size.")
+          # The code and the commit of this APK's app: the tag itself names the build published last.
+          _, tag_code, commit = build_of(asset["name"]) or ("", "", commit)
+          if builds and not tag_code:
+              print(f"{tag} names no build that {asset['name']} is of: the commit of the tag stands for it.")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"asset-id={asset['id']}\nasset-name={asset['name']}\ncommit={commit}\ntag-code={tag_code}\n")

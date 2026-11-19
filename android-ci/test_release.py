@@ -219,6 +219,54 @@ def test_a_released_tag_is_built_again_with_build_numbers_only_by_its_own_run(en
     assert gh.numbers(1) == [1]
 
 
+def test_another_app_is_added_to_a_published_release_with_a_number_of_its_own(entry, lines, tmp_path, monkeypatch):
+    # sleephub-android builds SleepHub and SweetSleep (an applicationId of its own) from one tag, one
+    # per run, and passes the pattern of the run's APKs. The tag step still asks whether the release
+    # exists, for its rules about older tags; release-version reads which apps the release holds.
+    import sys
+
+    sys.path.insert(0, str(ROOT / "release-version"))
+    import release_version
+    from test_build_numbers import FakeGitHub, add_asset
+    from test_release_version import API, parse_outputs
+
+    plan = entry["jobs"]["plan"]
+    assert "asset-pattern" not in json.dumps(step_by_id(plan, "tag"))
+    result, tagged = check_tag(entry, tmp_path, "v1.9.0", gh_directory(tmp_path, TAGS, released=RELEASED + ["v1.10.1"]))
+    assert result.returncode == 0 and tagged["exists"] == "true", result.stdout + result.stderr
+    assert step_by_id(plan, "code")["with"]["asset-pattern"] == "${{ inputs.asset-pattern }}"
+    monkeypatch.chdir(lines["clone"])
+    gh = FakeGitHub()
+    gh.release("v1.10.1", "SleepHub_release_1.10.1_100000002.apk")
+    gh.release("v1.9.0", "SleepHub_release_1.9.0_100000001.apk")
+    gh.reserve_by_hand(1, 2)
+
+    def plan_code(run_id, pattern):
+        output = tmp_path / f"code-{run_id}-{len(pattern)}"
+        output.write_text("")
+        env = {
+            "OPERATION": "code", "KIND": tagged["kind"], "VERSION": tagged["tag"], "SHA": lines["a"], "TAG_PREFIX": "v",
+            "RELEASE_EXISTS": tagged["exists"], "ASSET_PATTERN": pattern, "VERSION_CODE_SCHEME": "build-number",
+            "TOKEN": "job-token", "GITHUB_REPOSITORY": "acme/app", "GITHUB_API_URL": API, "GITHUB_RUN_ID": run_id,
+            "GITHUB_OUTPUT": str(output),
+        }
+        return release_version.main(env, release_version.http_get, gh), parse_outputs(output.read_text())
+
+    # heysleep-android-v2 passes no pattern: the release is one build, refused as before.
+    assert plan_code("5101", "") == (1, {})
+    # SweetSleep is new to the release: the next number, and the run keeps it when it is run again.
+    code, sweet = plan_code("5102", "SweetSleep_*.apk")
+    assert (code, sweet["version-code"]) == (0, "100000003")
+    add_asset(gh, "v1.9.0", "SweetSleep_release_1.9.0_100000003.apk")
+    assert plan_code("5102", "SweetSleep_*.apk")[1]["version-code"] == "100000003"
+    # A new run of an app the release holds is refused, and so is a third app that v1.10.1 holds.
+    assert plan_code("5103", "SweetSleep_*.apk") == (1, {})
+    add_asset(gh, "v1.10.1", "Third_release_1.10.1_100000004.apk")
+    gh.reserve_by_hand(1, 4)
+    assert plan_code("5104", "Third_*.apk") == (1, {})
+    assert gh.numbers(1) == [2, 3, 4]
+
+
 def test_a_release_of_a_lower_line_is_not_the_latest(entry, tmp_path):
     # 2.0.1 exists, and 1.13.2 is released after it from release/1.x.
     directory = gh_directory(tmp_path, LINE_TAGS, released=["v1.13.0", "v1.13.1", "v2.0.0", "v2.0.1"])
@@ -646,6 +694,8 @@ def test_plan_takes_the_version_code_from_the_one_formula(entry):
         "sha": "${{ steps.tag.outputs.sha }}",
         # A tag whose GitHub Release exists keeps the number of its own run, or is refused.
         "release-exists": "${{ steps.tag.outputs.exists }}",
+        # Unless the release holds no APK of the app this run builds.
+        "asset-pattern": "${{ inputs.asset-pattern }}",
         "version-code-scheme": "${{ inputs.version-code-scheme }}",
         "version-code-floor": "${{ inputs.version-code-floor }}",
     }
@@ -3085,7 +3135,7 @@ def test_primary_and_fallback_pass_the_same_inputs(entry):
     forwarded = set(inner["inputs"]) - {"runs-on", "attempt", "kind", "ref", "gradle-home", *left_out, *planned}
     assert forwarded == set(inputs) - {
         "tag", "runner-labels", "fallback-runs-on", "source-branch", "required-checks", "release-notes-prompt", "gradle-home",
-        "version-code-scheme", "version-code-floor",
+        "version-code-scheme", "version-code-floor", "asset-pattern",
     }
     for name in forwarded:
         assert primary["with"][name] == fallback["with"][name] == f"${{{{ inputs.{name} }}}}"
@@ -3358,6 +3408,61 @@ def test_publish_needs_an_apk(entry, tmp_path):
     assert result.returncode == 1
     assert "::error::The build artifact holds no APK." in result.stdout
     assert calls == []
+
+
+CHECK_NAMES = "Check the APKs against asset-pattern"
+
+
+def check_names(entry, tmp_path, pattern: str, apks: tuple):
+    apk_directory = tmp_path / "apk"
+    apk_directory.mkdir(parents=True)
+    for name in apks:
+        (apk_directory / name).parent.mkdir(parents=True, exist_ok=True)
+        (apk_directory / name).write_text("apk")
+    (apk_directory / "output-metadata.json").write_text("{}")
+    env = {"ASSET_PATTERN": pattern, "APK_DIRECTORY": str(apk_directory)}
+    return run_script(step(entry["jobs"]["publish"], CHECK_NAMES)["run"], env, tmp_path)
+
+
+SWEET_APK = "sweetsleep/release/SweetSleep_release_1.12.0_100000003.apk"
+HUB_APK = "sleephub/release/SleepHub_release_1.12.0_100000003.apk"
+
+
+def test_every_apk_of_the_build_has_to_match_asset_pattern(entry, tmp_path):
+    result = check_names(entry, tmp_path / "match", "SweetSleep_*.apk", (SWEET_APK,))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "Every APK of the build matches asset-pattern SweetSleep_*.apk: SweetSleep_release_1.12.0_100000003.apk.\n"
+    # Stripped, as release-version strips it.
+    result = check_names(entry, tmp_path / "stripped", " SweetSleep_*.apk\n", (SWEET_APK,))
+    assert result.returncode == 0, result.stdout + result.stderr
+    # The run built the other app, or both: the plan's reading of the release may be wrong.
+    for name, apks in (("other", (HUB_APK,)), ("both", (HUB_APK, SWEET_APK))):
+        result = check_names(entry, tmp_path / name, "SweetSleep_*.apk", apks)
+        assert result.returncode == 1, name
+        assert (
+            "::error title=An APK does not match asset-pattern::asset-pattern is SweetSleep_*.apk, and the build made "
+            "SleepHub_release_1.12.0_100000003.apk, which it does not match. Nothing is published."
+        ) in result.stdout, name
+    # Compared case by case, as release-version and the Sleepless upload compare a pattern.
+    assert check_names(entry, tmp_path / "case", "sweetsleep_*.apk", (SWEET_APK,)).returncode == 1
+    # Whitespace only is no pattern, as for release-version.
+    result = check_names(entry, tmp_path / "blank", " ", (HUB_APK,))
+    assert (result.returncode, result.stdout) == (0, "asset-pattern is empty: every APK of the build is published.\n")
+
+
+def test_the_apks_are_held_to_asset_pattern_before_anything_is_published(entry):
+    publish = entry["jobs"]["publish"]
+    names = [item.get("name") for item in publish["steps"]]
+    assert names.index("Download the signed APKs") + 1 == names.index(CHECK_NAMES)
+    assert names.index(CHECK_NAMES) < names.index("Create or update the GitHub Release")
+    check = step(publish, CHECK_NAMES)
+    # A calling file without the input (heysleep-android-v2) publishes as before.
+    assert check["if"] == "${{ inputs.asset-pattern != '' }}"
+    create = step(publish, "Create or update the GitHub Release")
+    assert check["env"] == {"ASSET_PATTERN": "${{ inputs.asset-pattern }}", "APK_DIRECTORY": create["env"]["APK_DIRECTORY"]}
+    assert "python3 -I - <<'NAMES'" in check["run"]
+    inputs = trigger(entry)["inputs"]
+    assert inputs["asset-pattern"] == {**inputs["asset-pattern"], "type": "string", "default": "", "required": False}
 
 
 def test_look_for_the_release_tells_missing_from_unreachable(entry, tmp_path):

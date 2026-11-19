@@ -66,6 +66,12 @@ jobs:
       # release.yml and in version-bump.yml alike ("Build numbers" in
       # android-ci/README.md).
       # version-code-scheme: build-number
+      # A repository that builds several apps (applicationIds) into the
+      # rolling pre-release, one app per run, names the APKs of the run: each
+      # run then replaces its own app's APKs and keeps the others. With a
+      # `brand` input of the manual run, next to `label` and `version`:
+      # gradle-args: -PciBrand=${{ inputs.brand || 'sleephub' }}
+      # asset-pattern: ${{ (inputs.brand || 'sleephub') == 'sweetsleep' && 'SweetSleep_*.apk' || 'SleepHub_*.apk' }}
       # Secrets and variables written to local.properties under their own
       # names, next to the four signing keys.
       local-properties-secrets: |
