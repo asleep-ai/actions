@@ -76,6 +76,8 @@ class GitHub(ThreadingHTTPServer):
         self.refs: dict[str, dict] = {}
         self.objects: dict[str, dict] = {}
         self.releases: dict[str, dict] = {}
+        # A release that changes while it is read: answered one by one, the last one stays.
+        self.release_reads: dict[str, list[dict]] = {}
         self.files: dict[int, bytes] = {}
         self.requests: list[tuple] = []
         # (method, start of the path below the repository) -> statuses to answer, used up one by one.
@@ -173,7 +175,9 @@ class Handler(BaseHTTPRequestHandler):
             item = server.objects.get(match[1])
             return self.answer(200, item) if item else self.answer(404, {"message": "Not Found"})
         if match := re.fullmatch(r"releases/tags/(.+)", rest):
-            release = server.releases.get(urllib.parse.unquote(match[1]))
+            name = urllib.parse.unquote(match[1])
+            reads = server.release_reads.get(name)
+            release = (reads.pop(0) if len(reads) > 1 else reads[0]) if reads else server.releases.get(name)
             return self.answer(200, release) if release else self.answer(404, {"message": "Not Found"})
         if match := re.fullmatch(r"releases/assets/([0-9]+)", rest):
             content = server.files.get(int(match[1]))
@@ -477,7 +481,12 @@ def test_missing_settings_are_named_together_before_anything_is_downloaded(plan,
 
 
 def find(plan, tmp_path, github, tag="qa-develop", asset=""):
-    return run_step(plan, "Find the APK", tmp_path, github, TAG=tag, ASSET=asset)
+    # The release is read again at once, instead of after 15 seconds.
+    return run_step(plan, "Find the APK", tmp_path, github, TAG=tag, ASSET=asset, RELEASE_POLL_SECONDS="0")
+
+
+def release_reads(github: GitHub, tag: str) -> int:
+    return len(github.asked("GET", f"{BASE}releases/tags/{tag}"))
 
 
 def test_the_only_apk_of_a_rolling_pre_release_is_found_with_the_code_its_tag_names(plan, tmp_path, github):
@@ -509,6 +518,8 @@ def test_several_apks_need_asset(plan, tmp_path, github):
     result, _ = find(plan, tmp_path, github)
     assert result.returncode == 1
     assert f"::error title=No APK to upload::The release qa-develop holds 2 APKs: {names[0]}, {names[1]}. Name the one to upload with asset" in result.stdout
+    # Both are of the build the tag names: no replacing ends that, and the release is not read again.
+    assert release_reads(github, "qa-develop") == 1
     result, outputs = find(plan, tmp_path, github, asset="HeySleep_main_*.apk")
     assert result.returncode == 0, result.stdout + result.stderr
     assert outputs["asset-name"] == names[1] and outputs["asset-id"] == str(ids[names[1]])
@@ -537,6 +548,121 @@ def test_an_asset_that_is_still_uploading_is_not_chosen(plan, tmp_path, github):
     github.releases["qa-develop"]["assets"][0]["state"] = "open"
     result, _ = find(plan, tmp_path, github)
     assert result.returncode == 1 and "The release qa-develop holds no APK. Its APKs: none." in result.stdout
+    # It was waited for, as long as an APK that is going up is waited for.
+    assert release_reads(github, "qa-develop") == 9
+
+
+# The publish job of android-qa.yml replacing the APK of qa-develop: the tag is moved to the new build
+# first, the new APK goes up next to the old one, and the old one is deleted last.
+OLD_APK = "HeySleep_qa_2.0.1-qa.57_200000123.apk"
+NEW_APK = "HeySleep_qa_2.0.1-qa.58_200000124.apk"
+NEW_TAG = "2.0.1-qa.58 (200000124)"
+
+
+def moment(github: GitHub, tag: str, *names: str, going_up: tuple = ()) -> dict:
+    """The release as it is listed at one moment of a replacing: these of its assets, some still going up."""
+    assets = [
+        {**item, "state": "open" if item["name"] in going_up else "uploaded"}
+        for item in github.releases[tag]["assets"] if item["name"] in names
+    ]
+    return {"tag_name": tag, "assets": assets}
+
+
+@pytest.mark.parametrize("asset", ["", "HeySleep_qa_*.apk"])
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        # <App>_<kind>_<versionName>_<versionCode>.apk
+        (OLD_APK, NEW_APK),
+        # The version name alone, or the versionCode alone.
+        ("HeySleep_qa_2.0.1-qa.57.apk", "HeySleep_qa_2.0.1-qa.58.apk"),
+        ("HeySleep_qa_200000123.apk", "HeySleep_qa_200000124.apk"),
+    ],
+)
+def test_while_a_qa_build_replaces_its_apk_the_new_one_is_chosen_by_its_name(plan, tmp_path, github, asset, old, new):
+    # Both are uploaded and both have names of their own: the old one is about to be deleted.
+    github.tag("qa-develop", message=NEW_TAG)
+    ids = github.release("qa-develop", **{old: apk_bytes(code="200000123"), new: apk_bytes(code="200000124")})
+    result, outputs = find(plan, tmp_path, github, asset=asset)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs["asset-id"] == str(ids[new]) and outputs["asset-name"] == new and outputs["tag-code"] == "200000124"
+    # No download of either to find out, and no waiting.
+    assert release_reads(github, "qa-develop") == 1
+    assert github.asked("GET", f"{BASE}releases/assets/") == []
+    assert f"qa-develop also holds {old}, of the build before: the QA build that moved the tag to 2.0.1-qa.58 (200000124) is replacing it." in result.stdout
+
+
+@pytest.mark.parametrize("asset", ["", "HeySleep_qa*.apk"])
+@pytest.mark.parametrize("replacing", ["going up", "copy", "names that do not tell"])
+def test_while_the_names_do_not_tell_the_release_is_read_again_until_the_replacing_is_done(plan, tmp_path, github, asset, replacing):
+    github.tag("qa-develop", message=NEW_TAG)
+    if replacing == "going up":
+        # The new APK is still going up next to the old one, then both are there, then the old one goes.
+        ids = github.release("qa-develop", **{OLD_APK: apk_bytes(code="200000123"), NEW_APK: apk_bytes(code="200000124")})
+        reads = [
+            moment(github, "qa-develop", OLD_APK, NEW_APK, going_up=(NEW_APK,)),
+            moment(github, "qa-develop", OLD_APK, NEW_APK, going_up=(NEW_APK,)),
+            moment(github, "qa-develop", OLD_APK, NEW_APK),
+        ]
+        chosen, after = ids[NEW_APK], 3
+    elif replacing == "copy":
+        # A build that names every APK alike: the new one goes up as a copy, then takes the name.
+        staged = "HeySleep_qa.run-99-1.apk"
+        ids = github.release("qa-develop", **{"HeySleep_qa.apk": apk_bytes(code="200000123"), staged: apk_bytes(code="200000124")})
+        renamed = {"id": ids[staged], "name": "HeySleep_qa.apk", "size": 4136, "state": "uploaded"}
+        reads = [
+            moment(github, "qa-develop", "HeySleep_qa.apk", staged),
+            moment(github, "qa-develop", staged),
+            {"tag_name": "qa-develop", "assets": [renamed]},
+        ]
+        chosen, after = ids[staged], 3
+    else:
+        ids = github.release("qa-develop", **{"HeySleep_qa.apk": apk_bytes(code="200000123"), "HeySleep_qa_arm64.apk": apk_bytes(code="200000124")})
+        reads = [
+            moment(github, "qa-develop", "HeySleep_qa.apk", "HeySleep_qa_arm64.apk"),
+            moment(github, "qa-develop", "HeySleep_qa_arm64.apk"),
+        ]
+        chosen, after = ids["HeySleep_qa_arm64.apk"], 2
+    github.release_reads["qa-develop"] = reads
+    result, outputs = find(plan, tmp_path, github, asset=asset)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert outputs["asset-id"] == str(chosen)
+    assert release_reads(github, "qa-develop") == after
+    assert "The release qa-develop is being replaced by 2.0.1-qa.58 (200000124), the build its tag names: reading it again in 0 seconds (1 of 8)." in result.stdout
+
+
+def test_a_release_that_stays_in_between_fails_as_before(plan, tmp_path, github):
+    # Two APKs whose names do not tell, for longer than a replacing takes: the publish job did not
+    # finish, or the build makes two APKs and asset names none.
+    github.tag("qa-develop", message=NEW_TAG)
+    github.release("qa-develop", **{"HeySleep_qa.apk": apk_bytes(), "HeySleep_qa_arm64.apk": apk_bytes()})
+    result, outputs = find(plan, tmp_path, github)
+    assert result.returncode == 1
+    assert "::error title=No APK to upload::The release qa-develop holds 2 APKs: HeySleep_qa.apk, HeySleep_qa_arm64.apk. Name the one to upload with asset" in result.stdout
+    assert release_reads(github, "qa-develop") == 9
+    assert result.stdout.count("reading it again in 0 seconds") == 8
+    assert outputs == {}
+
+
+def test_the_wait_is_two_minutes_and_the_calling_file_does_not_change_it(plan):
+    find_step = step(plan, "Find the APK")
+    assert "RELEASE_POLL_SECONDS" not in find_step["env"]
+    script = find_step["run"]
+    assert "READS = 9" in script and 'pause = float(os.environ.get("RELEASE_POLL_SECONDS") or 15)' in script
+    assert plan["timeout-minutes"] == 15
+
+
+@pytest.mark.parametrize("message", ["v2.0.0", None])
+def test_several_apks_of_a_release_tag_are_an_error_at_once(plan, tmp_path, github, message):
+    # A release tag names no build: nothing replaces its APKs, and several of them are a setting to make.
+    github.tag("v2.0.0", message=message)
+    names = ["HeySleep_brand_2.0.0_200050000.apk", "HeySleep_main_2.0.0_200050000.apk"]
+    github.release("v2.0.0", **{name: apk_bytes() for name in names})
+    result, outputs = find(plan, tmp_path, github, tag="v2.0.0")
+    assert result.returncode == 1
+    assert f"::error title=No APK to upload::The release v2.0.0 holds 2 APKs: {names[0]}, {names[1]}. Name the one to upload with asset" in result.stdout
+    assert release_reads(github, "v2.0.0") == 1 and "reading it again" not in result.stdout
+    assert outputs == {}
 
 
 @pytest.mark.parametrize(
