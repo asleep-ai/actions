@@ -43,6 +43,15 @@ with the same object, so a run that is run again keeps its name too. The first
 number of a version is one above the QA builds of it that are out already, by
 the names the rolling tags hold, so no name is given twice.
 
+A reused number. A release that holds several apps can get an app's APK later
+with the number another app's APK of the same release was built with
+(release_version.reused_number). That number's ref exists already, so nothing
+is reserved: every later build is above it whatever happens. The run says
+that it reused the number with a ref of its own,
+refs/reused-numbers/<X>/<n>/app-<key>/<k>, naming the run's object, so that
+the run, run again, is told apart from a new run of the same app, and builds
+with that number again or not at all, whatever the release holds by then.
+
 The API is reached through a function the caller passes, so the tests run
 against a stand-in. A server error, or a request that got no answer, is made
 again a few times; every request here may be.
@@ -59,6 +68,7 @@ from version_code import MAJOR_BLOCK, MAX_BUILD_NUMBER, MAX_VERSION_CODE, Versio
 
 REFS = "refs/build-numbers"
 QA_REFS = "refs/qa-numbers"
+REUSED_REFS = "refs/reused-numbers"
 # What an asset pattern keeps of itself in the name of its counter: git and a URL take these as they are.
 APP_KEY = re.compile(r"[A-Za-z0-9_]")
 # The name inside the tag object of a reservation. The number is the ref's.
@@ -129,8 +139,17 @@ def qa_counter(version: str, pattern: str = "") -> str:
     """
     if not pattern:
         return f"{QA_REFS}/{version}"
-    key = "".join(chr(byte) if APP_KEY.fullmatch(chr(byte)) else f"-{byte:02x}" for byte in pattern.encode())
-    return f"{QA_REFS}/{version}/app-{key}"
+    return f"{QA_REFS}/{version}/{app_key(pattern)}"
+
+
+def app_key(pattern: str) -> str:
+    """The part of a ref's name that stands for an asset pattern: app- and the pattern, every byte but a letter, a digit and _ as - and two hex digits."""
+    return "app-" + "".join(chr(byte) if APP_KEY.fullmatch(chr(byte)) else f"-{byte:02x}" for byte in pattern.encode())
+
+
+def reuse_counter(major: int, number: int, pattern: str) -> str:
+    """Where the runs that reused build number `number` of the major for the app of `pattern` say so."""
+    return f"{REUSED_REFS}/{major}/{number}/{app_key(pattern)}"
 
 
 def codes_in_name(name: str) -> list:
@@ -144,6 +163,19 @@ def codes_in_name(name: str) -> list:
         return []
     stem = name.rsplit(".", 1)[0]
     return [int(part) for part in re.split(r"[_-]", stem) if CODE_PART.fullmatch(part)]
+
+
+def shipped_in(releases: Iterable[dict]) -> list:
+    """The versionCodes in the file names of the assets of these releases and pre-releases."""
+    out = []
+    for release in releases:
+        kind = "pre-release" if release.get("prerelease") else "release"
+        for asset in release.get("assets") or []:
+            name = asset.get("name") if isinstance(asset, dict) else None
+            if isinstance(name, str):
+                for code in codes_in_name(name):
+                    out.append(Shipped(code, f"in the name of {name}, an asset of the {kind} {release.get('tag_name')}"))
+    return out
 
 
 def parse_floor(text: str) -> Optional[int]:
@@ -325,15 +357,38 @@ class Repository:
 
     def shipped(self) -> list:
         """The versionCodes in the file names of the assets of the releases and pre-releases."""
-        out = []
-        for release in self.published():
-            kind = "pre-release" if release.get("prerelease") else "release"
-            for asset in release.get("assets") or []:
-                name = asset.get("name") if isinstance(asset, dict) else None
-                if isinstance(name, str):
-                    for code in codes_in_name(name):
-                        out.append(Shipped(code, f"in the name of {name}, an asset of the {kind} {release.get('tag_name')}"))
-        return out
+        return shipped_in(self.published())
+
+    def reuses(self, major: int) -> dict:
+        """The runs that reused a build number of the major: {(n, app key): {k: the id of the object its ref names}}."""
+        counter = f"{REUSED_REFS}/{major}"
+        ref = re.compile(rf"{re.escape(counter)}/([1-9][0-9]*)/(app-[A-Za-z0-9_-]+)/([1-9][0-9]*)")
+        runs = {}
+        for item in self._listed(f"git/matching-refs/{counter[len('refs/'):]}/", f"list the runs that reused a build number of major {major}"):
+            match = ref.fullmatch(str(item.get("ref", "")))
+            target = item.get("object")
+            if match:
+                runs.setdefault((int(match[1]), match[2]), {})[int(match[3])] = target.get("sha", "") if isinstance(target, dict) else ""
+        return runs
+
+    def tag_target(self, sha: str, ref: str = "") -> str:
+        """The id of the object a tag object names: the commit of a reservation. `ref` names the tag object, for the message."""
+        named_by = f"{ref}, which names {sha}," if ref else sha
+        if not OBJECT_ID.fullmatch(sha):
+            raise BuildNumberError(f"{named_by} is not the id of a tag object")
+        status, _, document = self._ask("GET", f"{self.base}git/tags/{sha}")
+        no_tag_object_of_that_id_for_a_token_that_listed_the_refs = status == 404
+        if no_tag_object_of_that_id_for_a_token_that_listed_the_refs:
+            raise BuildNumberError(
+                f"{named_by} does not name a tag object (HTTP 404 for git/tags/{sha}): the reservation of a build "
+                "names the tag object of its run, and a ref made by hand, or by another tool, names a commit. Which "
+                "commit and which run reserved the number cannot be told. Nothing is built"
+            )
+        target = document.get("object") if isinstance(document, dict) else None
+        named = target.get("sha") if isinstance(target, dict) else None
+        if status != 200 or not isinstance(named, str) or not OBJECT_ID.fullmatch(named):
+            raise self._refusal(f"read the tag object {sha}", status, document, "contents: read")
+        return named
 
     def tag_object(self, commit: str, message: str, date: str) -> str:
         """Create the tag object a reservation names, and return its id.
@@ -474,6 +529,41 @@ def reserve_qa(
         number, why = 1, f"the first QA build of {of}: no QA number of it was reserved before, and none of its QA builds is out"
     number, ref, why = take(repository, counter, number, own, why, f"QA numbers of {of}")
     return QaNumber(version, pattern, number, why, ref, False)
+
+
+def reuse_of_the_run(runs: dict, major: int, pattern: str, own: str) -> tuple:
+    """The number an earlier attempt of this run reused for the app, and the ref that says so: (n, ref), or (0, "").
+
+    `runs` is Repository.reuses of the major, and `own` the run's object: the
+    one a reservation of the run would name, so a run that is run again finds
+    the ref its first attempt created, whatever number that was and whatever
+    the release holds now.
+    """
+    key = app_key(pattern)
+    found = sorted((number, k) for (number, app), refs in runs.items() if app == key for k, sha in refs.items() if sha == own)
+    if len({number for number, _ in found}) > 1:
+        listed = ", ".join(f"{reuse_counter(major, number, pattern)}/{k}" for number, k in found)
+        raise BuildNumberError(
+            f"earlier attempts of this run reused more than one build number of major {major} for {pattern}: "
+            f"{listed}. A run builds with one. Nothing is built"
+        )
+    if not found:
+        return 0, ""
+    number, k = found[-1]
+    return number, f"{reuse_counter(major, number, pattern)}/{k}"
+
+
+def record_reuse(repository: Repository, runs: dict, major: int, number: int, pattern: str, own: str) -> str:
+    """Say that this run reused the number for the app: the ref <counter>/<k> naming the run's object. Nothing is reserved.
+
+    `runs` is Repository.reuses of the major: k is one above the runs that reused the number for the app before.
+    """
+    last = max(runs.get((number, app_key(pattern)), {}), default=0)
+    _, ref, _ = take(
+        repository, reuse_counter(major, number, pattern), last + 1, own, "",
+        f"refs of the runs that reused build number {number} of major {major} for {pattern}",
+    )
+    return ref
 
 
 def look(repository: Repository, major: int, seen: Iterable[Shipped], floor: Optional[int]) -> BuildNumber:

@@ -130,6 +130,11 @@ class FakeGitHub:
             sha = hashlib.sha1(json.dumps(body, sort_keys=True).encode()).hexdigest()
             self.objects[sha] = body
             return self._answer(201, {"sha": sha})
+        if method == "GET" and path.startswith("git/tags/"):
+            body = self.objects.get(path[len("git/tags/"):])
+            if body is None:
+                return self._answer(404, {"message": "Not Found"})
+            return self._answer(200, {"sha": path[len("git/tags/"):], "object": {"sha": body["object"], "type": body["type"]}})
         if method == "POST" and path == "git/refs":
             if self.before_create:
                 hook, self.before_create = self.before_create, None
@@ -154,7 +159,7 @@ def no_waiting(monkeypatch):
     monkeypatch.setattr(build_numbers, "RETRY_DELAYS", (0, 0, 0))
 
 
-def run(tmp_path, gh, run_id="7001", **inputs):
+def run(tmp_path, gh, run_id="7001", read=None, **inputs):
     output = tmp_path / "github-output"
     output.write_text("")
     env = {
@@ -168,7 +173,7 @@ def run(tmp_path, gh, run_id="7001", **inputs):
         "VERSION_CODE_SCHEME": "build-number",
     }
     env.update({name.upper(): value for name, value in inputs.items()})
-    code = release_version.main(env, pulls(), gh)
+    code = release_version.main(env, pulls(), gh, read)
     return code, parse_outputs(output.read_text())
 
 
@@ -1026,6 +1031,738 @@ def test_the_assets_are_read_only_for_a_released_tag_and_with_build_numbers(line
     assert (code, out) == (1, {})
     assert error_of(capsys).startswith("cannot list the releases: HTTP 403: Resource not accessible by integration.")
     assert gh.refs == {}
+
+
+def apks(codes):
+    """A stand-in for reading the versionCode of a release asset from its APK: (tag, name) -> code."""
+
+    def reader(tag, asset):
+        reader.read.append((tag, asset["name"]))
+        return codes[(tag, asset["name"])]
+
+    reader.read = []
+    return reader
+
+
+def set_assets(gh, tag, *names):
+    """Replace every asset of a release, as the publish job of a QA build without asset-pattern does."""
+    (published,) = [item for item in gh.releases if item["tag_name"] == tag]
+    published["assets"] = [{"name": name} for name in names]
+
+
+def reused_refs(gh):
+    return sorted(name for name in gh.refs if name.startswith("refs/reused-numbers/"))
+
+
+SWEET_REUSED = "refs/reused-numbers/2/30/app-SweetSleep_-2a-2eapk"
+SLEEPHUB_REUSED = "refs/reused-numbers/2/30/app-SleepHub_-2a-2eapk"
+SLEEPHUB_APK = ("v2.1.0", "SleepHub_release_2.1.0.apk")
+SWEETSLEEP_APK = ("v2.1.0", "SweetSleep_release_2.1.0.apk")
+
+
+def released_with_sleephub(repo, tmp_path, gh, number=30):
+    """v2.1.0 released with SleepHub alone by its own run, as build number `number` of major 2."""
+    target = commit(repo, "Feature (#1)")
+    gh.reserve_by_hand(2, number - 1)
+    code, first = release(tmp_path, gh, "v2.1.0", target, run_id="8001", release_exists="false", asset_pattern=SLEEPHUB)
+    assert (code, first["version-code"]) == (0, str(200_000_000 + number))
+    gh.release("v2.1.0", "SleepHub_release_2.1.0.apk")
+    return target
+
+
+def add_later(tmp_path, gh, target, read, run_id="8101", tag="v2.1.0", **inputs):
+    """The run of release.yml that adds SweetSleep to the release of a tag, with SleepHub's number."""
+    inputs = {"release_exists": "true", "asset_pattern": SWEETSLEEP, "version_code_from": SLEEPHUB, **inputs}
+    return release(tmp_path, gh, tag, target, run_id=run_id, read=read, **inputs)
+
+
+def qa_build_of_sleephub_alone_after_the_release(repo, gh):
+    gh.reserve_by_hand(2, 33)
+    rolling(repo, "qa-develop", "2.1.1-qa.3", 200_000_033)
+    gh.release("qa-develop", "SleepHub_2.1.1-qa.3.apk", prerelease=True)
+
+
+def other_releases_of_both_apps(gh):
+    gh.release("v2.0.0", "SleepHub_release_2.0.0.apk", "SweetSleep_release_2.0.0.apk")
+    gh.release("v1.13.2", "SweetSleep_release_1.13.2.apk")
+    gh.release("v2.0.1", "SweetSleep_release_2.0.1.apk", draft=True)
+
+
+def test_an_app_added_later_gets_the_number_of_the_other_apps_apk_and_keeps_it_when_run_again(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = released_with_sleephub(repo, tmp_path, gh)
+    qa_build_of_sleephub_alone_after_the_release(repo, gh)
+    other_releases_of_both_apps(gh)
+    reader = apks({SLEEPHUB_APK: 200_000_030, SWEETSLEEP_APK: 200_000_030})
+    capsys.readouterr()
+    code, out = add_later(tmp_path, gh, target, reader)
+    log = capsys.readouterr().out
+    assert (code, out["version-code"], out["build-number"], out["version-code-from"]) == (0, "200000030", "30", SLEEPHUB), log
+    assert (out["version-code-scheme"], out["version-code-reused"]) == ("build-number", "true")
+    assert (
+        "SleepHub_release_2.1.0.apk of v2.1.0: versionCode 200000030, build number 30 of major 2, reserved as "
+        f"refs/build-numbers/2/30 for {target[:7]}."
+    ) in log
+    assert f"Build number 30 of major 2, reused and recorded as {SWEET_REUSED}/1: the number SleepHub_release_2.1.0.apk" in log
+    assert "No number is reserved." in log
+    assert reader.read == [SLEEPHUB_APK]
+    reserved_by_the_release_and_the_qa_build = [29, 30, 33]
+    assert gh.numbers(2) == reserved_by_the_release_and_the_qa_build
+    assert reused_refs(gh) == [f"{SWEET_REUSED}/1"]
+    code, run_again_before_it_published = add_later(tmp_path, gh, target, reader)
+    assert (code, run_again_before_it_published["version-code"]) == (0, "200000030")
+    assert f"Build number 30 of major 2 ({SWEET_REUSED}/1): reused for SweetSleep_*.apk by an earlier attempt of this run, and kept." in capsys.readouterr().out
+    add_asset(gh, *SWEETSLEEP_APK)
+    code, run_again_once_its_apk_is_out = add_later(tmp_path, gh, target, reader)
+    assert (code, run_again_once_its_apk_is_out["version-code"]) == (0, "200000030")
+    capsys.readouterr()
+    downloaded_before_the_new_run = [SLEEPHUB_APK, SLEEPHUB_APK, SLEEPHUB_APK, SWEETSLEEP_APK]
+    assert reader.read == downloaded_before_the_new_run
+    code, new_run = add_later(tmp_path, gh, target, reader, run_id="8102")
+    assert (code, new_run) == (1, {})
+    message = error_of(capsys)
+    assert message.startswith(
+        "v2.1.0 has a GitHub Release with SweetSleep_release_2.1.0.apk already, an APK that asset-pattern "
+        "SweetSleep_*.apk matches, and no attempt of this run reused a build number for it."
+    ), message
+    assert "Re-run failed jobs or Re-run all jobs on the run that built it" in message
+    assert reader.read == downloaded_before_the_new_run
+    assert gh.numbers(2) == reserved_by_the_release_and_the_qa_build and reused_refs(gh) == [f"{SWEET_REUSED}/1"]
+
+
+def test_a_new_run_after_one_that_did_not_publish_reuses_the_same_number(repo, tmp_path):
+    gh = FakeGitHub()
+    target = released_with_sleephub(repo, tmp_path, gh)
+    reader = apks({SLEEPHUB_APK: 200_000_030})
+    run_that_did_not_publish, new_run = "8201", "8202"
+    assert add_later(tmp_path, gh, target, reader, run_id=run_that_did_not_publish)[1]["version-code"] == "200000030"
+    assert add_later(tmp_path, gh, target, reader, run_id=new_run)[1]["version-code"] == "200000030"
+    one_record_per_run = [f"{SWEET_REUSED}/1", f"{SWEET_REUSED}/2"]
+    assert reused_refs(gh) == one_record_per_run
+    assert gh.numbers(2) == [29, 30]
+    assert add_later(tmp_path, gh, target, reader, run_id=run_that_did_not_publish)[1]["version-code"] == "200000030"
+    assert reused_refs(gh) == one_record_per_run
+
+
+def qa_build_of_both_brands_after_the_release(repo, gh):
+    gh.reserve_by_hand(2, 35)
+    rolling(repo, "qa-develop", "2.1.1-qa.5", 200_000_035)
+    gh.release("qa-develop", "SleepHub_2.1.1-qa.5.apk", "SweetSleep_2.1.1-qa.5.apk", prerelease=True)
+
+
+def qa_tag_with_a_line_per_app_above_the_number(repo, gh, target):
+    gh.reserve_by_hand(2, 36)
+    rolling_apps(
+        repo, "qa-develop", "2.1.1-qa.6 (200000036)",
+        f"{SLEEPHUB} 2.1.1-qa.6 (200000036) {target}", f"{SWEETSLEEP} 2.1.1-qa.2 (200000034) {target}",
+    )
+    set_assets(gh, "qa-develop", "SleepHub_2.1.1-qa.6.apk", "SweetSleep_2.1.1-qa.2.apk")
+
+
+def test_an_app_added_later_gets_the_number_whatever_qa_build_of_the_next_version_a_rolling_tag_holds(repo, tmp_path):
+    gh = FakeGitHub()
+    target = released_with_sleephub(repo, tmp_path, gh)
+    qa_build_of_both_brands_after_the_release(repo, gh)
+    reader = apks({SLEEPHUB_APK: 200_000_030})
+    code, out = add_later(tmp_path, gh, target, reader)
+    assert (code, out["version-code"], out["version-code-reused"]) == (0, "200000030", "true")
+    assert reused_refs(gh) == [f"{SWEET_REUSED}/1"] and gh.numbers(2) == [29, 30, 35]
+    qa_tag_with_a_line_per_app_above_the_number(repo, gh, target)
+    a_floor_above_the_number = "200000040"
+    code, out = add_later(tmp_path, gh, target, reader, run_id="8102", version_code_floor=a_floor_above_the_number)
+    assert (code, out["version-code"]) == (0, "200000030")
+    assert reader.read == [SLEEPHUB_APK, SLEEPHUB_APK]
+
+
+def test_a_run_that_reused_a_number_builds_with_it_again_after_a_higher_qa_build(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = released_with_sleephub(repo, tmp_path, gh)
+    reader = apks({SLEEPHUB_APK: 200_000_030, SWEETSLEEP_APK: 200_000_030})
+    assert add_later(tmp_path, gh, target, reader)[1]["version-code"] == "200000030"
+    qa_build_of_both_brands_after_the_release(repo, gh)
+    add_asset(gh, *SWEETSLEEP_APK)
+    capsys.readouterr()
+    code, out = add_later(tmp_path, gh, target, reader)
+    assert (code, out["version-code"]) == (0, "200000030")
+    assert f"Build number 30 of major 2 ({SWEET_REUSED}/1): reused for SweetSleep_*.apk by an earlier attempt of this run, and kept." in capsys.readouterr().out
+    assert reused_refs(gh) == [f"{SWEET_REUSED}/1"] and gh.numbers(2) == [29, 30, 35]
+
+
+def alone(tmp_path, gh, target, pattern, other, read, run_id, release_exists="true", **inputs):
+    """A run of one brand, as sleephub-android's release.yml starts it: the other brand's APK lends its number."""
+    return release(
+        tmp_path, gh, "v2.1.0", target, run_id=run_id, read=read, release_exists=release_exists,
+        asset_pattern=pattern, version_code_from=other, **inputs,
+    )
+
+
+@pytest.mark.parametrize("exists", ["false", ""])
+def test_the_first_app_of_a_tag_without_a_release_takes_a_number_of_its_own_with_version_code_from(repo, tmp_path, capsys, exists):
+    gh = FakeGitHub()
+    target = commit(repo, "Feature (#1)")
+    gh.reserve_by_hand(2, 29)
+    reader = apks({})
+    capsys.readouterr()
+    code, out = alone(tmp_path, gh, target, SWEETSLEEP, SLEEPHUB, reader, "8001", release_exists=exists)
+    log = capsys.readouterr().out
+    assert (code, out["version-code"], out["version-code-from"], out["version-code-reused"]) == (0, "200000030", SLEEPHUB, "false"), log
+    assert "v2.1.0 has no " in log and "SweetSleep_*.apk takes a build number of its own." in log
+    assert "Build number 30 of major 2, reserved as refs/build-numbers/2/30" in log
+    assert reader.read == [] and reused_refs(gh) == [] and gh.numbers(2) == [29, 30]
+    gh.release("v2.1.0", "SweetSleep_release_2.1.0.apk")
+    code, again = alone(tmp_path, gh, target, SWEETSLEEP, SLEEPHUB, reader, "8001")
+    assert (code, again["version-code"], again["version-code-reused"]) == (0, "200000030", "false")
+    assert reader.read == [] and gh.numbers(2) == [29, 30]
+
+
+def test_a_release_without_an_apk_of_version_code_from_gives_the_app_a_number_of_its_own(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = released_with_sleephub(repo, tmp_path, gh)
+    reader = apks({})
+    capsys.readouterr()
+    code, out = alone(tmp_path, gh, target, SWEETSLEEP, "Sleep_*.apk", reader, "8101")
+    log = capsys.readouterr().out
+    assert (code, out["version-code"], out["version-code-reused"]) == (0, "200000031", "false"), log
+    assert (
+        "v2.1.0 has a GitHub Release, and none of its assets matches version-code-from Sleep_*.apk (its assets: "
+        "SleepHub_release_2.1.0.apk): SweetSleep_*.apk takes a build number of its own."
+    ) in log
+    gh.releases = [item for item in gh.releases if item["tag_name"] != "v2.1.0"]
+    gh.release("v2.1.0", "SleepHub_release_2.1.0.apk", draft=True)
+    code, with_only_a_draft = alone(tmp_path, gh, target, SWEETSLEEP, SLEEPHUB, reader, "8102")
+    assert (code, with_only_a_draft["version-code"], with_only_a_draft["version-code-reused"]) == (0, "200000032", "false")
+    assert "v2.1.0 has no published GitHub Release (a draft is not out), so no APK of SleepHub_*.apk lends its build number" in capsys.readouterr().out
+    assert reader.read == [] and reused_refs(gh) == []
+
+
+def test_sleephub_added_to_a_release_of_sweetsleep_alone_gets_its_number(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = commit(repo, "Feature (#1)")
+    gh.reserve_by_hand(2, 29)
+    assert alone(tmp_path, gh, target, SWEETSLEEP, SLEEPHUB, apks({}), "8001", release_exists="false")[1]["version-code"] == "200000030"
+    gh.release("v2.1.0", "SweetSleep_release_2.1.0.apk")
+    reader = apks({SWEETSLEEP_APK: 200_000_030})
+    capsys.readouterr()
+    code, out = alone(tmp_path, gh, target, SLEEPHUB, SWEETSLEEP, reader, "8101")
+    log = capsys.readouterr().out
+    assert (code, out["version-code"], out["version-code-from"], out["version-code-reused"]) == (0, "200000030", SWEETSLEEP, "true"), log
+    assert reader.read == [SWEETSLEEP_APK]
+    assert reused_refs(gh) == [f"{SLEEPHUB_REUSED}/1"] and gh.numbers(2) == [29, 30]
+
+
+def test_sleephub_added_to_a_release_of_sweetsleep_alone_after_qa_builds_of_the_next_version_gets_its_number_also_run_again(repo, tmp_path):
+    gh = FakeGitHub()
+    target = commit(repo, "Feature (#1)")
+    gh.reserve_by_hand(2, 29)
+    assert alone(tmp_path, gh, target, SWEETSLEEP, SLEEPHUB, apks({}), "8001", release_exists="false")[1]["version-code"] == "200000030"
+    gh.release("v2.1.0", "SweetSleep_release_2.1.0.apk")
+    gh.reserve_by_hand(2, 31)
+    rolling(repo, "qa-develop", "2.1.1-qa.1", 200_000_031)
+    gh.release("qa-develop", "SleepHub_2.1.1-qa.1.apk", prerelease=True)
+    reader = apks({SWEETSLEEP_APK: 200_000_030, SLEEPHUB_APK: 200_000_030})
+    code, out = alone(tmp_path, gh, target, SLEEPHUB, SWEETSLEEP, reader, "8101")
+    assert (code, out["version-code"], out["version-code-reused"]) == (0, "200000030", "true")
+    assert reused_refs(gh) == [f"{SLEEPHUB_REUSED}/1"] and gh.numbers(2) == [29, 30, 31]
+    gh.reserve_by_hand(2, 32)
+    rolling(repo, "qa-develop", "2.1.1-qa.2", 200_000_032)
+    set_assets(gh, "qa-develop", "SleepHub_2.1.1-qa.2.apk")
+    add_asset(gh, "v2.1.0", "SleepHub_release_2.1.0.apk")
+    code, again = alone(tmp_path, gh, target, SLEEPHUB, SWEETSLEEP, reader, "8101")
+    assert (code, again["version-code"]) == (0, "200000030")
+    assert reused_refs(gh) == [f"{SLEEPHUB_REUSED}/1"] and gh.numbers(2) == [29, 30, 31, 32]
+
+
+def test_the_run_that_lent_its_number_keeps_it_when_it_is_run_again(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = commit(repo, "Feature (#1)")
+    gh.reserve_by_hand(2, 29)
+    assert alone(tmp_path, gh, target, SLEEPHUB, SWEETSLEEP, apks({}), "8001", release_exists="false")[1]["version-code"] == "200000030"
+    gh.release("v2.1.0", "SleepHub_release_2.1.0.apk")
+    assert alone(tmp_path, gh, target, SWEETSLEEP, SLEEPHUB, apks({SLEEPHUB_APK: 200_000_030}), "8101")[1]["version-code"] == "200000030"
+    add_asset(gh, "v2.1.0", "SweetSleep_release_2.1.0.apk")
+    reader = apks({SWEETSLEEP_APK: 200_000_030})
+    capsys.readouterr()
+    code, out = alone(tmp_path, gh, target, SLEEPHUB, SWEETSLEEP, reader, "8001")
+    log = capsys.readouterr().out
+    assert (code, out["version-code"], out["version-code-reused"]) == (0, "200000030", "false"), log
+    assert (
+        "An earlier attempt of this run reserved refs/build-numbers/2/30 for SleepHub_*.apk: the run keeps that number, "
+        "and does not reuse the one of SweetSleep_*.apk."
+    ) in log
+    assert "Build number 30 of major 2 (refs/build-numbers/2/30): reserved by an earlier attempt of this run, and kept." in log
+    assert reader.read == [] and gh.numbers(2) == [29, 30] and reused_refs(gh) == [f"{SWEET_REUSED}/1"]
+    code, new_run = alone(tmp_path, gh, target, SLEEPHUB, SWEETSLEEP, reader, "8002")
+    assert (code, new_run) == (1, {})
+    assert error_of(capsys).startswith(
+        "v2.1.0 has a GitHub Release with SleepHub_release_2.1.0.apk already, an APK that asset-pattern SleepHub_*.apk "
+        "matches, and no attempt of this run reused a build number for it."
+    )
+
+
+def test_a_run_that_reserved_before_the_other_app_was_released_keeps_its_number_and_a_new_run_gets_the_other_apps(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = commit(repo, "Feature (#1)")
+    gh.reserve_by_hand(2, 29)
+    assert alone(tmp_path, gh, target, SLEEPHUB, SWEETSLEEP, apks({}), "8001", release_exists="false")[1]["version-code"] == "200000030"
+    assert alone(tmp_path, gh, target, SWEETSLEEP, SLEEPHUB, apks({}), "8101", release_exists="false")[1]["version-code"] == "200000031"
+    gh.release("v2.1.0", "SweetSleep_release_2.1.0.apk")
+    reader = apks({SWEETSLEEP_APK: 200_000_031})
+    code, run_again_with_two_versioncodes_in_the_release = alone(tmp_path, gh, target, SLEEPHUB, SWEETSLEEP, reader, "8001")
+    assert (code, run_again_with_two_versioncodes_in_the_release["version-code"]) == (0, "200000030")
+    assert run_again_with_two_versioncodes_in_the_release["version-code-reused"] == "false"
+    assert reader.read == [] and gh.numbers(2) == [29, 30, 31] and reused_refs(gh) == []
+    code, new_run_with_one_versioncode = alone(tmp_path, gh, target, SLEEPHUB, SWEETSLEEP, reader, "8002")
+    assert (code, new_run_with_one_versioncode["version-code"], new_run_with_one_versioncode["version-code-reused"]) == (0, "200000031", "true")
+    assert gh.numbers(2) == [29, 30, 31]
+
+
+def sweetsleep_reused_the_number_and_failed_then_sleephub_lost_its_apk(repo, tmp_path, gh):
+    target = released_with_sleephub(repo, tmp_path, gh)
+    assert add_later(tmp_path, gh, target, apks({SLEEPHUB_APK: 200_000_030}))[1]["version-code"] == "200000030"
+    set_assets(gh, "v2.1.0")
+    return target
+
+
+def sleephub_run_again_puts_its_apk_back(tmp_path, gh, target):
+    code, lender = alone(tmp_path, gh, target, SLEEPHUB, SWEETSLEEP, apks({}), "8001")
+    assert (code, lender["version-code"], lender["version-code-reused"]) == (0, "200000030", "false")
+    add_asset(gh, *SLEEPHUB_APK)
+
+
+def test_a_run_that_reused_a_number_takes_none_of_its_own_while_the_apk_that_lent_it_is_gone_and_builds_with_it_once_back(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = sweetsleep_reused_the_number_and_failed_then_sleephub_lost_its_apk(repo, tmp_path, gh)
+    reader = apks({SLEEPHUB_APK: 200_000_030})
+    capsys.readouterr()
+    code, out = add_later(tmp_path, gh, target, reader)
+    assert (code, out) == (1, {})
+    message = error_of(capsys)
+    assert message.startswith(
+        "An earlier attempt of this run reused build number 30 of major 2 (versionCode 200000030) for "
+        f"SweetSleep_*.apk, recorded as {SWEET_REUSED}/1, and the GitHub Release of v2.1.0 holds no APK that "
+        "version-code-from SleepHub_*.apk or asset-pattern SweetSleep_*.apk matches now (its assets: none)."
+    ), message
+    assert (
+        "Put the APK of SleepHub_*.apk with versionCode 200000030 back on the GitHub Release of v2.1.0 by running "
+        "again the run that built it (Re-run failed jobs or Re-run all jobs), then run this run again. Do that before "
+        "any new run of SweetSleep_*.apk for v2.1.0: while no APK of SleepHub_*.apk is there, a new run has no number "
+        "to reuse and takes one of its own\n"
+    ) in message
+    assert gh.numbers(2) == [29, 30] and reused_refs(gh) == [f"{SWEET_REUSED}/1"]
+    sleephub_run_again_puts_its_apk_back(tmp_path, gh, target)
+    capsys.readouterr()
+    code, out = add_later(tmp_path, gh, target, reader)
+    assert (code, out["version-code"], out["version-code-reused"]) == (0, "200000030", "true")
+    assert f"Build number 30 of major 2 ({SWEET_REUSED}/1): reused for SweetSleep_*.apk by an earlier attempt of this run, and kept." in capsys.readouterr().out
+    assert gh.numbers(2) == [29, 30] and reused_refs(gh) == [f"{SWEET_REUSED}/1"]
+
+
+def test_a_new_run_while_the_apk_that_would_lend_its_number_is_gone_takes_a_number_of_its_own(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = sweetsleep_reused_the_number_and_failed_then_sleephub_lost_its_apk(repo, tmp_path, gh)
+    reader = apks({})
+    capsys.readouterr()
+    code, new_run = add_later(tmp_path, gh, target, reader, run_id="8102")
+    log = capsys.readouterr().out
+    assert (code, new_run["version-code"], new_run["version-code-reused"]) == (0, "200000031", "false"), log
+    assert (
+        "v2.1.0 has a GitHub Release, and none of its assets matches version-code-from SleepHub_*.apk (its assets: "
+        "none): SweetSleep_*.apk takes a build number of its own."
+    ) in log
+    assert reader.read == [] and gh.numbers(2) == [29, 30, 31] and reused_refs(gh) == [f"{SWEET_REUSED}/1"]
+
+
+def sweetsleep_published_by_a_new_run_with_a_number_of_its_own_while_sleephub_was_gone(repo, tmp_path, gh):
+    target = sweetsleep_reused_the_number_and_failed_then_sleephub_lost_its_apk(repo, tmp_path, gh)
+    assert add_later(tmp_path, gh, target, apks({}), run_id="8102")[1]["version-code"] == "200000031"
+    add_asset(gh, *SWEETSLEEP_APK)
+    return target
+
+
+def test_a_run_that_reused_a_number_is_refused_once_a_new_run_published_its_app_with_another_number(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = sweetsleep_published_by_a_new_run_with_a_number_of_its_own_while_sleephub_was_gone(repo, tmp_path, gh)
+    sleephub_run_again_puts_its_apk_back(tmp_path, gh, target)
+    reader = apks({SLEEPHUB_APK: 200_000_030, SWEETSLEEP_APK: 200_000_031})
+    capsys.readouterr()
+    code, out = add_later(tmp_path, gh, target, reader)
+    assert (code, out) == (1, {})
+    message = error_of(capsys)
+    assert message.startswith(
+        "An earlier attempt of this run reused build number 30 of major 2 (versionCode 200000030) for "
+        f"SweetSleep_*.apk, recorded as {SWEET_REUSED}/1, and SweetSleep_release_2.1.0.apk (200000031) of v2.1.0, an "
+        "APK that asset-pattern SweetSleep_*.apk matches, is out with another versionCode: another run published it. "
+        "Built with 200000030, it would be replaced (gh release upload --clobber), and a device that took it does not "
+        "take a lower versionCode. Nothing is built."
+    ), message
+    assert (
+        "To build SweetSleep_*.apk of v2.1.0 again, run again the run that built it (Re-run failed jobs or Re-run all "
+        "jobs on that run), not this one\n"
+    ) in message
+    assert reader.read == [SLEEPHUB_APK, SWEETSLEEP_APK]
+    assert gh.numbers(2) == [29, 30, 31] and reused_refs(gh) == [f"{SWEET_REUSED}/1"]
+
+
+def test_a_run_that_reused_a_number_is_refused_while_its_app_is_out_with_another_number_and_the_lending_apk_is_gone(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = sweetsleep_published_by_a_new_run_with_a_number_of_its_own_while_sleephub_was_gone(repo, tmp_path, gh)
+    reader = apks({SWEETSLEEP_APK: 200_000_031})
+    capsys.readouterr()
+    code, out = add_later(tmp_path, gh, target, reader)
+    assert (code, out) == (1, {})
+    assert (
+        "and SweetSleep_release_2.1.0.apk (200000031) of v2.1.0, an APK that asset-pattern SweetSleep_*.apk matches, "
+        "is out with another versionCode: another run published it."
+    ) in error_of(capsys)
+    assert reader.read == [SWEETSLEEP_APK]
+    assert gh.numbers(2) == [29, 30, 31] and reused_refs(gh) == [f"{SWEET_REUSED}/1"]
+
+
+OTHER_OBJECT = "e" * 40
+
+
+def without_release(gh, repo, target):
+    gh.releases = [item for item in gh.releases if item["tag_name"] != "v2.1.0"]
+    return {"release_exists": "false"}, {}, "and v2.1.0 has no published GitHub Release now (a draft is not out)."
+
+
+def with_a_draft(gh, repo, target):
+    gh.releases = [item for item in gh.releases if item["tag_name"] != "v2.1.0"]
+    gh.release("v2.1.0", "SleepHub_release_2.1.0.apk", draft=True)
+    return {"release_exists": ""}, {}, "and v2.1.0 has no published GitHub Release now (a draft is not out)."
+
+
+def with_neither_apk(gh, repo, target):
+    set_assets(gh, "v2.1.0", "SleepHub_release_2.1.0.aab", "notes.txt")
+    return {}, {}, "matches now (its assets: SleepHub_release_2.1.0.aab, notes.txt)."
+
+
+def republished_by_a_new_run_with_another_code(gh, repo, target):
+    return {}, {SLEEPHUB_APK: 200_000_031}, (
+        "and SleepHub_release_2.1.0.apk (200000031) of v2.1.0 has another versionCode now. The run builds with its "
+        "number or not at all, and with it the release would hold two versionCodes. Nothing is built. To build "
+        "SweetSleep_*.apk with the number the release holds now, start a new run for v2.1.0 instead of running this "
+        "one again: a new run reuses it"
+    )
+
+
+def without_its_ref(gh, repo, target):
+    del gh.refs["refs/build-numbers/2/30"]
+    return {}, {SLEEPHUB_APK: 200_000_030}, "refs/build-numbers/2/30 does not exist"
+
+
+def with_a_ref_of_another_commit(gh, repo, target):
+    other = commit(repo, "Other (#2)")
+    gh.objects[OTHER_OBJECT] = {"object": other, "type": "commit"}
+    gh.refs["refs/build-numbers/2/30"] = OTHER_OBJECT
+    return {}, {SLEEPHUB_APK: 200_000_030}, f"was reserved for the commit {other[:7]}, not for {target[:7]}"
+
+
+def with_two_numbers(gh, repo, target):
+    gh.refs["refs/reused-numbers/2/31/app-SweetSleep_-2a-2eapk/1"] = gh.refs[f"{SWEET_REUSED}/1"]
+    return {}, {SLEEPHUB_APK: 200_000_030}, (
+        "earlier attempts of this run reused more than one build number of major 2 for SweetSleep_*.apk: "
+        f"{SWEET_REUSED}/1, refs/reused-numbers/2/31/app-SweetSleep_-2a-2eapk/1."
+    )
+
+
+@pytest.mark.parametrize(
+    "lost",
+    [
+        without_release, with_a_draft, with_neither_apk, republished_by_a_new_run_with_another_code, without_its_ref,
+        with_a_ref_of_another_commit, with_two_numbers,
+    ],
+)
+def test_a_run_that_reused_a_number_builds_with_it_or_not_at_all(repo, tmp_path, capsys, lost):
+    gh = FakeGitHub()
+    target = released_with_sleephub(repo, tmp_path, gh)
+    assert add_later(tmp_path, gh, target, apks({SLEEPHUB_APK: 200_000_030}))[1]["version-code"] == "200000030"
+    inputs, codes, said = lost(gh, repo, target)
+    numbers_before, records_before = gh.numbers(2), reused_refs(gh)
+    capsys.readouterr()
+    code, out = add_later(tmp_path, gh, target, apks(codes), **inputs)
+    assert (code, out) == (1, {})
+    message = error_of(capsys)
+    assert said in message, message
+    assert gh.numbers(2) == numbers_before and reused_refs(gh) == records_before
+
+
+def sweetsleep_out_with_the_number_then_sleephub_lost_its_apk(repo, tmp_path, gh):
+    target = released_with_sleephub(repo, tmp_path, gh)
+    assert add_later(tmp_path, gh, target, apks({SLEEPHUB_APK: 200_000_030}))[1]["version-code"] == "200000030"
+    set_assets(gh, *SWEETSLEEP_APK)
+    return target
+
+
+def test_a_run_whose_apk_is_out_builds_with_its_number_again_while_the_apk_that_lent_it_is_gone(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = sweetsleep_out_with_the_number_then_sleephub_lost_its_apk(repo, tmp_path, gh)
+    reader = apks({SWEETSLEEP_APK: 200_000_030})
+    capsys.readouterr()
+    code, out = add_later(tmp_path, gh, target, reader)
+    log = capsys.readouterr().out
+    assert (code, out["version-code"], out["version-code-reused"]) == (0, "200000030", "true"), log
+    assert (
+        "v2.1.0 holds no APK that version-code-from SleepHub_*.apk matches now, and SweetSleep_release_2.1.0.apk, "
+        "which this run published, has versionCode 200000030: the run builds with that number again."
+    ) in log
+    assert f"Build number 30 of major 2 ({SWEET_REUSED}/1): reused for SweetSleep_*.apk by an earlier attempt of this run, and kept." in log
+    assert reader.read == [SWEETSLEEP_APK]
+    assert gh.numbers(2) == [29, 30] and reused_refs(gh) == [f"{SWEET_REUSED}/1"]
+
+
+def test_a_new_run_is_refused_while_the_release_holds_the_apps_apk_and_the_apk_that_lent_its_number_is_gone(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = sweetsleep_out_with_the_number_then_sleephub_lost_its_apk(repo, tmp_path, gh)
+    reader = apks({})
+    capsys.readouterr()
+    code, new_run = add_later(tmp_path, gh, target, reader, run_id="8102")
+    assert (code, new_run) == (1, {})
+    assert "v2.1.0 has a GitHub Release with SweetSleep_release_2.1.0.apk already" in error_of(capsys)
+    assert reader.read == [] and gh.numbers(2) == [29, 30] and reused_refs(gh) == [f"{SWEET_REUSED}/1"]
+
+
+def test_an_app_added_later_to_a_preview_gets_the_number_of_the_other_apps_apk(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = commit(repo, "Feature (#1)")
+    gh.reserve_by_hand(2, 29)
+    tag, apk = "v2.2.0-preview.1", ("v2.2.0-preview.1", "SleepHub_2.2.0-preview.1.apk")
+    code, first = release(
+        tmp_path, gh, tag, target, kind="preview", run_id="8001", read=apks({}), release_exists="false",
+        asset_pattern=SLEEPHUB, version_code_from=SWEETSLEEP,
+    )
+    assert (code, first["version"], first["version-code"], first["version-code-reused"]) == (0, "2.2.0-preview.1", "200000030", "false")
+    gh.release(tag, apk[1], prerelease=True)
+    reader = apks({apk: 200_000_030})
+    code, out = release(
+        tmp_path, gh, tag, target, kind="preview", run_id="8101", read=reader, release_exists="true",
+        asset_pattern=SWEETSLEEP, version_code_from=SLEEPHUB,
+    )
+    assert (code, out["version"], out["version-code"], out["version-code-reused"]) == (0, "2.2.0-preview.1", "200000030", "true")
+    assert reader.read == [apk] and gh.numbers(2) == [29, 30] and reused_refs(gh) == [f"{SWEET_REUSED}/1"]
+
+
+@pytest.mark.parametrize(
+    ("status", "said", "hint"),
+    [
+        (422, "Repository rule violations found", "A ruleset of the repository refuses it: let the job token create refs/reused-numbers/*, or keep those refs out of the ruleset."),
+        (403, "Resource not accessible by integration", "The job's token needs contents: write."),
+    ],
+)
+def test_a_reuse_that_cannot_be_recorded_is_refused_and_reserves_nothing(repo, tmp_path, capsys, status, said, hint):
+    gh = FakeGitHub()
+    target = released_with_sleephub(repo, tmp_path, gh)
+    gh.refuse_ref = ("refs/reused-numbers/", status, said)
+    capsys.readouterr()
+    code, out = add_later(tmp_path, gh, target, apks({SLEEPHUB_APK: 200_000_030}))
+    assert (code, out) == (1, {})
+    message = error_of(capsys)
+    assert message.startswith(f"cannot create {SWEET_REUSED}/1: HTTP {status}: {said}. {hint}"), message
+    assert gh.numbers(2) == [29, 30] and reused_refs(gh) == []
+
+
+def test_a_number_whose_ref_was_made_by_hand_with_the_id_of_the_commit_is_not_reused(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = released_with_sleephub(repo, tmp_path, gh)
+    the_id_of_the_commit_instead_of_a_tag_object = target
+    gh.refs["refs/build-numbers/2/30"] = the_id_of_the_commit_instead_of_a_tag_object
+    capsys.readouterr()
+    code, out = add_later(tmp_path, gh, target, apks({SLEEPHUB_APK: 200_000_030}))
+    assert (code, out) == (1, {})
+    message = error_of(capsys)
+    assert message.startswith(
+        f"refs/build-numbers/2/30, which names {target}, does not name a tag object (HTTP 404 for git/tags/{target}): "
+        "the reservation of a build names the tag object of its run, and a ref made by hand, or by another tool, "
+        "names a commit."
+    ), message
+    assert "contents: read" not in message and reused_refs(gh) == []
+
+
+@pytest.mark.parametrize(
+    ("another_release_of_the_app", "its_asset_with_a_higher_code_in_its_name_or_not"),
+    [
+        ("v2.0.0", "SweetSleep_release_2.0.0_200000031.apk"),
+        ("v2.0.0", "SweetSleep_release_2.0.0.apk"),
+        ("v2.1.0-preview.1", "SweetSleep_2.1.0-preview.1.apk"),
+        ("v2.2.0-preview.1", "SweetSleep_2.2.0-preview.1.apk"),
+        ("v2.1.1", "SweetSleep_release_2.1.1.apk"),
+        ("v2.2.0", "SweetSleep_release_2.2.0.apk"),
+    ],
+)
+def test_an_app_added_later_gets_the_number_whatever_other_releases_of_it_hold_and_downloads_only_the_lending_apk(
+    repo, tmp_path, another_release_of_the_app, its_asset_with_a_higher_code_in_its_name_or_not
+):
+    gh = FakeGitHub()
+    target = released_with_sleephub(repo, tmp_path, gh)
+    gh.reserve_by_hand(2, 31)
+    tag = another_release_of_the_app
+    gh.release(tag, its_asset_with_a_higher_code_in_its_name_or_not, prerelease="-preview." in tag)
+    reader = apks({SLEEPHUB_APK: 200_000_030})
+    code, out = add_later(tmp_path, gh, target, reader)
+    assert (code, out["version-code"], out["version-code-reused"]) == (0, "200000030", "true")
+    assert reader.read == [SLEEPHUB_APK] and reused_refs(gh) == [f"{SWEET_REUSED}/1"]
+
+
+@pytest.mark.parametrize(
+    ("inputs", "message"),
+    [
+        ({"version_code_scheme": "minor-blocks"}, "version-code-from is SleepHub_*.apk, and version-code-scheme is minor-blocks: with the formula"),
+        ({"version_code_scheme": ""}, "version-code-from is SleepHub_*.apk, and version-code-scheme is minor-blocks: with the formula"),
+        ({"asset_pattern": ""}, "version-code-from is SleepHub_*.apk, and asset-pattern is empty"),
+        ({"asset_pattern": " \n"}, "version-code-from is SleepHub_*.apk, and asset-pattern is empty"),
+        ({"asset_pattern": SLEEPHUB}, "version-code-from and asset-pattern are both SleepHub_*.apk"),
+        ({"version_code_from": " SleepHub_*.apk\n", "asset_pattern": SLEEPHUB}, "version-code-from and asset-pattern are both SleepHub_*.apk"),
+        ({"version_code_from": "SleepHub *.apk"}, "version-code-from is 'SleepHub *.apk'. It is the file name pattern"),
+        ({"asset_pattern": "Sweet/Sleep_*.apk"}, "asset-pattern is 'Sweet/Sleep_*.apk'. It is the file name pattern"),
+        ({"kind": "qa"}, "version-code-from is for the build of a release or a preview tag, and kind is qa"),
+    ],
+)
+def test_version_code_from_is_refused_where_it_does_not_fit_before_anything_is_asked(repo, tmp_path, capsys, inputs, message):
+    target = commit(repo, "Feature (#1)")
+    code, out = add_later(tmp_path, no_api, target, apks({}), **inputs)
+    assert (code, out) == (1, {})
+    assert error_of(capsys).startswith(message)
+
+
+@pytest.mark.parametrize("operation", ["next", "qa", "changes"])
+def test_version_code_from_is_for_the_code_of_a_tag_only(repo, tmp_path, capsys, operation):
+    target = commit(repo, "Feature (#1)")
+    code, out = run(tmp_path, no_api, operation=operation, sha=target, version_code_from=SLEEPHUB)
+    assert (code, out) == (1, {})
+    assert error_of(capsys) == f"version-code-from is for the operation code, the versionCode of a release or a preview tag, and the operation is {operation}\n"
+
+
+def test_without_version_code_from_a_run_downloads_no_apk_and_writes_no_record_as_before(repo, tmp_path):
+    gh = FakeGitHub()
+    target = released_with_sleephub(repo, tmp_path, gh)
+    reader = apks({})
+    code, out = release(tmp_path, gh, "v2.1.0", target, run_id="8301", read=reader, release_exists="true", asset_pattern=SWEETSLEEP)
+    assert (code, out["version-code"]) == (0, "200000031")
+    assert "version-code-from" not in out and reader.read == [] and reused_refs(gh) == []
+    assert ("GET", "git/tags/") not in [(method, path[:9]) for method, path in gh.requests]
+
+
+def test_the_number_is_reused_only_from_one_apk_of_the_release_reserved_for_the_tagged_commit(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = released_with_sleephub(repo, tmp_path, gh)
+
+    def refused(read, **inputs):
+        capsys.readouterr()
+        code, out = add_later(tmp_path, gh, target, read, **inputs)
+        assert (code, out) == (1, {})
+        assert reused_refs(gh) == []
+        return error_of(capsys)
+
+    add_asset(gh, *SWEETSLEEP_APK)
+    a_pattern_of_both_apps = refused(apks({}), version_code_from="*_release_2.1.0.apk")
+    assert a_pattern_of_both_apps.startswith("SweetSleep_release_2.1.0.apk of v2.1.0 matches both version-code-from *_release_2.1.0.apk and asset-pattern SweetSleep_*.apk.")
+    set_assets(gh, "v2.1.0", "SleepHub_release_2.1.0.apk", "SleepHub_mini_release_2.1.0.apk")
+    two_lending_apks_with_two_codes = refused(apks({SLEEPHUB_APK: 200_000_030, ("v2.1.0", "SleepHub_mini_release_2.1.0.apk"): 200_000_031}))
+    assert two_lending_apks_with_two_codes.startswith(
+        "the APKs of v2.1.0 that version-code-from SleepHub_*.apk matches were built with different versionCodes: "
+        "SleepHub_mini_release_2.1.0.apk (200000031), SleepHub_release_2.1.0.apk (200000030)."
+    ), two_lending_apks_with_two_codes
+    set_assets(gh, *SLEEPHUB_APK)
+    a_code_of_another_major = refused(apks({SLEEPHUB_APK: 100_000_030}))
+    assert a_code_of_another_major.startswith("SleepHub_release_2.1.0.apk of v2.1.0 has versionCode 100000030, which is no build number of major 2 (200000001 to 299999999)")
+    a_code_without_its_ref = refused(apks({SLEEPHUB_APK: 200_150_000}))
+    assert a_code_without_its_ref.startswith(
+        "SleepHub_release_2.1.0.apk of v2.1.0 has versionCode 200150000, build number 150000 of major 2, and "
+        "refs/build-numbers/2/150000 does not exist"
+    ), a_code_without_its_ref
+    another_commit = commit(repo, "Other (#2)")
+    assert release(tmp_path, gh, "v2.1.1", another_commit, run_id="8401", release_exists="false")[1]["version-code"] == "200000031"
+    a_number_of_another_commit = refused(apks({SLEEPHUB_APK: 200_000_031}))
+    assert a_number_of_another_commit.startswith(
+        f"SleepHub_release_2.1.0.apk of v2.1.0 has versionCode 200000031, and refs/build-numbers/2/31 was reserved for "
+        f"the commit {another_commit[:7]}, not for {target[:7]}, the commit of v2.1.0."
+    ), a_number_of_another_commit
+
+
+def test_version_code_floor_is_for_a_new_number_and_does_not_hold_back_one_the_release_was_built_with(repo, tmp_path, capsys):
+    gh = FakeGitHub()
+    target = released_with_sleephub(repo, tmp_path, gh)
+    reader = apks({SLEEPHUB_APK: 200_000_030})
+    for floor in ("200000030", "200000029", "300000005"):
+        capsys.readouterr()
+        code, out = add_later(tmp_path, gh, target, reader, version_code_floor=floor)
+        assert (code, out["version-code"]) == (0, "200000030")
+        assert "::notice" not in capsys.readouterr().out
+
+
+def test_the_ref_of_a_reuse_names_the_number_and_the_app_as_a_qa_counter_does():
+    assert build_numbers.reuse_counter(2, 30, SWEETSLEEP) == "refs/reused-numbers/2/30/app-SweetSleep_-2a-2eapk"
+    assert build_numbers.app_key("SleepHub_*.apk") == "app-SleepHub_-2a-2eapk"
+    assert build_numbers.qa_counter("2.1.1", "SleepHub_*.apk") == "refs/qa-numbers/2.1.1/app-SleepHub_-2a-2eapk"
+
+
+def test_the_refs_of_reuses_are_outside_the_directory_of_number_refs_the_counter_reads():
+    assert not build_numbers.REUSED_REFS.startswith(build_numbers.REFS + "/")
+
+
+def test_the_versioncode_of_an_asset_is_read_from_the_downloaded_apk_with_aapt2(tmp_path):
+    import http.server
+
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            seen.append((self.headers.get("Host"), self.path, self.headers.get("Authorization"), self.headers.get("Accept")))
+            if self.path == "/repos/acme/app/releases/assets/7":
+                self.redirect_to_the_file_on_another_host()
+                return
+            body = {"/file/7": b"APK 200000030", "/repos/acme/app/releases/assets/9": b"not an APK"}.get(self.path)
+            self.send_response(200 if body else 404)
+            self.send_header("Content-Length", str(len(body or b"")))
+            self.end_headers()
+            self.wfile.write(body or b"")
+
+        def redirect_to_the_file_on_another_host(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://localhost:{server.server_port}/file/7")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    sdk = tmp_path / "sdk"
+    an_older_aapt2_that_answers_another_code = "echo \"package: name='x' versionCode='1' versionName='0'\"\n"
+    the_highest_aapt2_that_reads_the_file = (
+        '[ "$1 $2" = "dump badging" ] || exit 2\n'
+        'read -r word code < "$3"\n'
+        '[ "$word" = APK ] || { echo "ERROR: $3: not a zip" >&2; exit 1; }\n'
+        "echo \"package: name='ai.asleep.sleephub' versionCode='$code' versionName='2.1.0' platformBuildVersionName=''\"\n"
+    )
+    for version, script in (("35.0.0", an_older_aapt2_that_answers_another_code), ("36.1.0", the_highest_aapt2_that_reads_the_file)):
+        tool = sdk / "build-tools" / version / "aapt2"
+        tool.parent.mkdir(parents=True)
+        tool.write_text("#!/bin/sh\n" + script)
+        tool.chmod(0o755)
+    env = {"GITHUB_API_URL": f"http://127.0.0.1:{server.server_port}", "GITHUB_REPOSITORY": "acme/app", "TOKEN": "job-token\n"}
+    try:
+        read = release_version.apk_reader({**env, "ANDROID_HOME": str(sdk)})
+        assert read("v2.1.0", {"name": "SleepHub_release_2.1.0.apk", "id": 7}) == 200_000_030
+        port = server.server_port
+        request_to_the_api_with_the_token, request_to_the_file_without_it = seen
+        assert request_to_the_api_with_the_token == (f"127.0.0.1:{port}", "/repos/acme/app/releases/assets/7", "Bearer job-token", "application/octet-stream")
+        assert request_to_the_file_without_it == (f"localhost:{port}", "/file/7", None, "application/octet-stream")
+        with pytest.raises(release_version.Failure, match=r"aapt2 of build-tools 36\.1\.0 cannot read the versionCode of x\.apk of v2\.1\.0: ERROR: .* not a zip"):
+            read("v2.1.0", {"name": "x.apk", "id": 9})
+        with pytest.raises(release_version.Failure, match=r"cannot download y\.apk of v2\.1\.0 to read its versionCode: HTTP 404"):
+            read("v2.1.0", {"name": "y.apk", "id": 8})
+        with pytest.raises(release_version.Failure, match="z.apk of v2.1.0 is listed without an id"):
+            read("v2.1.0", {"name": "z.apk"})
+        read_with_android_sdk_root = release_version.apk_reader({**env, "ANDROID_SDK_ROOT": str(sdk)})
+        assert read_with_android_sdk_root("v2.1.0", {"name": "a.apk", "id": 7}) == 200_000_030
+        downloads_before = len(seen)
+        read_without_an_sdk = release_version.apk_reader({**env, "ANDROID_HOME": str(tmp_path / "none")})
+        with pytest.raises(release_version.Failure, match="aapt2 was not found under the build-tools of ANDROID_HOME or ANDROID_SDK_ROOT"):
+            read_without_an_sdk("v2.1.0", {"name": "a.apk", "id": 7})
+        assert len(seen) == downloads_before
+    finally:
+        server.shutdown()
 
 
 # --- the number in the name of a QA build ---------------------------------------------------------

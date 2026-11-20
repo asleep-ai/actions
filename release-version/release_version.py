@@ -35,7 +35,9 @@ next  Resolve the commit to release, find the last release it builds on,
       version has previews: a patch release is refused.
 
 code  The versionCode of a release, of a preview or of a QA build, from
-      version_code.py.
+      version_code.py. With version-code-from, the build number another
+      app's APK of the same GitHub Release was built with, reused for this
+      app's APK (reused_number).
 
 qa    Plan a QA build of a branch head: its version name, its versionCode and
       the rolling pre-release it is published as.
@@ -93,17 +95,21 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Mapping, Optional
 
 import build_numbers
 from build_numbers import BuildNumber, BuildNumberError, QaNumber, Shipped
+from version_code import MAJOR_BLOCK, major_codes
 from version_code import MAX_LABEL as MAX_LABEL_BUILDS
 from version_code import VersionCodeError, check_major, label_code, preview_code, qa_code, release_code
 
@@ -152,6 +158,10 @@ ZERO = (0, 0, 0)
 
 # (url, token) -> body
 Fetch = Callable[[str, str], bytes]
+ReleaseTag = str
+AssetAsTheApiListsIt = dict
+VersionCodeTheApkWasBuiltWith = int
+ReadCode = Callable[[ReleaseTag, AssetAsTheApiListsIt], VersionCodeTheApkWasBuiltWith]
 
 
 class Failure(Exception):
@@ -561,6 +571,312 @@ def kept_only_for_the_app(
     return ""
 
 
+def apk_reader(env: Mapping[str, str]) -> ReadCode:
+    """Read the versionCode of a release asset from the APK itself: download it, and ask aapt2.
+
+    The name of an asset need not hold the versionCode (sleephub-android's do
+    not), and nothing else GitHub keeps says which build an asset is. The build
+    job read the same value with the same tool before the APK was published,
+    and refused an APK without the planned one (android-release-build.yml). The
+    token goes with the request to the API only: GitHub answers with the
+    address of the file, on another host, which is asked without it.
+    """
+    api = (env.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+    repository = env.get("GITHUB_REPOSITORY", "").strip()
+    token = env.get("TOKEN", "").strip()
+    sdk = env.get("ANDROID_HOME", "").strip() or env.get("ANDROID_SDK_ROOT", "").strip()
+
+    def read(tag: str, asset: dict) -> int:
+        name = str(asset.get("name"))
+        identifier = asset.get("id")
+        if not isinstance(identifier, int) or isinstance(identifier, bool):
+            raise Failure(f"{name} of {tag} is listed without an id, and cannot be downloaded to read its versionCode")
+        found = [path for path in Path(sdk, "build-tools").glob("*/aapt2") if path.is_file() and os.access(path, os.X_OK)] if sdk else []
+        if not found:
+            raise Failure(
+                "aapt2 was not found under the build-tools of ANDROID_HOME or ANDROID_SDK_ROOT: the versionCode of an "
+                "APK of the release is read with it. GitHub-hosted Ubuntu runners have it"
+            )
+        aapt2 = max(found, key=lambda path: [int(part) for part in re.findall(r"[0-9]+", path.parent.name)])
+        request = urllib.request.Request(
+            f"{api}/repos/{repository}/releases/assets/{identifier}",
+            headers={
+                "Accept": "application/octet-stream",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "asleep-ai-actions-release-version",
+            },
+        )
+        if token:
+            request.add_unredirected_header("Authorization", f"Bearer {token}")
+        with tempfile.TemporaryDirectory(prefix="release-version-") as directory:
+            path = os.path.join(directory, "asset.apk")
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response, open(path, "wb") as out:
+                    shutil.copyfileobj(response, out, 1 << 20)
+            except urllib.error.HTTPError as exc:
+                raise Failure(f"cannot download {name} of {tag} to read its versionCode: HTTP {exc.code}") from None
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+                raise Failure(f"cannot download {name} of {tag} to read its versionCode: {str(exc) or type(exc).__name__}") from None
+            badging = subprocess.run([str(aapt2), "dump", "badging", path], capture_output=True, text=True, check=False)
+        line = next((line for line in badging.stdout.splitlines() if line.startswith("package: ")), "")
+        match = re.search(r"\bversionCode='([1-9][0-9]{0,9})'", line)
+        if badging.returncode != 0 or not match:
+            said = (badging.stderr.strip() or line or "no package line")[:300]
+            raise Failure(f"aapt2 of build-tools {aapt2.parent.name} cannot read the versionCode of {name} of {tag}: {said}")
+        print(f"{name} of {tag}: versionCode {match[1]}, read from the APK with aapt2 of build-tools {aapt2.parent.name}.")
+        return int(match[1])
+
+    return read
+
+
+def checked_reuse(scheme: str, kind: str, pattern: str, source: str) -> None:
+    """Refuse version-code-from in a run it does not fit, before anything is asked or reserved."""
+    if scheme != BUILD_NUMBER:
+        raise Failure(
+            f"version-code-from is {source}, and version-code-scheme is {scheme}: with the formula the versionCode "
+            "follows from the tag, the same in every run and for every app, and there is no build number to reuse. "
+            f"version-code-from is for version-code-scheme: {BUILD_NUMBER} only. Nothing is built"
+        )
+    if kind not in ("release", "preview"):
+        raise Failure(f"version-code-from is for the build of a release or a preview tag, and kind is {kind}")
+    if not pattern:
+        raise Failure(
+            f"version-code-from is {source}, and asset-pattern is empty: the number of another app's APK is reused "
+            "by a run that adds one app to a release of several, and asset-pattern names the APKs this run builds. "
+            "Pass it. Nothing is built"
+        )
+    for name, value in (("version-code-from", source), ("asset-pattern", pattern)):
+        if not ASSET_PATTERN.fullmatch(value):
+            raise Failure(
+                f"{name} is {value!r}. It is the file name pattern of the APKs of one app, such as SleepHub_*.apk: "
+                "letters, digits, . _ - and the wildcards * ? [ ] !, without whitespace"
+            )
+    if source == pattern:
+        raise Failure(
+            f"version-code-from and asset-pattern are both {source}: the number is reused from the APK of another app "
+            "of the release, not from the app this run builds. Nothing is built"
+        )
+
+
+def reused_number(
+    env: Mapping[str, str],
+    call: build_numbers.Call,
+    read: ReadCode,
+    prefix: str,
+    name: str,
+    major: int,
+    target: str,
+    pattern: str,
+    source: str,
+    exists: str = "",
+) -> Optional[BuildNumber]:
+    """The build number of the APKs of another app of the release (`source`), for the first APK of this app (`pattern`).
+
+    A release that went out with one app gets another later with the same
+    versionCode. The number is the one in the APKs of the release that
+    `source` matches, read from the files themselves, and it has to be a
+    number of the major that the build of this very commit reserved:
+    refs/build-numbers/<major>/<n> names the tagged commit. Nothing is
+    reserved, because that ref exists already and every later build is above
+    it. The run records that it reused the number
+    (build_numbers.record_reuse), so that the run, run again, is told apart
+    from a new run of the app.
+
+    A run that is run again keeps what its first attempt took, and that is
+    looked at first, before what the release holds. An earlier attempt that
+    reused a number: the run builds with that number again or not at all. It
+    is checked against the APKs of `source` the release holds now and against
+    the APKs of the app that are out, whichever run published them; with
+    neither, or another code in either, the run is refused, with how to go on.
+    A number of its own would give the release two versionCodes once the APK
+    of `source` is back, and an APK of the app with another code, which a new
+    run published while the APK of `source` was gone, would be replaced with
+    a lower one. An earlier attempt that reserved a number of its own
+    (the run that lent its number to the other app, or one that published
+    nothing before the other app was released): None, and the run keeps that
+    number on the path without version-code-from.
+
+    Otherwise None when there is no number to reuse, and the run takes a build
+    number of its own as without version-code-from: the tag has no published
+    release (`exists` false, or none in the list), or no APK of the release
+    matches `source`. Once an APK of `source` is found, the run gets its
+    number or is refused, never a number of its own. It is refused when the
+    release holds an APK of the app already (as with kept_only_for_the_app),
+    before any APK is downloaded, and when the number is not one to reuse: the
+    APKs of `source` disagree, or their code is of the formula, of another
+    major, or of a ref that is gone or names another commit.
+
+    What else of the app is out is not compared. The app's builds that are
+    above the number came after the release that lends it: a QA build of the
+    next version (X.Y.Z+1-qa.N after vX.Y.Z), or a later release or preview.
+    Each of them is of a later version than this one, and a device that has
+    one is not meant to take this release. So the run, and the run run again,
+    builds with the number whatever went out since.
+    """
+    tag = prefix + name
+    low, high = major_codes(major)
+    try:
+        api = repository_api(env, call)
+        marker, date = run_marker(env, target)
+        own = api.tag_object(target, marker, date)
+        runs = api.reuses(major)
+        reserved = api.reserved(major)
+        reused_before, record = build_numbers.reuse_of_the_run(runs, major, pattern, own)
+        the_plan_found_no_published_release = exists == "false"
+        releases = [] if the_plan_found_no_published_release else api.published()
+        own_release = next((release for release in releases if str(release.get("tag_name") or "") == tag), None)
+
+        def assets_of(which: str) -> list:
+            return [
+                asset for asset in (own_release or {}).get("assets") or []
+                if isinstance(asset, dict) and isinstance(asset.get("name"), str) and fnmatch.fnmatchcase(asset["name"], which)
+            ]
+
+        def held() -> str:
+            return ", ".join(sorted(str(asset.get("name")) for asset in (own_release or {}).get("assets") or [] if isinstance(asset, dict))) or "none"
+
+        def read_codes(assets: list) -> dict:
+            return {asset["name"]: read(tag, asset) for asset in assets}
+
+        def checked(code: int, names: str) -> int:
+            """The build number of `code`, a number of the major that the build of the tagged commit reserved."""
+            if not low <= code <= high:
+                raise Failure(
+                    f"{names} of {tag} has versionCode {code}, which is no build number of major {major} ({low} to {high}): "
+                    f"it was built with the formula, or for another major. Only a number of {build_numbers.REFS}/{major}/ is "
+                    "reused. Nothing is built"
+                )
+            number = code - major * MAJOR_BLOCK
+            ref = f"{build_numbers.REFS}/{major}/{number}"
+            if number not in reserved:
+                raise Failure(
+                    f"{names} of {tag} has versionCode {code}, build number {number} of major {major}, and {ref} does "
+                    "not exist: no build of this repository reserved it, or the ref was deleted. A number is reused only "
+                    "while its ref keeps every later build above it. Nothing is built"
+                )
+            reserved_for = api.tag_target(reserved[number], ref)
+            if reserved_for != target:
+                raise Failure(
+                    f"{names} of {tag} has versionCode {code}, and {ref} was reserved for the commit "
+                    f"{reserved_for[:7]}, not for {target[:7]}, the commit of {tag}. Nothing is built"
+                )
+            print(f"{names} of {tag}: versionCode {code}, build number {number} of major {major}, reserved as {ref} for {target[:7]}.")
+            return number
+
+        lending = assets_of(source)
+        overlap = sorted(asset["name"] for asset in lending if fnmatch.fnmatchcase(asset["name"], pattern))
+        if overlap:
+            raise Failure(
+                f"{', '.join(overlap)} of {tag} matches both version-code-from {source} and asset-pattern {pattern}. "
+                "Give each app a pattern that matches its own APKs only. Nothing is built"
+            )
+        of_the_app = assets_of(pattern)
+
+        def the_number_this_run_reused_again() -> BuildNumber:
+            code = major * MAJOR_BLOCK + reused_before
+            said = (
+                f"An earlier attempt of this run reused build number {reused_before} of major {major} (versionCode "
+                f"{code}) for {pattern}, recorded as {record}"
+            )
+            restore = (
+                f"The run builds with that number or not at all: with a number of its own, {tag} would hold two "
+                f"versionCodes once an APK of {source} is back. Nothing is built. Put the APK of {source} with "
+                f"versionCode {code} back on the GitHub Release of {tag} by running again the run that built it "
+                "(Re-run failed jobs or Re-run all jobs), then run this run again. Do that before any new run of "
+                f"{pattern} for {tag}: while no APK of {source} is there, a new run has no number to reuse and takes "
+                "one of its own"
+            )
+            if own_release is None:
+                raise Failure(f"{said}, and {tag} has no published GitHub Release now (a draft is not out). {restore}")
+            if not lending and not of_the_app:
+                raise Failure(
+                    f"{said}, and the GitHub Release of {tag} holds no APK that version-code-from {source} or "
+                    f"asset-pattern {pattern} matches now (its assets: {held()}). {restore}"
+                )
+            codes = read_codes(lending + of_the_app)
+            names = ", ".join(sorted(codes))
+
+            def with_another_code(assets: list) -> str:
+                return ", ".join(f"{name} ({codes[name]})" for name in sorted(asset["name"] for asset in assets) if codes[name] != code)
+
+            replaced = with_another_code(of_the_app)
+            if replaced:
+                raise Failure(
+                    f"{said}, and {replaced} of {tag}, an APK that asset-pattern {pattern} matches, is out with another "
+                    f"versionCode: another run published it. Built with {code}, it would be replaced (gh release upload "
+                    "--clobber), and a device that took it does not take a lower versionCode. Nothing is built. To build "
+                    f"{pattern} of {tag} again, run again the run that built it (Re-run failed jobs or Re-run all jobs on "
+                    "that run), not this one"
+                )
+            lent_another = with_another_code(lending)
+            if lent_another:
+                again = (
+                    f"{pattern} of {tag} is out with {code} already: this run is not needed, and a new run is refused "
+                    "while that APK is there"
+                    if of_the_app else
+                    f"To build {pattern} with the number the release holds now, start a new run for {tag} instead of "
+                    "running this one again: a new run reuses it"
+                )
+                raise Failure(
+                    f"{said}, and {lent_another} of {tag} has another versionCode now. The run builds with its number "
+                    f"or not at all, and with it the release would hold two versionCodes. Nothing is built. {again}"
+                )
+            if not lending:
+                print(
+                    f"{tag} holds no APK that version-code-from {source} matches now, and {names}, which this run "
+                    f"published, has versionCode {code}: the run builds with that number again. Put the APK of "
+                    f"{source} back on the release with versionCode {code}, by running again the run that built it."
+                )
+            checked(code, names)
+            why = f"the number {names} of {tag} was built with ({build_numbers.REFS}/{major}/{reused_before}), reused for {pattern}"
+            return BuildNumber(major, reused_before, code, why, record, True)
+
+        if reused_before:
+            return the_number_this_run_reused_again()
+
+        reserved_by_an_earlier_attempt = sorted(number for number, sha in reserved.items() if sha == own)
+        if reserved_by_an_earlier_attempt:
+            print(
+                f"An earlier attempt of this run reserved {build_numbers.REFS}/{major}/{reserved_by_an_earlier_attempt[-1]} "
+                f"for {pattern}: the run keeps that number, and does not reuse the one of {source}."
+            )
+            return None
+        if own_release is None:
+            print(
+                f"{tag} has no published GitHub Release (a draft is not out), so no APK of {source} lends its build "
+                f"number: {pattern} takes a build number of its own."
+            )
+            return None
+        if not lending:
+            print(
+                f"{tag} has a GitHub Release, and none of its assets matches version-code-from {source} (its assets: "
+                f"{held()}): {pattern} takes a build number of its own."
+            )
+            return None
+        if of_the_app:
+            raise Failure(
+                f"{tag} has a GitHub Release with {sorted(asset['name'] for asset in of_the_app)[0]} already, an APK that "
+                f"asset-pattern {pattern} matches, and no attempt of this run reused a build number for it. An APK that "
+                "is out is built again only by running its own run again (Re-run failed jobs or Re-run all jobs on the "
+                "run that built it). Nothing is built"
+            )
+        codes = read_codes(lending)
+        names = ", ".join(sorted(codes))
+        if len(set(codes.values())) > 1:
+            listed = ", ".join(f"{item} ({codes[item]})" for item in sorted(codes))
+            raise Failure(
+                f"the APKs of {tag} that version-code-from {source} matches were built with different versionCodes: "
+                f"{listed}. There is no one number to reuse. Nothing is built"
+            )
+        code = next(iter(codes.values()))
+        number = checked(code, names)
+        ref = build_numbers.record_reuse(api, runs, major, number, pattern, own)
+    except BuildNumberError as exc:
+        raise Failure(str(exc)) from None
+    why = f"the number {names} of {tag} was built with ({build_numbers.REFS}/{major}/{number}), reused for {pattern}"
+    return BuildNumber(major, number, code, why, ref, False)
+
+
 def formula_guard(env: Mapping[str, str], call: build_numbers.Call, major: int) -> None:
     """Refuse a versionCode of the formula for a major that has build numbers.
 
@@ -602,6 +918,18 @@ def print_qa_number(number: QaNumber) -> None:
         print(f"QA number {number.number} of {of} ({number.ref}): {number.why}.")
     else:
         print(f"QA number {number.number} of {of}, reserved as {number.ref}: {number.why}.")
+
+
+def print_reused_number(number: BuildNumber, pattern: str) -> None:
+    if number.notice:
+        print(f"::notice title=release-version::{escape(number.notice)}")
+    if number.kept:
+        print(f"Build number {number.number} of major {number.major} ({number.ref}): reused for {pattern} by an earlier attempt of this run, and kept.")
+    else:
+        print(
+            f"Build number {number.number} of major {number.major}, reused and recorded as {number.ref}: {number.why}. "
+            "No number is reserved."
+        )
 
 
 def print_build_number(number: BuildNumber) -> None:
@@ -1266,7 +1594,7 @@ def run_next(env: Mapping[str, str], fetch: Fetch, call: build_numbers.Call = ht
     })
 
 
-def run_code(env: Mapping[str, str], call: build_numbers.Call = http_call) -> None:
+def run_code(env: Mapping[str, str], call: build_numbers.Call = http_call, read: Optional[ReadCode] = None) -> None:
     text = env.get("VERSION", "").strip()
     prefix = env.get("TAG_PREFIX", "")
     kind = env.get("KIND", "").strip()
@@ -1276,6 +1604,10 @@ def run_code(env: Mapping[str, str], call: build_numbers.Call = http_call) -> No
     exists = env.get("RELEASE_EXISTS", "").strip()
     if exists not in ("", "true", "false"):
         raise Failure(f"release-exists must be true or false, got {exists!r}")
+    source = env.get("VERSION_CODE_FROM", "").strip()
+    if source:
+        checked_reuse(scheme, kind, env.get("ASSET_PATTERN", "").strip(), source)
+    read_source_said_on_every_path = {"version-code-from": source} if source else {}
     # The version may be given as its tag.
     if prefix and text.startswith(prefix):
         text = text[len(prefix):]
@@ -1319,6 +1651,17 @@ def run_code(env: Mapping[str, str], call: build_numbers.Call = http_call) -> No
         kept_only = ""
         # Stripped as the publish job of android-release.yml strips it to check the APKs it publishes.
         pattern = env.get("ASSET_PATTERN", "").strip()
+        if source:
+            reused = reused_number(env, call, read or apk_reader(env), prefix, name, version[0], target, pattern, source, exists)
+            if reused:
+                print_reused_number(reused, pattern)
+                print(f"versionCode of {kind} {name}: {reused.code}, as {source}")
+                write_outputs(env, {
+                    "version": name, "version-code": str(reused.code), **scheme_outputs(env, reused),
+                    **read_source_said_on_every_path, "version-code-reused": "true",
+                })
+                return
+            read_source_said_on_every_path["version-code-reused"] = "false"
         if exists == "true" and pattern:
             kept_only = kept_only_for_the_app(env, call, prefix, name, version[0], pattern)
         elif exists == "true":
@@ -1335,7 +1678,7 @@ def run_code(env: Mapping[str, str], call: build_numbers.Call = http_call) -> No
     else:
         formula_guard(env, call, version[0])
     print(f"versionCode of {kind} {name}: {code}")
-    write_outputs(env, {"version": name, "version-code": str(code), **scheme_outputs(env, reserved)})
+    write_outputs(env, {"version": name, "version-code": str(code), **scheme_outputs(env, reserved), **read_source_said_on_every_path})
 
 
 def run_qa(env: Mapping[str, str], call: build_numbers.Call = http_call) -> None:
@@ -1455,13 +1798,23 @@ def run_changes(env: Mapping[str, str]) -> None:
 OPERATIONS = ("next", "code", "qa", "changes")
 
 
-def main(env: Mapping[str, str] = os.environ, fetch: Fetch = http_get, call: build_numbers.Call = http_call) -> int:
+def main(
+    env: Mapping[str, str] = os.environ,
+    fetch: Fetch = http_get,
+    call: build_numbers.Call = http_call,
+    read: Optional[ReadCode] = None,
+) -> int:
     operation = env.get("OPERATION", "").strip()
     try:
+        if operation in OPERATIONS and operation != "code" and env.get("VERSION_CODE_FROM", "").strip():
+            raise Failure(
+                f"version-code-from is for the operation code, the versionCode of a release or a preview tag, and the "
+                f"operation is {operation}"
+            )
         if operation == "next":
             run_next(env, fetch, call)
         elif operation == "code":
-            run_code(env, call)
+            run_code(env, call, read)
         elif operation == "qa":
             run_qa(env, call)
         elif operation == "changes":

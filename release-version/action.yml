@@ -66,7 +66,8 @@ inputs:
       major that has them), and with version-code-scheme build-number reads
       the releases (contents: read, for next) and reserves a build number
       (contents: write, for qa and code), and for qa the number in the name
-      of a QA build.
+      of a QA build. With version-code-from it also downloads APKs of the
+      releases (contents: read) and records the reuse (contents: write).
     required: false
     default: ${{ github.token }}
   version:
@@ -170,6 +171,27 @@ inputs:
       apps' lines back in kept-builds.
     required: false
     default: ''
+  version-code-from:
+    description: >-
+      For code with version-code-scheme build-number, kind release or preview
+      and asset-pattern, optional: the file name pattern of the APKs of
+      another app of the same GitHub Release, such as SleepHub_*.apk. When
+      the published release of the tag holds such APKs, the build of
+      asset-pattern's app gets the build number they were built with, read
+      from the APKs themselves (aapt2 of ANDROID_HOME), instead of the next
+      one: nothing is reserved, and the run records the reuse as
+      refs/reused-numbers/<major>/<n>/app-<key>/<k> so that it keeps the
+      number when it is run again. Refused unless that number was reserved
+      for the tagged commit; what else of the app is out is not compared,
+      since it is of a later version. A run that reused a number, run again,
+      builds with it again, checked against those APKs and the app's APKs
+      that are out, or is refused, never with a number of its own. When the
+      tag has no release, or its release no such APK, or an
+      earlier attempt of the run reserved a number of its own, the run takes
+      or keeps a build number of its own, as without the input. Any other
+      operation, scheme or combination is refused.
+    required: false
+    default: ''
   version-code-scheme:
     description: >-
       For next, code and qa, optional. How a build gets its versionCode.
@@ -245,6 +267,21 @@ outputs:
       number in version-code: reserved for qa and code, looked up for next.
       Empty with the formula.
     value: ${{ steps.version.outputs.build-number }}
+  version-code-from:
+    description: >-
+      For code with version-code-from. The pattern as the step read it,
+      without the whitespace around it, whether the number of those APKs was
+      reused or not; not written without the input. A later step compares it
+      with the input: a release-version from before version-code-from ignores
+      the input and reserves a new number.
+    value: ${{ steps.version.outputs.version-code-from }}
+  version-code-reused:
+    description: >-
+      For code with version-code-from. true when the build got the number of
+      the APKs of version-code-from, false when it took or kept a build
+      number of its own (no release, no such APK in it, or an earlier attempt
+      of the run reserved its own).
+    value: ${{ steps.version.outputs.version-code-reused }}
   version-code-scheme:
     description: >-
       For next, code and qa. The scheme the versionCode was computed with,
@@ -350,4 +387,5 @@ runs:
         VERSION_CODE_FLOOR: ${{ inputs.version-code-floor }}
         RELEASE_EXISTS: ${{ inputs.release-exists }}
         ASSET_PATTERN: ${{ inputs.asset-pattern }}
+        VERSION_CODE_FROM: ${{ inputs.version-code-from }}
       run: python3 "$GITHUB_ACTION_PATH/release_version.py"
