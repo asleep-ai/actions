@@ -267,6 +267,124 @@ def test_another_app_is_added_to_a_published_release_with_a_number_of_its_own(en
     assert gh.numbers(1) == [2, 3, 4]
 
 
+def test_another_app_is_added_later_with_the_number_of_the_first_apps_apk(entry, lines, tmp_path, monkeypatch):
+    import sys
+
+    sys.path.insert(0, str(ROOT / "release-version"))
+    import release_version
+    from test_build_numbers import FakeGitHub, add_asset
+    from test_release_version import API, parse_outputs
+
+    plan = entry["jobs"]["plan"]
+    result, tagged = check_tag(entry, tmp_path, "v1.10.1", gh_directory(tmp_path, TAGS, released=RELEASED + ["v1.10.1"]))
+    assert result.returncode == 0 and tagged["exists"] == "true", result.stdout + result.stderr
+    monkeypatch.chdir(lines["clone"])
+    gh = FakeGitHub()
+
+    def plan_code(run_id, pattern, source="", exists=tagged["exists"], codes=None):
+        output = tmp_path / f"code-{run_id}-{exists}"
+        output.write_text("")
+        env = {
+            "OPERATION": "code", "KIND": tagged["kind"], "VERSION": tagged["tag"], "SHA": lines["a"], "TAG_PREFIX": "v",
+            "RELEASE_EXISTS": exists, "ASSET_PATTERN": pattern, "VERSION_CODE_FROM": source,
+            "VERSION_CODE_SCHEME": "build-number", "TOKEN": "job-token", "GITHUB_REPOSITORY": "acme/app",
+            "GITHUB_API_URL": API, "GITHUB_RUN_ID": run_id, "GITHUB_OUTPUT": str(output),
+        }
+
+        def read(tag, asset):
+            return (codes or {})[(tag, asset["name"])]
+
+        return release_version.main(env, release_version.http_get, gh, read), parse_outputs(output.read_text())
+
+    def the_check_after_the_code_step(given, answer):
+        return run_script(
+            step(plan, CHECK_REUSE)["run"],
+            {"GIVEN": given, "READ": answer.get("version-code-from", ""), "REUSED": answer.get("version-code-reused", "")},
+            tmp_path,
+        )
+
+    code, sleephub_first = plan_code("5201", "SleepHub_*.apk", "SweetSleep_*.apk", exists="false")
+    assert (code, sleephub_first["version-code"], sleephub_first["version-code-from"], sleephub_first["version-code-reused"]) == (0, "100000001", "SweetSleep_*.apk", "false")
+    result = the_check_after_the_code_step("SweetSleep_*.apk", sleephub_first)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "version-code-from: SweetSleep_*.apk. This build has a build number of its own: the step above says why.\n"
+    gh.release("v1.10.1", "SleepHub_release_1.10.1.apk")
+    last_qa_build_of_sleephub_alone = 4
+    gh.reserve_by_hand(1, last_qa_build_of_sleephub_alone)
+    codes = {("v1.10.1", "SleepHub_release_1.10.1.apk"): 100_000_001, ("v1.10.1", "SweetSleep_release_1.10.1.apk"): 100_000_001}
+    code, sweetsleep_later = plan_code("5202", "SweetSleep_*.apk", "SleepHub_*.apk", codes=codes)
+    assert (code, sweetsleep_later["version-code"], sweetsleep_later["version-code-from"], sweetsleep_later["version-code-reused"]) == (0, "100000001", "SleepHub_*.apk", "true")
+    assert gh.numbers(1) == [1, last_qa_build_of_sleephub_alone]
+    result = the_check_after_the_code_step("SleepHub_*.apk", sweetsleep_later)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "version-code-from: SleepHub_*.apk, whose number this build reuses.\n"
+    add_asset(gh, "v1.10.1", "SweetSleep_release_1.10.1.apk")
+    run_again_once_its_apk_is_out = plan_code("5202", "SweetSleep_*.apk", "SleepHub_*.apk", codes=codes)
+    assert run_again_once_its_apk_is_out[1]["version-code"] == "100000001"
+    new_run = plan_code("5203", "SweetSleep_*.apk", "SleepHub_*.apk", codes=codes)
+    assert new_run == (1, {})
+    assert gh.numbers(1) == [1, last_qa_build_of_sleephub_alone]
+
+
+CHECK_REUSE = "Check the number release-version reused"
+
+
+@pytest.mark.parametrize(
+    ("given", "read", "passes"),
+    [
+        ("SleepHub_*.apk", "SleepHub_*.apk", True),
+        (" SleepHub_*.apk\n", "SleepHub_*.apk", True),
+        pytest.param("SleepHub_*.apk", "", False, id="a-release-version-from-before-version-code-from-ignores-it-and-writes-nothing"),
+        ("SleepHub_*.apk", "SweetSleep_*.apk", False),
+        pytest.param(" \n", "", True, id="whitespace-only-is-no-input-as-for-release-version"),
+    ],
+)
+def test_a_release_version_from_before_version_code_from_stops_the_plan(entry, tmp_path, given, read, passes):
+    plan = entry["jobs"]["plan"]
+    check = step(plan, CHECK_REUSE)
+    assert check["if"] == "${{ inputs.version-code-from != '' }}"
+    assert check["env"] == {
+        "GIVEN": "${{ inputs.version-code-from }}",
+        "READ": "${{ steps.code.outputs.version-code-from }}",
+        "REUSED": "${{ steps.code.outputs.version-code-reused }}",
+    }
+    names = [item.get("id") or item.get("name") for item in plan["steps"]]
+    right_after_the_check_of_the_scheme = names.index(CHECK_SCHEME) + 1
+    assert names.index(CHECK_SCHEME) == names.index("code") + 1
+    assert names.index(CHECK_REUSE) == right_after_the_check_of_the_scheme < names.index("pick")
+    result = run_script(check["run"], {"GIVEN": given, "READ": read, "REUSED": "true" if read else ""}, tmp_path)
+    assert (result.returncode == 0) == passes, result.stdout + result.stderr
+    if passes and read:
+        assert result.stdout == f"version-code-from: {given.strip()}, whose number this build reuses.\n"
+    elif passes:
+        assert result.stdout == "version-code-from: none. This build has a build number of its own: the step above says why.\n"
+    else:
+        assert (
+            f"::error title=release-version is from before version-code-from::version-code-from is {given.strip()}, and "
+            f"release-version answered with {read or 'no reused number'}"
+        ) in result.stdout
+
+
+def test_the_plan_has_time_to_read_apks_only_with_version_code_from(entry):
+    plan = entry["jobs"]["plan"]
+    assert plan["timeout-minutes"] == "${{ inputs.version-code-from != '' && 30 || 10 }}"
+    inputs = trigger(entry)["inputs"]
+    assert inputs["version-code-from"] == {**inputs["version-code-from"], "type": "string", "default": "", "required": False}
+
+
+def test_version_code_from_is_declared_right_after_asset_pattern_which_it_needs(entry):
+    names = list(trigger(entry)["inputs"])
+    assert names.index("version-code-from") == names.index("asset-pattern") + 1
+
+
+def test_only_the_plan_reads_version_code_from_since_the_build_and_the_publish_job_are_the_same_for_a_reused_number(entry):
+    plan = entry["jobs"]["plan"]
+    check = step(plan, CHECK_REUSE)
+    read_by_the_plan = [plan["timeout-minutes"], check["if"], check["env"]["GIVEN"], step_by_id(plan, "code")["with"]["version-code-from"]]
+    assert all("inputs.version-code-from" in value for value in read_by_the_plan)
+    assert (WORKFLOWS / ENTRY).read_text().count("inputs.version-code-from") == len(read_by_the_plan)
+
+
 def test_a_release_of_a_lower_line_is_not_the_latest(entry, tmp_path):
     # 2.0.1 exists, and 1.13.2 is released after it from release/1.x.
     directory = gh_directory(tmp_path, LINE_TAGS, released=["v1.13.0", "v1.13.1", "v2.0.0", "v2.0.1"])
@@ -467,6 +585,7 @@ def test_the_branch_and_the_checks_are_checked_for_every_tag_before_anything_is_
         "Check the commit's checks",
         "Compute the versionCode",
         "Check the scheme release-version read",
+        "Check the number release-version reused",
         "Pick the runner",
     ]
     # No step is conditional on who pushed the tag or on what started the run.
@@ -696,6 +815,7 @@ def test_plan_takes_the_version_code_from_the_one_formula(entry):
         "release-exists": "${{ steps.tag.outputs.exists }}",
         # Unless the release holds no APK of the app this run builds.
         "asset-pattern": "${{ inputs.asset-pattern }}",
+        "version-code-from": "${{ inputs.version-code-from }}",
         "version-code-scheme": "${{ inputs.version-code-scheme }}",
         "version-code-floor": "${{ inputs.version-code-floor }}",
     }
@@ -3135,7 +3255,7 @@ def test_primary_and_fallback_pass_the_same_inputs(entry):
     forwarded = set(inner["inputs"]) - {"runs-on", "attempt", "kind", "ref", "gradle-home", *left_out, *planned}
     assert forwarded == set(inputs) - {
         "tag", "runner-labels", "fallback-runs-on", "source-branch", "required-checks", "release-notes-prompt", "gradle-home",
-        "version-code-scheme", "version-code-floor", "asset-pattern",
+        "version-code-scheme", "version-code-floor", "asset-pattern", "version-code-from",
     }
     for name in forwarded:
         assert primary["with"][name] == fallback["with"][name] == f"${{{{ inputs.{name} }}}}"

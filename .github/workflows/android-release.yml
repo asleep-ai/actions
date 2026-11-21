@@ -24,7 +24,10 @@ name: Android release
 # the plan reserves in the repository.
 #
 # With asset-pattern, one release holds several apps, one per run: a run adds
-# its app's APKs to the release that another app's run published.
+# its app's APKs to the release that another app's run published. With
+# version-code-from as well, those APKs get the build number of the other
+# app's APKs in that release, read from the APKs, instead of a new one; a
+# release without them (or no release yet) gets a new one.
 #
 # The caller's contract, every input and the secrets are in
 # android-ci/README.md.
@@ -122,8 +125,25 @@ on:
           such as SweetSleep_*.apk. Every APK of the build has to match it, or
           nothing is published. With build-number, a release without an asset
           that matches gets this app's APK from a new run, with a number of
-          its own, unless a later release or preview of the major has one.
-          Empty: the release is one build, as before.
+          its own unless a later release or preview of the major has one, or
+          with the number of version-code-from. Empty: the release is one
+          build, as before.
+        required: false
+        type: string
+        default: ''
+      version-code-from:
+        description: >-
+          Optional, with asset-pattern and version-code-scheme build-number:
+          the file name pattern of the APKs of another app of the tag's
+          GitHub Release, such as SleepHub_*.apk. When the release holds such
+          APKs, the APKs of asset-pattern get the versionCode those were built
+          with, read from them, instead of the next build number, and nothing
+          is reserved, whatever later builds of this app are out. Refused
+          unless the number was reserved for the tagged commit, and with any
+          other scheme or without asset-pattern. When the tag has no release
+          yet, or its release no such APK, the run takes a new number, as
+          without it; a run that reused a number, run again, keeps it or is
+          refused. Empty: a new number, as before.
         required: false
         type: string
         default: ''
@@ -304,7 +324,9 @@ jobs:
   # signing key.
   plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # With version-code-from the plan downloads the other app's APKs of the
+    # release to read their versionCode.
+    timeout-minutes: ${{ inputs.version-code-from != '' && 30 || 10 }}
     permissions:
       # Reads the repository; with version-code-scheme build-number it also
       # reserves the build number, a ref of the repository. A permission
@@ -654,6 +676,14 @@ jobs:
       # refused: it would reserve a number above every build since, a later
       # release included. With asset-pattern only a release with an APK of
       # this app counts: the codes of two apps keep no order with each other.
+      #
+      # With version-code-from the number is not reserved when the release
+      # holds the other app's APKs: it is the one they were built with, which
+      # release-version downloads and reads with aapt2 of the runner's Android
+      # SDK. Builds of this app that came after the release (a QA build of
+      # the next version) do not hold it back. Without them the run takes or
+      # keeps a number of its own, as above; a run that reused a number, run
+      # again, builds with it again or is refused, whatever the release holds.
       - name: Compute the versionCode
         id: code
         uses: asleep-ai/actions/release-version@android-ci/v1
@@ -664,6 +694,7 @@ jobs:
           sha: ${{ steps.tag.outputs.sha }}
           release-exists: ${{ steps.tag.outputs.exists }}
           asset-pattern: ${{ inputs.asset-pattern }}
+          version-code-from: ${{ inputs.version-code-from }}
           version-code-scheme: ${{ inputs.version-code-scheme }}
           version-code-floor: ${{ inputs.version-code-floor }}
 
@@ -688,6 +719,32 @@ jobs:
             exit 1
           fi
           echo "version-code-scheme: ${READ:-minor-blocks}."
+
+      # The same for version-code-from: a release-version from before it
+      # ignores the input with no more than a warning and takes the next
+      # build number, a number of its own for this app, also when the release
+      # holds the other app's APKs. release-version says which pattern it
+      # read, whether it reused that number or not, and anything else is
+      # refused here, before the build. The number it took is a gap, which
+      # costs nothing.
+      - name: Check the number release-version reused
+        if: ${{ inputs.version-code-from != '' }}
+        env:
+          GIVEN: ${{ inputs.version-code-from }}
+          READ: ${{ steps.code.outputs.version-code-from }}
+          REUSED: ${{ steps.code.outputs.version-code-reused }}
+        run: |
+          set -euo pipefail
+          given=$(python3 -I -c 'import os, sys; sys.stdout.write(os.environ["GIVEN"].strip())')
+          if [[ -n "$given" && "$READ" != "$given" ]]; then
+            echo "::error title=release-version is from before version-code-from::version-code-from is $given, and release-version answered with ${READ:-no reused number}: the release-version this workflow runs (asleep-ai/actions/release-version@android-ci/v1) is one from before version-code-from, and took a build number of its own for this app. Nothing is built. Move the tag android-ci/v1 to a version with version-code-from first; to try a branch of these workflows, point their uses: at that branch as well."
+            exit 1
+          fi
+          if [[ "$REUSED" == true ]]; then
+            echo "version-code-from: ${given:-none}, whose number this build reuses."
+          else
+            echo "version-code-from: ${given:-none}. This build has a build number of its own: the step above says why."
+          fi
 
       - name: Pick the runner
         id: pick

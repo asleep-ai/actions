@@ -58,9 +58,14 @@ jobs:
       # A repository that builds several apps (applicationIds) into one
       # release, one app per run, names the APKs of the run: the run of the
       # second app then adds its APK to the release the first one published.
-      # With a `brand` input of the manual run, next to `cold`:
+      # With version-code-from (build-number only), the other app's pattern,
+      # that APK gets the versionCode of the first app's APK instead of a
+      # number of its own; the first app's run, with no APK of the other in
+      # the release yet, takes a new number. With a `brand` input of the
+      # manual run, next to `cold`:
       # gradle-args: -PciBrand=${{ inputs.brand || 'sleephub' }}
-      # asset-pattern: ${{ (inputs.brand || 'sleephub') == 'sweetsleep' && 'SweetSleep_*.apk' || 'SleepHub_*.apk' }}
+      # asset-pattern: ${{ inputs.brand == 'sweetsleep' && 'SweetSleep_*.apk' || 'SleepHub_*.apk' }}
+      # version-code-from: ${{ inputs.brand == 'sweetsleep' && 'SleepHub_*.apk' || 'SweetSleep_*.apk' }}
       # Secrets and variables written to local.properties under their own
       # names, next to the four signing keys.
       local-properties-secrets: |
