@@ -134,7 +134,7 @@ jobs:
 
       # The pull request head, not the merge commit, with full history:
       # pre-commit-changed compares the head with its merge base.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         id: checkout
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -143,7 +143,7 @@ jobs:
 
       # pre-commit and every tool the caller's hooks need come from the
       # caller's mise configuration.
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         id: mise
         with:
           version: ${{ inputs.mise-version }}
@@ -209,7 +209,7 @@ jobs:
       # private ones, and the job token reads the repository itself. Two
       # commits deep, so the plan step can compare a pull request's merge
       # commit with its first parent. No token stays in the clone.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         id: checkout
         with:
           token: ${{ inputs.checkout-submodules != 'false' && secrets.GIT_TOKEN || github.token }}
@@ -309,7 +309,7 @@ jobs:
 
       - name: Set up the JDK
         if: ${{ steps.plan.outputs.build == 'true' }}
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         with:
           distribution: ${{ inputs.java-distribution }}
           java-version: ${{ inputs.java-version }}
@@ -500,7 +500,7 @@ jobs:
             done < <(find "$GITHUB_WORKSPACE/.git" -type f -name '*.lock' -print0)
           fi
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         id: checkout
         with:
           token: ${{ inputs.checkout-submodules != 'false' && secrets.GIT_TOKEN || github.token }}
@@ -581,7 +581,7 @@ jobs:
 
       - name: Set up the JDK
         if: ${{ steps.plan.outputs.build == 'true' }}
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         with:
           distribution: ${{ inputs.java-distribution }}
           java-version: ${{ inputs.java-version }}

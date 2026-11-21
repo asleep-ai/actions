@@ -202,7 +202,7 @@ jobs:
       # Every tag, every branch and the whole history: the last release is
       # searched among the tags the commit contains, and the commit has to be
       # on the branch of its release line.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -617,7 +617,7 @@ jobs:
       tagged: ${{ steps.push.outputs.tagged }}
     steps:
       # The token stays in the clone: the push below uses it.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PUSH_TOKEN || github.token }}

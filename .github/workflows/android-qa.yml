@@ -460,7 +460,7 @@ jobs:
       # started for: the version is counted from the release tags the commit
       # contains, and a label build from the rolling tags. Nothing of the
       # checkout is run.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -1243,7 +1243,7 @@ jobs:
       # Full history and every tag: the notes list what the commit adds to the
       # build before it, which the rolling tag still names, and the other
       # rolling tags say which versionCodes are published.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.plan.outputs.sha }}
           fetch-depth: 0
